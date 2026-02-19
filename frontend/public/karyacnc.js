@@ -1048,8 +1048,11 @@ setevent("change", "strokewidth", function() {
 
 setevent("change", "isdarktheme", function() {
     // Redraw canvas when dark mode changes
-    if (currentViewMode === 'gcode') {
-        parseAndRenderGCode();
+    if (currentViewMode === 'gcode' && gcodeParsedData.length > 0) {
+        // Clear operations untuk GCode view
+        window.myCanvas1._drawOperations = [];
+        renderGCodeToCanvas(gcodeParsedData);
+        window.myCanvas1._redraw();
     }
 });
 
@@ -1067,8 +1070,14 @@ document.getElementById('btInstallInkscapeExt').addEventListener('click', async 
 // ============================================================
 
 var currentViewMode = 'original'; // 'original' or 'gcode'
+var gcodeViewMode = '2d'; // '2d' or 'isometric'
 var gcodeParsedData = [];
 var originalDrawOperations = []; // Backup untuk original path
+
+// Isometric view constants
+var ISO_ANGLE = Math.PI / 6; // 30 degrees
+var ISO_COS = Math.cos(ISO_ANGLE);
+var ISO_SIN = Math.sin(ISO_ANGLE);
 
 function switchViewTab(mode) {
     currentViewMode = mode;
@@ -1076,6 +1085,8 @@ function switchViewTab(mode) {
     // Update tab styles
     var tabOriginal = document.getElementById('tabOriginalPath');
     var tabGCode = document.getElementById('tabGCodeRender');
+    var viewControls = document.getElementById('gcodeViewControls');
+    var bboxPanel = document.getElementById('gcodeBoundingBox');
     
     if (mode === 'original') {
         tabOriginal.style.background = '#3498db';
@@ -1084,6 +1095,10 @@ function switchViewTab(mode) {
         tabGCode.style.background = '#e0e0e0';
         tabGCode.style.color = '#333';
         tabGCode.style.fontWeight = 'normal';
+        
+        // Hide view controls and bounding box panel
+        if (viewControls) viewControls.style.display = 'none';
+        if (bboxPanel) bboxPanel.style.display = 'none';
         
         // Restore original operations dan redraw
         if (window.myCanvas1) {
@@ -1100,6 +1115,10 @@ function switchViewTab(mode) {
         tabOriginal.style.color = '#333';
         tabOriginal.style.fontWeight = 'normal';
         
+        // Show view controls
+        if (viewControls) viewControls.style.display = 'block';
+        // Bounding box panel will be shown by renderGCodeToCanvas
+        
         // Backup original operations sebelum render GCode
         if (window.myCanvas1) {
             originalDrawOperations = window.myCanvas1._drawOperations.slice();
@@ -1110,38 +1129,109 @@ function switchViewTab(mode) {
     }
 }
 
+function changeGCodeViewMode(mode) {
+    gcodeViewMode = mode;
+    if (currentViewMode === 'gcode' && gcodeParsedData.length > 0) {
+        // Clear operations untuk GCode view
+        window.myCanvas1._drawOperations = [];
+        renderGCodeToCanvas(gcodeParsedData);
+        window.myCanvas1._redraw();
+    }
+}
+
+// Convert 3D coordinates to 2D screen coordinates
+function toScreen(x, y, z, scale, offsetX, offsetY, centerX, centerY) {
+    if (gcodeViewMode === 'isometric') {
+        // Isometric projection
+        var isoX = (x - y) * ISO_COS;
+        var isoY = (x + y) * ISO_SIN - z;
+        return {
+            x: isoX * scale + offsetX,
+            y: isoY * scale + offsetY
+        };
+    } else {
+        // 2D top view - ignore Z
+        return {
+            x: x * scale + offsetX,
+            y: y * scale + offsetY
+        };
+    }
+}
+
 function parseGCodeText(text) {
     var lines = text.split('\n');
     var moves = [];
     var currentPos = { x: 0, y: 0, z: 0 };
+    var g92Offset = { x: 0, y: 0, z: 0 }; // Offset dari G92
     
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim().toUpperCase();
         if (!line || line.startsWith(';')) continue;
         
-        if (line.startsWith('G0') || line.startsWith('G1')) {
-            var move = {
-                type: line.startsWith('G0') ? 'G0' : 'G1',
-                lineIndex: i,
-                startX: currentPos.x,
-                startY: currentPos.y,
-                startZ: currentPos.z,
-                endX: currentPos.x,
-                endY: currentPos.y,
-                endZ: currentPos.z
-            };
+        // Handle G92 - Set Position Offset
+        if (line.startsWith('G92')) {
+            var xMatch = line.match(/X(-?\d+\.?\d*)/);
+            var yMatch = line.match(/Y(-?\d+\.?\d*)/);
+            var zMatch = line.match(/Z(-?\d+\.?\d*)/);
             
+            // G92 Xval Yval - Set current position to the specified values
+            // Update currentPos to the G92 values so subsequent moves start from here
+            if (xMatch !== null) {
+                g92Offset.x = currentPos.x - parseFloat(xMatch[1]);
+                currentPos.x = parseFloat(xMatch[1]); // Update currentPos to G92 value
+            }
+            if (yMatch !== null) {
+                g92Offset.y = currentPos.y - parseFloat(yMatch[1]);
+                currentPos.y = parseFloat(yMatch[1]); // Update currentPos to G92 value
+            }
+            if (zMatch !== null) {
+                g92Offset.z = currentPos.z - parseFloat(zMatch[1]);
+                currentPos.z = parseFloat(zMatch[1]); // Update currentPos to G92 value
+            }
+            continue;
+        }
+        
+        // Handle G28 - Reset offsets
+        if (line.startsWith('G28')) {
+            g92Offset = { x: 0, y: 0, z: 0 };
+            currentPos = { x: 0, y: 0, z: 0 };
+            continue;
+        }
+        
+        if (line.startsWith('G0') || line.startsWith('G1')) {
             // Parse coordinates
             var xMatch = line.match(/X(-?\d+\.?\d*)/);
             var yMatch = line.match(/Y(-?\d+\.?\d*)/);
             var zMatch = line.match(/Z(-?\d+\.?\d*)/);
             
-            if (xMatch) move.endX = parseFloat(xMatch[1]);
-            if (yMatch) move.endY = parseFloat(yMatch[1]);
-            if (zMatch) move.endZ = parseFloat(zMatch[1]);
+            // Hanya buat move jika ada perubahan koordinat (X, Y, atau Z)
+            // Jika hanya F (feedrate), skip untuk rendering
+            if (!xMatch && !yMatch && !zMatch) {
+                continue; // Skip lines that only set feedrate/power without moving
+            }
+            
+            var move = {
+                type: line.startsWith('G0') ? 'G0' : 'G1',
+                lineIndex: i,
+                startX: currentPos.x + g92Offset.x,
+                startY: currentPos.y + g92Offset.y,
+                startZ: currentPos.z + g92Offset.z,
+                endX: currentPos.x + g92Offset.x,
+                endY: currentPos.y + g92Offset.y,
+                endZ: currentPos.z + g92Offset.z
+            };
+            
+            if (xMatch) move.endX = parseFloat(xMatch[1]) + g92Offset.x;
+            if (yMatch) move.endY = parseFloat(yMatch[1]) + g92Offset.y;
+            if (zMatch) move.endZ = parseFloat(zMatch[1]) + g92Offset.z;
             
             moves.push(move);
-            currentPos = { x: move.endX, y: move.endY, z: move.endZ };
+            // Simpan posisi GCode asli (tanpa offset) untuk perhitungan G92 berikutnya
+            currentPos = { 
+                x: move.endX - g92Offset.x, 
+                y: move.endY - g92Offset.y, 
+                z: move.endZ - g92Offset.z 
+            };
         }
     }
     
@@ -1151,10 +1241,11 @@ function parseGCodeText(text) {
 function parseAndRenderGCode() {
     if (!window.myCanvas1) return;
     
-    // Get GCode from both editors
+    // Get GCode from both editors + start/finish gcode
     var cuttingGCode = getvalue('gcode') || '';
     var engraveGCode = getvalue('engcode') || '';
-    var combinedGCode = cuttingGCode + '\n' + engraveGCode;
+    // Include startgcode which may contain G92 offset
+    var combinedGCode = (startgcode || '') + '\n' + cuttingGCode + '\n' + engraveGCode + '\n' + (finishgcode || '');
     
     // Parse GCode
     gcodeParsedData = parseGCodeText(combinedGCode);
@@ -1177,19 +1268,62 @@ function renderGCodeToCanvas(moves) {
     
     var ctx = window.myCanvas1.getContext('2d');
     
-    // Calculate bounds
+    // Calculate bounds based on view mode
     var minX = Infinity, maxX = -Infinity;
     var minY = Infinity, maxY = -Infinity;
     
-    for (var i = 0; i < moves.length; i++) {
-        var m = moves[i];
-        minX = Math.min(minX, m.startX, m.endX);
-        maxX = Math.max(maxX, m.startX, m.endX);
-        minY = Math.min(minY, m.startY, m.endY);
-        maxY = Math.max(maxY, m.startY, m.endY);
+    if (gcodeViewMode === 'isometric') {
+        // For isometric, we need to calculate projected bounds
+        for (var i = 0; i < moves.length; i++) {
+            var m = moves[i];
+            // Project start point (with scale=1, offset=0 for bounds calc)
+            var s = toScreen(m.startX, m.startY, m.startZ, 1, 0, 0);
+            minX = Math.min(minX, s.x);
+            maxX = Math.max(maxX, s.x);
+            minY = Math.min(minY, s.y);
+            maxY = Math.max(maxY, s.y);
+            // Project end point
+            var e = toScreen(m.endX, m.endY, m.endZ, 1, 0, 0);
+            minX = Math.min(minX, e.x);
+            maxX = Math.max(maxX, e.x);
+            minY = Math.min(minY, e.y);
+            maxY = Math.max(maxY, e.y);
+        }
+    } else {
+        // 2D view - ignore Z
+        for (var i = 0; i < moves.length; i++) {
+            var m = moves[i];
+            minX = Math.min(minX, m.startX, m.endX);
+            maxX = Math.max(maxX, m.startX, m.endX);
+            minY = Math.min(minY, m.startY, m.endY);
+            maxY = Math.max(maxY, m.startY, m.endY);
+        }
     }
     
     if (minX === Infinity) return;
+    
+    // Calculate actual GCode bounds (not projected) for display
+    var actualMinX = Infinity, actualMaxX = -Infinity;
+    var actualMinY = Infinity, actualMaxY = -Infinity;
+    for (var i = 0; i < moves.length; i++) {
+        var m = moves[i];
+        actualMinX = Math.min(actualMinX, m.startX, m.endX);
+        actualMaxX = Math.max(actualMaxX, m.startX, m.endX);
+        actualMinY = Math.min(actualMinY, m.startY, m.endY);
+        actualMaxY = Math.max(actualMaxY, m.startY, m.endY);
+    }
+    
+    // Update bounding box info panel
+    var bboxPanel = document.getElementById('gcodeBoundingBox');
+    if (bboxPanel) {
+        bboxPanel.style.display = 'block';
+        document.getElementById('bboxWidth').textContent = (actualMaxX - actualMinX).toFixed(2);
+        document.getElementById('bboxHeight').textContent = (actualMaxY - actualMinY).toFixed(2);
+        document.getElementById('bboxMinX').textContent = actualMinX.toFixed(2);
+        document.getElementById('bboxMinY').textContent = actualMinY.toFixed(2);
+        document.getElementById('bboxMaxX').textContent = actualMaxX.toFixed(2);
+        document.getElementById('bboxMaxY').textContent = actualMaxY.toFixed(2);
+    }
     
     // Calculate scale to fit canvas
     var canvasWidth = window.myCanvas1.width;
@@ -1199,26 +1333,30 @@ function renderGCodeToCanvas(moves) {
     
     var scaleX = (canvasWidth - 100) / boundsWidth;
     var scaleY = (canvasHeight - 100) / boundsHeight;
-    var scale = Math.min(scaleX, scaleY);
+    var scale = Math.min(scaleX, scaleY) * 0.9; // 90% to add some margin
     
     // Center offset
-    var offsetX = (canvasWidth - boundsWidth * scale) / 2 - minX * scale;
-    var offsetY = (canvasHeight - boundsHeight * scale) / 2 - minY * scale;
+    var centerX = canvasWidth / 2;
+    var centerY = canvasHeight / 2;
+    var offsetX = -((minX + maxX) / 2) * scale + centerX;
+    var offsetY = -((minY + maxY) / 2) * scale + centerY;
     
     // Draw grid
-    drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY);
+    if (gcodeViewMode === '2d') {
+        drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY);
+    } else {
+        drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY);
+    }
     
     // Draw GCode paths
-    for (var i = 0; i < moves.length; i++) {
+    for (var i = 0; i < moves.length-1; i++) {
         var m = moves[i];
-        var x1 = m.startX * scale + offsetX;
-        var y1 = m.startY * scale + offsetY;
-        var x2 = m.endX * scale + offsetX;
-        var y2 = m.endY * scale + offsetY;
+        var s = toScreen(m.startX, m.startY, m.startZ, scale, offsetX, offsetY);
+        var e = toScreen(m.endX, m.endY, m.endZ, scale, offsetX, offsetY);
         
         ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
+        ctx.moveTo(s.x, s.y);
+        ctx.lineTo(e.x, e.y);
         
         if (m.type === 'G1') {
             // Cut move - red
@@ -1236,26 +1374,97 @@ function renderGCodeToCanvas(moves) {
     }
     
     // Draw origin
-    var ox = offsetX;
-    var oy = offsetY;
+    var origin = toScreen(0, 0, 0, scale, offsetX, offsetY);
     ctx.beginPath();
-    ctx.moveTo(ox - 10, oy);
-    ctx.lineTo(ox + 10, oy);
-    ctx.moveTo(ox, oy - 10);
-    ctx.lineTo(ox, oy + 10);
-    ctx.strokeStyle = '#ff6b6b';
+    ctx.moveTo(origin.x - 10, origin.y);
+    ctx.lineTo(origin.x + 10, origin.y);
+    ctx.moveTo(origin.x, origin.y - 10);
+    ctx.lineTo(origin.x, origin.y + 10);
+    ctx.strokeStyle = '#0065b8ff';
     ctx.lineWidth = 2;
     ctx.stroke();
     
-    // Draw bounds rectangle
+    // Draw bounds rectangle (only for 2D view)
+    if (gcodeViewMode === '2d') {
+        ctx.beginPath();
+        ctx.rect(minX * scale + offsetX, minY * scale + offsetY, 
+                 boundsWidth * scale, boundsHeight * scale);
+        ctx.strokeStyle = '#9b59b6';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 2]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+}
+
+function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY) {
+    // Find Z bounds
+    var minZ = Infinity, maxZ = 0;
+    for (var i = 0; i < moves.length; i++) {
+        minZ = Math.min(minZ, moves[i].startZ, moves[i].endZ);
+        maxZ = Math.max(maxZ, moves[i].startZ, moves[i].endZ);
+    }
+    if (minZ === Infinity) minZ = 0;
+    
+    // Draw grid at Z=0 plane
+    var gridSize = 10;
+    var gridRange = 200; // Range around origin
+    
+    var isDarkMode = getchecked("isdarktheme");
+    var lineColor = isDarkMode ? 'rgba(80, 80, 80, 0.4)' : 'rgba(200, 200, 200, 0.5)';
+    ctx.lineWidth = 0.5;
+    
+    // Draw isometric grid lines
+    for (var i = -gridRange; i <= gridRange; i += gridSize) {
+        // Lines along X axis (at Y=0)
+        var p1 = toScreen(i, -gridRange, 0, scale, offsetX, offsetY);
+        var p2 = toScreen(i, gridRange, 0, scale, offsetX, offsetY);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = lineColor;
+        ctx.stroke();
+        
+        // Lines along Y axis (at X=0)  
+        p1 = toScreen(-gridRange, i, 0, scale, offsetX, offsetY);
+        p2 = toScreen(gridRange, i, 0, scale, offsetX, offsetY);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = lineColor;
+        ctx.stroke();
+    }
+    
+    // Draw axes
+    var axisLength = 50;
+    var origin = toScreen(0, 0, 0, scale, offsetX, offsetY);
+    
+    // X axis (red)
+    var xEnd = toScreen(axisLength, 0, 0, scale, offsetX, offsetY);
     ctx.beginPath();
-    ctx.rect(minX * scale + offsetX, minY * scale + offsetY, 
-             boundsWidth * scale, boundsHeight * scale);
-    ctx.strokeStyle = '#9b59b6';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 2]);
+    ctx.moveTo(origin.x, origin.y);
+    ctx.lineTo(xEnd.x, xEnd.y);
+    ctx.strokeStyle = '#ff4444';
+    ctx.lineWidth = 2;
     ctx.stroke();
-    ctx.setLineDash([]);
+    
+    // Y axis (green)
+    var yEnd = toScreen(0, axisLength, 0, scale, offsetX, offsetY);
+    ctx.beginPath();
+    ctx.moveTo(origin.x, origin.y);
+    ctx.lineTo(yEnd.x, yEnd.y);
+    ctx.strokeStyle = '#44ff44';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Z axis (blue) - goes down in isometric
+    var zEnd = toScreen(0, 0, axisLength, scale, offsetX, offsetY);
+    ctx.beginPath();
+    ctx.moveTo(origin.x, origin.y);
+    ctx.lineTo(zEnd.x, zEnd.y);
+    ctx.strokeStyle = '#4444ff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
 }
 
 function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {

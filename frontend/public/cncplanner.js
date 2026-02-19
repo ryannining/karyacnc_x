@@ -171,13 +171,14 @@ const CncPlanner = (function() {
         line = line.trim().toUpperCase();
         if (!line || line[0] === ';') return null;
         
-        const cmd = { type: null, x: null, y: null, z: null, f: null, s: null, isG0: false, isG1: false, rel: false };
+        const cmd = { type: null, x: null, y: null, z: null, f: null, s: null, isG0: false, isG1: false, isG92: false, rel: false };
         
         if (line.startsWith('G90')) cmd.rel = false;
         else if (line.startsWith('G91')) cmd.rel = true;
         else if (line.startsWith('G0')) { cmd.type = 'G0'; cmd.isG0 = true; }
         else if (line.startsWith('G1')) { cmd.type = 'G1'; cmd.isG1 = true; }
         else if (line.startsWith('G28')) { cmd.type = 'G28'; }
+        else if (line.startsWith('G92')) { cmd.type = 'G92'; cmd.isG92 = true; }
         else if (line.startsWith('M3') || line.startsWith('M03')) { cmd.type = 'M3'; }
         else if (line.startsWith('M5') || line.startsWith('M05')) { cmd.type = 'M5'; }
         else if (line.startsWith('M2') || line.startsWith('M30')) { cmd.type = 'END'; }
@@ -200,6 +201,8 @@ const CncPlanner = (function() {
         if (!cmd || cmd.type === 'G28' || cmd.type === 'END') {
             if (cmd?.type === 'G28') {
                 initPlanner(cfg);
+                // Reset G92 offset on G28
+                state.g92Offset = { x: 0, y: 0, z: 0 };
                 return { ...state, pos: { x: 0, y: 0, z: 0 } };
             }
             return state;
@@ -207,17 +210,36 @@ const CncPlanner = (function() {
         
         if (cmd.rel !== undefined) state.rel = cmd.rel;
         
+        if (cmd.isG92) {
+            // G92: Set position - calculate offset
+            // The current position is set to the specified values
+            // So offset = current_position - new_position
+            if (cmd.x !== null) state.g92Offset.x = state.pos.x - cmd.x;
+            if (cmd.y !== null) state.g92Offset.y = state.pos.y - cmd.y;
+            if (cmd.z !== null) state.g92Offset.z = state.pos.z - cmd.z;
+            return state;
+        }
+        
         if (cmd.isG0 || cmd.isG1) {
             if (cmd.f > 0) state[cmd.isG0 ? 'g0f' : 'g1f'] = cmd.f;
-            addmove(state[cmd.isG0 ? 'g0f' : 'g1f'], cmd.x, cmd.y, cmd.z, cmd.isG1 ? 255 : 0, cmd.isG0 ? 1 : 0, state.rel);
-            state.pos = { x: cmd.x, y: cmd.y, z: cmd.z };
+            // Apply G92 offset to coordinates
+            const adjustedX = cmd.x !== null ? cmd.x + state.g92Offset.x : null;
+            const adjustedY = cmd.y !== null ? cmd.y + state.g92Offset.y : null;
+            const adjustedZ = cmd.z !== null ? cmd.z + state.g92Offset.z : null;
+            addmove(state[cmd.isG0 ? 'g0f' : 'g1f'], adjustedX, adjustedY, adjustedZ, cmd.isG1 ? 255 : 0, cmd.isG0 ? 1 : 0, state.rel);
+            // Store actual position (without offset) for G92 calculations
+            state.pos = { 
+                x: cmd.x !== null ? cmd.x : state.pos.x, 
+                y: cmd.y !== null ? cmd.y : state.pos.y, 
+                z: cmd.z !== null ? cmd.z : state.pos.z 
+            };
         }
         return state;
     }
 
     function calculateJobTime(gcodeText, config) {
         initPlanner(config);
-        let state = { pos: { x: 0, y: 0, z: 0 }, g0f: 2000 / 60, g1f: 2000 / 60, rel: false };
+        let state = { pos: { x: 0, y: 0, z: 0 }, g0f: 2000 / 60, g1f: 2000 / 60, rel: false, g92Offset: { x: 0, y: 0, z: 0 } };
         gcodeLines = gcodeText.split('\n');
         lineIndex = 0;
         let parsingComplete = false;
