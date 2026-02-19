@@ -1,0 +1,1555 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>G-Code Editor & Viewer</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg: #121212;
+            --panel: #1e1e1e;
+            --text: #e0e0e0;
+            --accent: #3498db;
+            --success: #2ecc71;
+            --border: #333;
+            --input-bg: #2a2a2a;
+        }
+
+        body {
+            font-family: 'Consolas', 'Monaco', monospace;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            background: var(--panel);
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .header h1 {
+            font-size: 18px;
+            color: var(--accent);
+        }
+
+        .header input, .header select {
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .header input {
+            width: 200px;
+        }
+
+        .param-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .param-group label {
+            font-size: 12px;
+            color: #888;
+        }
+
+        .param-group input {
+            width: 70px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            color: white;
+            font-size: 13px;
+            transition: opacity 0.2s;
+        }
+
+        .viewer-header .btn {
+            padding: 6px 12px;
+            font-size: 11px;
+        }
+
+        .btn:hover {
+            opacity: 0.85;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+        }
+
+        .btn-success {
+            background: var(--success);
+        }
+
+        .main-container {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .editor-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--border);
+            min-width: 200px;
+            max-width: 400px;
+        }
+
+        .editor-header {
+            background: var(--panel);
+            padding: 8px 15px;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+            color: #888;
+        }
+
+        .editor-container {
+            flex: 1;
+            position: relative;
+            background: #0d0d0d;
+            overflow: hidden;
+        }
+
+        #gcodeEditor, #gcodeHighlight {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            white-space: pre;
+            margin: 0;
+            border: none;
+            overflow: auto;
+            box-sizing: border-box;
+        }
+
+        #gcodeEditor {
+            background: transparent;
+            color: transparent;
+            caret-color: #e0e0e0;
+            resize: none;
+            outline: none;
+            z-index: 2;
+        }
+
+        #gcodeHighlight {
+            color: #e0e0e0;
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        #gcodeHighlight code {
+            display: block;
+        }
+
+        /* Syntax Highlight Colors */
+        .gcode-g { color: #4ec9b0; font-weight: bold; }
+        .gcode-m { color: #569cd6; font-weight: bold; }
+        .gcode-axis { color: #ce9178; }
+        .gcode-num { color: #b5cea8; }
+        .gcode-comment { color: #6a9955; font-style: italic; }
+        .gcode-feed { color: #dcdcaa; }
+
+        .viewer-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 800px;
+        }
+
+        .viewer-header {
+            background: var(--panel);
+            padding: 8px 15px;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .dimension-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+        }
+
+        .dimension-toggle input {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+
+        .legend {
+            display: flex;
+            gap: 15px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+
+        .color-g1 {
+            background: #ff4444;
+        }
+
+        .color-g0 {
+            background: #808080;
+        }
+
+        .color-g1-highlight {
+            background: #2ecc71;
+        }
+
+        #gcodeCanvas {
+            flex: 1;
+            background: #0a0a0a;
+            cursor: grab;
+            touch-action: none;
+        }
+
+        #gcodeCanvas:active {
+            cursor: grabbing;
+        }
+
+        .status-bar {
+            background: var(--panel);
+            padding: 8px 15px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            gap: 20px;
+        }
+
+        .dimension-info {
+            position: absolute;
+            top: 150px;
+            right: 10px;
+            background: rgba(30, 30, 30, 0.95);
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            padding: 12px 15px;
+            font-size: 12px;
+            color: var(--text);
+            z-index: 100;
+            min-width: 170px;
+        }
+
+        .sim-info {
+            position: absolute;
+            top: 150px;
+            right: 200px;
+            background: rgba(30, 30, 30, 0.95);
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            padding: 12px 15px;
+            font-size: 12px;
+            color: var(--text);
+            z-index: 100;
+            min-width: 150px;
+        }
+
+        .sim-info h3 {
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: var(--accent);
+            border-bottom: 1px solid #444;
+            padding-bottom: 8px;
+        }
+
+        .sim-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 15px;
+            margin: 4px 0;
+        }
+
+        .sim-label {
+            color: #888;
+        }
+
+        .sim-val {
+            font-family: 'Consolas', monospace;
+            font-weight: bold;
+        }
+
+        .sim-val.x { color: #ff6b6b; }
+        .sim-val.y { color: #4ecdc4; }
+        .sim-val.z { color: #a29bfe; }
+        .sim-val.v { color: #f39c12; }
+        .sim-val.p { color: #2ecc71; }
+
+        .dimension-info h3 {
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: var(--accent);
+            border-bottom: 1px solid #444;
+            padding-bottom: 8px;
+        }
+
+        .dimension-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 15px;
+            margin: 4px 0;
+        }
+
+        .dimension-label {
+            color: #888;
+        }
+
+        .dimension-value {
+            font-family: 'Consolas', monospace;
+            font-weight: bold;
+        }
+
+        .dimension-value.x { color: #ff6b6b; }
+        .dimension-value.y { color: #4ecdc4; }
+        .dimension-value.z { color: #a29bfe; }
+
+        .sim-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-left: 15px;
+            padding-left: 15px;
+            border-left: 1px solid var(--border);
+        }
+
+        .sim-controls .btn {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .sim-status {
+            display: flex;
+            gap: 10px;
+            margin-left: 15px;
+            padding-left: 15px;
+            border-left: 1px solid var(--border);
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            align-items: center;
+        }
+
+        .sim-label {
+            color: #666;
+        }
+
+        .sim-val {
+            display: inline-block;
+            min-width: 45px;
+            font-weight: bold;
+        }
+
+        .sim-val.x { color: #ff6b6b; }
+        .sim-val.y { color: #4ecdc4; }
+        .sim-val.z { color: #a29bfe; }
+        .sim-val.v { color: #f39c12; }
+        .sim-val.p { color: #2ecc71; }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>G-Code Editor</h1>
+        <input type="text" id="jobName" placeholder="Job Name">
+        <button class="btn btn-success" onclick="parseAndDraw()">Parse & Render</button>
+        <select id="renderType" onchange="setRenderType()">
+            <option value="2d">2D View</option>
+            <option value="3d">3D View</option>
+        </select>
+        <select id="viewAngle" onchange="setViewAngle()">
+            <option value="isometric">Isometric</option>
+            <option value="top">Top View</option>
+        </select>
+        <div class="param-group">
+            <label>Material (mm):</label>
+            <input type="number" id="materialThickness" value="4" min="0" step="0.5">
+        </div>
+        <div class="param-group">
+            <label>Cutter Ø (mm):</label>
+            <input type="number" id="cutterDiameter" value="2.5" min="0.1" step="0.1">
+        </div>
+        <div class="param-group">
+            <label>Format:</label>
+            <select id="uploadFormat">
+                <option value="gx">GX (Compressed)</option>
+                <option value="text">Text</option>
+            </select>
+        </div>
+        <button class="btn btn-primary" onclick="uploadGCode()">Upload</button>
+        <button class="btn btn-success" onclick="clearEditor()">Clear</button>
+        <div class="sim-controls">
+            <button class="btn btn-primary" id="btnSimPlay" onclick="toggleSimulation()">▶ Play</button>
+            <button class="btn btn-secondary" onclick="resetSimulation()">⏹ Reset</button>
+            <select id="simSpeed" onchange="updateSimSpeed()">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="5">5x</option>
+                <option value="10" selected>10x</option>
+                <option value="50">50x</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <div class="editor-panel">
+            <div class="editor-header">G-Code Editor</div>
+            <div class="editor-container">
+                <pre id="gcodeHighlight"><code></code></pre>
+                <textarea id="gcodeEditor" spellcheck="false"></textarea>
+            </div>
+        </div>
+
+        <div class="viewer-panel">
+            <div class="viewer-header">
+                <span id="viewTitle">Isometric View</span>
+                <button class="btn btn-primary" onclick="autoScaleView()">Auto Scale</button>
+                <label class="dimension-toggle">
+                    <input type="checkbox" id="showDimensions" checked onchange="requestDraw()">
+                    <span>Show Dimensions</span>
+                </label>
+                <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color color-g1"></div>
+                        <span>G1 (Cut)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color color-g0"></div>
+                        <span>G0 (Move)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color color-g1-highlight"></div>
+                        <span>Highlighted</span>
+                    </div>
+                </div>
+            </div>
+            <div class="dimension-info" id="dimensionInfo" style="display: none;">
+                <h3>Bounding Box</h3>
+                <div class="dimension-row">
+                    <span class="dimension-label">Width (X):</span>
+                    <span class="dimension-value x" id="dimWidth">-</span>
+                </div>
+                <div class="dimension-row">
+                    <span class="dimension-label">Height (Y):</span>
+                    <span class="dimension-value y" id="dimHeight">-</span>
+                </div>
+                <div class="dimension-row">
+                    <span class="dimension-label">Depth (Z):</span>
+                    <span class="dimension-value z" id="dimDepth">-</span>
+                </div>
+                <div class="dimension-row" style="margin-top:8px;border-top:1px solid #444;padding-top:8px">
+                    <span class="dimension-label">Min X:</span>
+                    <span class="dimension-value" id="dimMinX">-</span>
+                </div>
+                <div class="dimension-row">
+                    <span class="dimension-label">Max X:</span>
+                    <span class="dimension-value" id="dimMaxX">-</span>
+                </div>
+                <div class="dimension-row">
+                    <span class="dimension-label">Min Y:</span>
+                    <span class="dimension-value" id="dimMinY">-</span>
+                </div>
+                <div class="dimension-row">
+                    <span class="dimension-label">Max Y:</span>
+                    <span class="dimension-value" id="dimMaxY">-</span>
+                </div>
+                <div class="dimension-row" style="margin-top:8px;border-top:1px solid #444;padding-top:8px">
+                    <span class="dimension-label">Est. Time:</span>
+                    <span class="dimension-value" id="estimatedTime" style="color: var(--success)">-</span>
+                </div>
+            </div>
+            <div class="sim-info" id="simInfo" style="display: none;">
+                <h3>Position</h3>
+                <div class="sim-row">
+                    <span class="sim-label">X:</span>
+                    <span class="sim-val x" id="simX">0.00</span>
+                </div>
+                <div class="sim-row">
+                    <span class="sim-label">Y:</span>
+                    <span class="sim-val y" id="simY">0.00</span>
+                </div>
+                <div class="sim-row">
+                    <span class="sim-label">Z:</span>
+                    <span class="sim-val z" id="simZ">0.00</span>
+                </div>
+                <div class="sim-row">
+                    <span class="sim-label">V:</span>
+                    <span class="sim-val v" id="simV">0</span>
+                </div>
+                <div class="sim-row">
+                    <span class="sim-label">P:</span>
+                    <span class="sim-val p" id="simPower">0</span>
+                </div>
+            </div>
+            <canvas id="gcodeCanvas"></canvas>
+            <div class="status-bar">
+                <span id="cursorLine">Line: 0</span>
+                <span id="zoomLevel">Zoom: 100%</span>
+                <span id="gcodeCount">Lines: 0</span>
+                <span id="shapeCount">Shapes: 0</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="gcodex.js"></script>
+    <script src="cncplanner.js"></script>
+    <script>
+        const canvas = document.getElementById('gcodeCanvas');
+        const ctx = canvas.getContext('2d');
+        const editor = document.getElementById('gcodeEditor');
+        const highlight = document.querySelector('#gcodeHighlight code');
+        const editorContainer = document.querySelector('.editor-container');
+
+        let gcodeLines = [], parsedGCode = [], shapes = [];
+        let cursorLine = 0, zoom = 1, panX = 0, panY = 0;
+        let isDragging = false, lastMouseX = 0, lastMouseY = 0;
+        let renderType = '2d', viewAngle = 'isometric';
+        let materialThickness = 4, cutterDiameter = 2.5;
+        let bounds = null, gridBounds = null, animationFrameId = null;
+        let initialPinchDistance = 0, initialZoom = 1;
+
+        let pathSegments = [];
+        let simState = {
+            running: false,
+            speedMultiplier: 10,
+            currentTime: 0,
+            totalTime: 0,
+            lastFrameTime: 0,
+            currentPos: { x: 0, y: 0, z: 0, v: 0, power: 0 },
+            activeSegment: null
+        };
+
+        const G1_COLOR = '#ff4444';
+        const G0_COLOR = '#808080';
+        const G1_HIGHLIGHT = '#2ecc71';
+        const MARGIN = 20;
+        const COS30 = Math.cos(Math.PI / 6);
+        const SIN30 = Math.sin(Math.PI / 6);
+
+        // Syntax Highlighter
+        function highlightGCode(code) {
+            if (!code) return '';
+            return code
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/;.*/gm, m => `<span class="gcode-comment">${m}</span>`)
+                .replace(/\bG\d+(\.\d+)?\b/g, '<span class="gcode-g">$&</span>')
+                .replace(/\bM\d+(\.\d+)?\b/g, '<span class="gcode-m">$&</span>')
+                .replace(/\b[XYZIJKR]-?\d+\.?\d*\b/g, '<span class="gcode-axis">$&</span>')
+                .replace(/\bF-?\d+\.?\d*\b/g, '<span class="gcode-feed">$&</span>')
+                .replace(/\b[SE]-?\d+\.?\d*\b/g, '<span class="gcode-num">$&</span>');
+        }
+
+        function syncHighlight() {
+            highlight.innerHTML = highlightGCode(editor.value);
+        }
+
+        function syncScroll() {
+            highlight.parentElement.scrollTop = editor.scrollTop;
+            highlight.parentElement.scrollLeft = editor.scrollLeft;
+        }
+
+        editor.addEventListener('input', syncHighlight);
+        editor.addEventListener('scroll', syncScroll);
+
+        function resizeCanvas() {
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height - 30;
+            requestDraw();
+        }
+
+        function requestDraw() {
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            animationFrameId = requestAnimationFrame(draw);
+        }
+
+        function parseGCode(autoCenter = true) {
+            gcodeLines = editor.value.split('\n');
+            parsedGCode = [];
+            shapes = [];
+            let currentPos = { x: 0, y: 0, z: 0 };
+            let prevType = '';
+            let shapeStartX = 0, shapeStartY = 0;
+            let currentShapeG1s = [];
+
+            gcodeLines.forEach((line, idx) => {
+                line = line.trim().toUpperCase();
+                if (!line || line.startsWith(';')) return;
+
+                if (line.startsWith('G0') || line.startsWith('G1')) {
+                    const move = {
+                        type: line.startsWith('G0') ? 'G0' : 'G1',
+                        lineIndex: idx,
+                        startX: currentPos.x, startY: currentPos.y, startZ: currentPos.z,
+                        endX: currentPos.x, endY: currentPos.y, endZ: currentPos.z
+                    };
+
+                    const regex = /([XYZ])(-?\d+\.?\d*)/g;
+                    let match;
+                    while ((match = regex.exec(line)) !== null) {
+                        const axis = match[1];
+                        const value = parseFloat(match[2]);
+                        if (axis === 'X') move.endX = value;
+                        if (axis === 'Y') move.endY = value;
+                        if (axis === 'Z') move.endZ = value;
+                    }
+
+                    if (move.type === 'G1' && prevType === 'G0') {
+                        shapeStartX = move.startX;
+                        shapeStartY = move.startY;
+                        currentShapeG1s = [];
+                    }
+                    if (move.type === 'G1') {
+                        currentShapeG1s.push(idx);
+                    } else if (move.type === 'G0' && currentShapeG1s.length >= 4) {
+                        shapes.push({ index: shapes.length, x: shapeStartX, y: shapeStartY, lineIndex: currentShapeG1s[0] });
+                        currentShapeG1s = [];
+                    } else if (move.type === 'G0') {
+                        currentShapeG1s = [];
+                    }
+                    prevType = move.type;
+                    currentPos = { x: move.endX, y: move.endY, z: move.endZ };
+                    parsedGCode.push(move);
+                }
+            });
+
+            if (currentShapeG1s.length >= 4) {
+                shapes.push({ index: shapes.length, x: shapeStartX, y: shapeStartY, lineIndex: currentShapeG1s[0] });
+            }
+
+            document.getElementById('gcodeCount').textContent = `Lines: ${parsedGCode.length}`;
+            document.getElementById('shapeCount').textContent = `Shapes: ${shapes.length}`;
+            updateBounds();
+            if (autoCenter) centerView();
+            else requestDraw();
+        }
+
+        function updateBounds() {
+            if (parsedGCode.length === 0) {
+                bounds = gridBounds = null;
+                document.getElementById('dimensionInfo').style.display = 'none';
+                return;
+            }
+
+            let minX = 0, maxX = 0;
+            let minY = 0, maxY = 0;
+            let minZ = 0, maxZ = 0;
+
+            parsedGCode.forEach(m => {
+                minX = Math.min(minX, m.startX, m.endX);
+                maxX = Math.max(maxX, m.startX, m.endX);
+                minY = Math.min(minY, m.startY, m.endY);
+                maxY = Math.max(maxY, m.startY, m.endY);
+                minZ = Math.min(minZ, m.startZ, m.endZ);
+                maxZ = Math.max(maxZ, m.startZ, m.endZ);
+            });
+
+            bounds = { minX, maxX, minY, maxY, minZ, maxZ };
+            gridBounds = {
+                minX: Math.floor(minX / 10) * 10 - MARGIN,
+                maxX: Math.ceil(maxX / 10) * 10 + MARGIN,
+                minY: Math.floor(minY / 10) * 10 - MARGIN,
+                maxY: Math.ceil(maxY / 10) * 10 + MARGIN
+            };
+
+            document.getElementById('dimWidth').textContent = `${(maxX - minX).toFixed(2)} mm`;
+            document.getElementById('dimHeight').textContent = `${(maxY - minY).toFixed(2)} mm`;
+            document.getElementById('dimDepth').textContent = `${(maxZ - minZ).toFixed(2)} mm`;
+            document.getElementById('dimMinX').textContent = minX.toFixed(2);
+            document.getElementById('dimMaxX').textContent = maxX.toFixed(2);
+            document.getElementById('dimMinY').textContent = minY.toFixed(2);
+            document.getElementById('dimMaxY').textContent = maxY.toFixed(2);
+            document.getElementById('dimensionInfo').style.display = 'block';
+        }
+
+        function toIso(x, y, z) {
+            if (viewAngle === 'top') {
+                return {
+                    x: x * zoom + panX + canvas.width / 2,
+                    y: y * zoom + panY + canvas.height / 2
+                };
+            }
+            return {
+                x: (x - y) * COS30 * zoom + panX + canvas.width / 2,
+                y: (x + y) * SIN30 * zoom - z * zoom + panY + canvas.height / 2
+            };
+        }
+
+        function centerView() {
+            if (!bounds) return;
+
+            const gw = gridBounds.maxX - gridBounds.minX || 1;
+            const gh = gridBounds.maxY - gridBounds.minY || 1;
+            const depth = bounds.maxZ - bounds.minZ + materialThickness || 1;
+
+            const cx = (gridBounds.minX + gridBounds.maxX) / 2;
+            const cy = (gridBounds.minY + gridBounds.maxY) / 2;
+            const cz = (bounds.minZ + bounds.maxZ) / 2;
+
+            zoom = Math.min(canvas.width * 0.5 / gw, canvas.height * 0.5 / gh, canvas.height * 0.5 / depth);
+
+            const ci = toIso(cx, cy, cz);
+            panX = -ci.x + canvas.width / 2;
+            panY = -ci.y + canvas.height / 2;
+
+            document.getElementById('zoomLevel').textContent = `Zoom: ${Math.round(zoom * 100)}%`;
+            requestDraw();
+        }
+
+        function autoScaleView() {
+            if (bounds) centerView();
+        }
+
+        function drawArrow(ctx, fx, fy, tx, ty, color) {
+            const hl = 8;
+            const a = Math.atan2(ty - fy, tx - fx);
+
+            ctx.beginPath();
+            ctx.moveTo(fx, fy);
+            ctx.lineTo(fx + hl * Math.cos(a + Math.PI / 6), fy + hl * Math.sin(a + Math.PI / 6));
+            ctx.moveTo(fx, fy);
+            ctx.lineTo(fx + hl * Math.cos(a - Math.PI / 6), fy + hl * Math.sin(a - Math.PI / 6));
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.moveTo(tx, ty);
+            ctx.lineTo(tx - hl * Math.cos(a + Math.PI / 6), ty - hl * Math.sin(a + Math.PI / 6));
+            ctx.moveTo(tx, ty);
+            ctx.lineTo(tx - hl * Math.cos(a - Math.PI / 6), ty - hl * Math.sin(a - Math.PI / 6));
+            ctx.stroke();
+        }
+
+        function drawDimensions() {
+            if (!bounds || !document.getElementById('showDimensions').checked) return;
+
+            const { minX, maxX, minY, maxY } = bounds;
+            const offset = 25 / zoom;
+
+            // X Dimension
+            const x1 = toIso(minX - offset, minY - offset, 0);
+            const x2 = toIso(maxX + offset, minY - offset, 0);
+            const xe1 = toIso(minX, minY - offset, 0);
+            const xe2 = toIso(maxX, minY - offset, 0);
+            const xt = toIso((minX + maxX) / 2, minY - offset, 0);
+
+            ctx.beginPath();
+            ctx.moveTo(xe1.x, xe1.y);
+            ctx.lineTo(x1.x, x1.y);
+            ctx.moveTo(xe2.x, xe2.y);
+            ctx.lineTo(x2.x, x2.y);
+            ctx.strokeStyle = '#888';
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([3, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.beginPath();
+            ctx.moveTo(x1.x, x1.y);
+            ctx.lineTo(x2.x, x2.y);
+            ctx.strokeStyle = '#2ecc71';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            drawArrow(ctx, x1.x, x1.y, x2.x, x2.y, '#2ecc71');
+
+            ctx.fillStyle = '#2ecc71';
+            ctx.font = '12px Consolas';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.save();
+            ctx.translate(xt.x, xt.y);
+            ctx.fillText(`${(maxX - minX).toFixed(2)} mm`, 0, -15);
+            ctx.restore();
+
+            // Y Dimension
+            const y1 = toIso(maxX + offset, minY - offset, 0);
+            const y2 = toIso(maxX + offset, maxY + offset, 0);
+            const ye1 = toIso(maxX + offset, minY, 0);
+            const ye2 = toIso(maxX + offset, maxY, 0);
+            const yt = toIso(maxX + offset, (minY + maxY) / 2, 0);
+
+            ctx.beginPath();
+            ctx.moveTo(ye1.x, ye1.y);
+            ctx.lineTo(y1.x, y1.y);
+            ctx.moveTo(ye2.x, ye2.y);
+            ctx.lineTo(y2.x, y2.y);
+            ctx.strokeStyle = '#888';
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([3, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.beginPath();
+            ctx.moveTo(y1.x, y1.y);
+            ctx.lineTo(y2.x, y2.y);
+            ctx.strokeStyle = '#3498db';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            drawArrow(ctx, y1.x, y1.y, y2.x, y2.y, '#3498db');
+
+            ctx.fillStyle = '#3498db';
+            ctx.font = '12px Consolas';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            ctx.save();
+            ctx.translate(yt.x, yt.y);
+            ctx.fillText(`${(maxY - minY).toFixed(2)} mm`, 15, 0);
+            ctx.restore();
+        }
+
+        function draw() {
+            materialThickness = parseFloat(document.getElementById('materialThickness').value) || 4;
+            cutterDiameter = parseFloat(document.getElementById('cutterDiameter').value) || 2.5;
+            renderType === '2d' ? draw2D() : draw3D();
+        }
+
+        function draw2D() {
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            if (parsedGCode.length === 0) return;
+
+            drawGrid2D();
+            drawBoundingBox2D();
+
+            parsedGCode.forEach(move => {
+                const s = toIso(move.startX, move.startY, move.startZ);
+                const e = toIso(move.endX, move.endY, move.endZ);
+                const hl = move.lineIndex <= cursorLine;
+
+                ctx.beginPath();
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(e.x, e.y);
+
+                if (move.type === 'G1') {
+                    ctx.strokeStyle = hl ? G1_HIGHLIGHT : G1_COLOR;
+                    ctx.lineWidth = hl ? 2.5 : 1.5;
+                    ctx.setLineDash([]);
+                } else {
+                    ctx.strokeStyle = hl ? '#00bcd4' : '#555';
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([5, 3]);
+                }
+                ctx.stroke();
+            });
+            ctx.setLineDash([]);
+
+            if (!simState.running && simState.currentTime === 0) {
+                shapes.forEach((shape, i) => {
+                    const p = toIso(shape.x, shape.y, 0);
+                    const ps = shape.lineIndex <= cursorLine;
+
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+                    ctx.fillStyle = ps ? '#00bcd4' : '#4caf50';
+                    ctx.fill();
+
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '10px Consolas';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(i + 1, p.x, p.y - 8);
+                });
+            }
+
+            drawAxes();
+            if (!simState.running && simState.currentTime === 0) {
+                drawDimensions();
+            }
+            drawOrigin2D();
+            drawWithSimulation();
+        }
+
+        function drawBoundingBox2D() {
+            if (!bounds) return;
+
+            const p1 = toIso(bounds.minX, bounds.minY, 0);
+            const p2 = toIso(bounds.maxX, bounds.minY, 0);
+            const p3 = toIso(bounds.maxX, bounds.maxY, 0);
+            const p4 = toIso(bounds.minX, bounds.maxY, 0);
+
+            ctx.strokeStyle = '#9b59b6';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.lineTo(p3.x, p3.y);
+            ctx.lineTo(p4.x, p4.y);
+            ctx.closePath();
+            ctx.stroke();
+            ctx.lineWidth = 1;
+        }
+
+        function drawOrigin2D() {
+            const o = toIso(0, 0, 0);
+            const sz = 10;
+
+            ctx.strokeStyle = '#ff6b6b';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(o.x - sz, o.y);
+            ctx.lineTo(o.x + sz, o.y);
+            ctx.moveTo(o.x, o.y - sz);
+            ctx.lineTo(o.x, o.y + sz);
+            ctx.stroke();
+
+            ctx.fillStyle = '#ff6b6b';
+            ctx.font = 'bold 11px Consolas';
+            ctx.textAlign = 'left';
+            ctx.fillText('(0,0)', o.x + 12, o.y + 4);
+        }
+
+        function drawGrid2D() {
+            if (!gridBounds) return;
+
+            const sx = Math.floor(gridBounds.minX / 10) * 10;
+            const ex = Math.ceil(gridBounds.maxX / 10) * 10;
+            const sy = Math.floor(gridBounds.minY / 10) * 10;
+            const ey = Math.ceil(gridBounds.maxY / 10) * 10;
+
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+
+            for (let x = sx; x <= ex; x += 10) {
+                ctx.strokeStyle = x % 50 === 0 ? '#3a3a3a' : '#1a1a1a';
+                const s = toIso(x, gridBounds.minY, 0);
+                const e = toIso(x, gridBounds.maxY, 0);
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(e.x, e.y);
+            }
+
+            for (let y = sy; y <= ey; y += 10) {
+                ctx.strokeStyle = y % 50 === 0 ? '#3a3a3a' : '#1a1a1a';
+                const s = toIso(gridBounds.minX, y, 0);
+                const e = toIso(gridBounds.maxX, y, 0);
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(e.x, e.y);
+            }
+            ctx.stroke();
+
+            ctx.fillStyle = '#666';
+            ctx.font = '10px Consolas';
+            ctx.textAlign = 'center';
+            for (let x = sx; x <= ex; x += 50) {
+                const p = toIso(x, gridBounds.minY, 0);
+                ctx.fillText(x.toString(), p.x, p.y + 15);
+            }
+            ctx.textAlign = 'left';
+            for (let y = sy; y <= ey; y += 50) {
+                const p = toIso(gridBounds.minX, y, 0);
+                ctx.fillText(y.toString(), p.x + 5, p.y + 4);
+            }
+        }
+
+        function drawAxes() {
+            const al = 50;
+            const o = toIso(0, 0, 0);
+            const xa = toIso(al, 0, 0);
+            const ya = toIso(0, al, 0);
+            const za = toIso(0, 0, al);
+
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(xa.x, xa.y);
+            ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)'; ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(ya.x, ya.y);
+            ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)'; ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(za.x, za.y);
+            ctx.strokeStyle = 'rgba(0, 0, 255, 0.5)'; ctx.stroke();
+        }
+
+        function buildToolPath(ctx, zLevel, r) {
+            let hasPath = false;
+            parsedGCode.forEach(move => {
+                if (move.lineIndex > cursorLine) return;
+                if (!['G1', 'G2', 'G3'].includes(move.type)) return;
+
+                const s = toIso(move.startX, move.startY, zLevel);
+                const e = toIso(move.endX, move.endY, zLevel);
+                const dx = e.x - s.x;
+                const dy = e.y - s.y;
+                const len = Math.sqrt(dx * dx + dy * dy);
+                const a = Math.atan2(dy, dx);
+
+                ctx.save();
+                ctx.translate(s.x, s.y);
+                ctx.rotate(a);
+                ctx.beginPath();
+                ctx.moveTo(0, -r);
+                ctx.lineTo(len, -r);
+                ctx.arc(len, 0, r, -Math.PI / 2, Math.PI / 2);
+                ctx.lineTo(0, r);
+                ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2);
+                ctx.fillStyle = '#000';
+                ctx.fill();
+                ctx.restore();
+                hasPath = true;
+            });
+            return hasPath;
+        }
+
+        function draw3D() {
+            if (!gridBounds || !bounds) return;
+
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const mz = -materialThickness;
+            const r = cutterDiameter / 2;
+            const rs = r * zoom;
+
+            const p1 = toIso(gridBounds.minX, gridBounds.minY, 0);
+            const p2 = toIso(gridBounds.maxX, gridBounds.minY, 0);
+            const p3 = toIso(gridBounds.maxX, gridBounds.maxY, 0);
+            const p4 = toIso(gridBounds.minX, gridBounds.maxY, 0);
+            const p1b = toIso(gridBounds.minX, gridBounds.minY, mz);
+            const p2b = toIso(gridBounds.maxX, gridBounds.minY, mz);
+            const p3b = toIso(gridBounds.maxX, gridBounds.maxY, mz);
+            const p4b = toIso(gridBounds.minX, gridBounds.maxY, mz);
+
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath();
+            ctx.moveTo(p2.x, p2.y);
+            ctx.lineTo(p3.x, p3.y);
+            ctx.lineTo(p3b.x, p3b.y);
+            ctx.lineTo(p2b.x, p2b.y);
+            ctx.fill();
+
+            ctx.fillStyle = '#121212';
+            ctx.beginPath();
+            ctx.moveTo(p3.x, p3.y);
+            ctx.lineTo(p4.x, p4.y);
+            ctx.lineTo(p4b.x, p4b.y);
+            ctx.lineTo(p3b.x, p3b.y);
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.lineTo(p3.x, p3.y);
+            ctx.lineTo(p4.x, p4.y);
+            ctx.closePath();
+            ctx.fillStyle = '#505050';
+            ctx.fill();
+
+            buildToolPath(ctx, 0, rs);
+            drawGrid2D();
+
+            parsedGCode.forEach(move => {
+                const s = toIso(move.startX, move.startY, move.startZ);
+                const e = toIso(move.endX, move.endY, move.endZ);
+                const dz = Math.min(move.startZ, move.endZ);
+                const exceeds = dz < -materialThickness;
+
+                ctx.beginPath();
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(e.x, e.y);
+                ctx.strokeStyle = exceeds ? '#000' : '#808080';
+                ctx.lineWidth = exceeds ? 2 : 1.5;
+
+                if (move.lineIndex > cursorLine) {
+                    ctx.setLineDash([2, 4]);
+                    ctx.globalAlpha = 0.5;
+                } else {
+                    ctx.setLineDash([]);
+                    ctx.globalAlpha = 1.0;
+                }
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+            });
+            ctx.setLineDash([]);
+
+            drawAxes();
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.font = '12px Consolas';
+            ctx.fillText(`3D Cut | Thickness: ${materialThickness}mm | Tool: Ø${cutterDiameter}mm`, 10, canvas.height - 10);
+            if (!simState.running && simState.currentTime === 0) {
+                drawDimensions();
+            }
+            drawWithSimulation();
+        }
+
+        function setRenderType() {
+            renderType = document.getElementById('renderType').value;
+            updateViewTitle();
+            bounds ? centerView() : requestDraw();
+        }
+
+        function setViewAngle() {
+            viewAngle = document.getElementById('viewAngle').value;
+            updateViewTitle();
+            bounds ? centerView() : requestDraw();
+        }
+
+        function updateViewTitle() {
+            document.getElementById('viewTitle').textContent = renderType === '2d' ? 'Path View' :
+                (viewAngle === 'top' ? 'Top View' : 'Isometric View');
+        }
+
+        function parseAndDraw() {
+            parseGCode(true);
+            requestDraw();
+            calculateTime();
+        }
+
+        async function calculateTime() {
+            const gcode = editor.value.trim();
+            if (!gcode) {
+                document.getElementById('estimatedTime').textContent = '-';
+                return;
+            }
+
+            try {
+                const config = await loadConfig2();
+                if (!config) {
+                    document.getElementById('estimatedTime').textContent = 'Config error';
+                    return;
+                }
+                CncPlanner.init(config);
+                const result = CncPlanner.calculateJobTime(gcode, config);
+                document.getElementById('estimatedTime').textContent = result.formatted;
+                pathSegments = result.pathSegments || [];
+                simState.totalTime = result.seconds;
+                simState.currentTime = 0;
+                simState.currentPos = { x: 0, y: 0, z: 0, v: 0, power: 0 };
+                updateSimStatusDisplay();
+            } catch (e) {
+                console.error('Time error:', e);
+                document.getElementById('estimatedTime').textContent = 'Error';
+            }
+        }
+
+        function updateCursorLine() {
+            const lines = editor.value.substr(0, editor.selectionStart).split('\n');
+            cursorLine = lines.length - 1;
+            document.getElementById('cursorLine').textContent = `Line: ${cursorLine + 1}`;
+            requestDraw();
+        }
+
+        function uploadGCode() {
+            const jobName = document.getElementById('jobName').value.trim();
+            const gcode = editor.value.trim();
+            const format = document.getElementById('uploadFormat').value;
+
+            if (!jobName) return alert('Please enter a job name');
+            if (!gcode) return alert('Please enter G-code');
+
+            let filename, blob;
+            if (format === 'gx' && typeof encodeGCode !== 'undefined') {
+                filename = jobName.endsWith('.gcode') ? jobName : jobName + '.gcode';
+                blob = new Blob([encodeGCode(gcode)], { type: 'application/octet-stream' });
+            } else {
+                filename = jobName.endsWith('.gcode') ? jobName : jobName + '.gcode';
+                blob = new Blob([gcode], { type: 'text/plain' });
+            }
+
+            const formData = new FormData();
+            formData.append('file', blob, filename);
+
+            fetch('/upload?noReport=1', { method: 'POST', body: formData })
+                .then(r => r.text())
+                .then(() => alert('Uploaded as ' + filename))
+                .catch(e => alert('Failed: ' + e));
+        }
+
+        function clearEditor() {
+            editor.value = '';
+            syncHighlight();
+            parseAndDraw();
+        }
+
+        function loadSample() {
+            editor.value = `; Sample G-Code
+G0 X0 Y0 Z5
+G1 Z-1 F100
+G1 X50 Y0 F300
+G1 X50 Y50
+G1 X0 Y50
+G1 X0 Y0
+G1 Z5 F100
+G0 X0 Y0 Z10`;
+            syncHighlight();
+            parseAndDraw();
+        }
+
+        // Event listeners
+        ['click', 'keyup', 'select'].forEach(evt => {
+            editor.addEventListener(evt, updateCursorLine);
+        });
+
+        canvas.addEventListener('mousedown', e => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            canvas.style.cursor = 'grabbing';
+        });
+
+        canvas.addEventListener('mousemove', e => {
+            if (!isDragging) return;
+            panX += e.clientX - lastMouseX;
+            panY += e.clientY - lastMouseY;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            requestDraw();
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+            canvas.style.cursor = 'grab';
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            isDragging = false;
+            canvas.style.cursor = 'grab';
+        });
+
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            const zf = e.deltaY > 0 ? 0.9 : 1.1;
+            const nz = zoom * zf;
+
+            panX = mx - (mx - panX) * (nz / zoom);
+            panY = my - (my - panY) * (nz / zoom);
+            zoom = nz;
+
+            document.getElementById('zoomLevel').textContent = `Zoom: ${Math.round(zoom * 100)}%`;
+            requestDraw();
+        }, { passive: false });
+
+        canvas.addEventListener('touchstart', e => {
+            if (e.touches.length === 1) {
+                isDragging = true;
+                lastMouseX = e.touches[0].clientX;
+                lastMouseY = e.touches[0].clientY;
+            } else if (e.touches.length === 2) {
+                isDragging = false;
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                initialPinchDistance = Math.sqrt(dx * dx + dy * dy);
+                initialZoom = zoom;
+            }
+        });
+
+        canvas.addEventListener('touchmove', e => {
+            e.preventDefault();
+            if (e.touches.length === 1 && isDragging) {
+                panX += e.touches[0].clientX - lastMouseX;
+                panY += e.touches[0].clientY - lastMouseY;
+                lastMouseX = e.touches[0].clientX;
+                lastMouseY = e.touches[0].clientY;
+                requestDraw();
+            } else if (e.touches.length === 2) {
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const cd = Math.sqrt(dx * dx + dy * dy);
+                const sc = 1 + (cd / initialPinchDistance - 1) * 0.3;
+                const nz = zoom * sc;
+
+                if (nz >= 0.1 && nz <= 10) {
+                    const rect = canvas.getBoundingClientRect();
+                    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+                    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+                    panX = cx - (cx - panX) * sc;
+                    panY = cy - (cy - panY) * sc;
+                    zoom = nz;
+                    initialPinchDistance = cd;
+                    initialZoom = zoom;
+                    document.getElementById('zoomLevel').textContent = `Zoom: ${Math.round(zoom * 100)}%`;
+                    requestDraw();
+                }
+            }
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', e => {
+            if (e.touches.length === 0) isDragging = false;
+        });
+
+        let resizeTimeout;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(resizeCanvas, 100);
+        });
+
+        function getParam(name) {
+            const r = new RegExp('[\\?&]' + name + '=([^&#]*)');
+            const res = r.exec(location.search);
+            return res ? decodeURIComponent(res[1].replace(/\+/g, ' ')) : '';
+        }
+
+        function loadJob(name) {
+            fetch(encodeURIComponent(name))
+                .then(r => {
+                    if (!r.ok) throw new Error('Failed to load file');
+                    return r.arrayBuffer();
+                })
+                .then(buffer => {
+                    const u = new Uint8Array(buffer);
+                    let content;
+                    if (u.length >= 2 && String.fromCharCode(u[0], u[1]) === 'GX' && typeof decodeGX !== 'undefined') {
+                        content = decodeGX(u);
+                        if (!content) throw new Error('Failed to decode GX');
+                    } else {
+                        content = new TextDecoder().decode(buffer);
+                    }
+                    editor.value = content;
+                    syncHighlight();
+                    document.getElementById('jobName').value = name;
+                    parseAndDraw();
+                })
+                .catch(e => alert('Failed: ' + e.message));
+        }
+
+        function getVelocityColor(v) {
+            const maxV = Math.max(...pathSegments.map(s => Math.max(s.v1, s.v2)), 1);
+            const ratio = Math.min(v / maxV, 1);
+            
+            if (ratio < 0.5) {
+                const t = ratio * 2;
+                const r = Math.floor(0 + 0 * t);
+                const g = Math.floor(100 + 155 * t);
+                const b = Math.floor(255 - 55 * t);
+                return `rgb(${r},${g},${b})`;
+            } else {
+                const t = (ratio - 0.5) * 2;
+                const r = Math.floor(0 + 255 * t);
+                const g = Math.floor(255 - 155 * t);
+                const b = Math.floor(200 - 200 * t);
+                return `rgb(${r},${g},${b})`;
+            }
+        }
+
+        function drawPathSegments() {
+            if (pathSegments.length === 0) return;
+
+            let activeIdx = -1;
+            if (simState.activeSegment) {
+                activeIdx = pathSegments.indexOf(simState.activeSegment);
+            }
+
+            const range = 20;
+            const startIdx = Math.max(0, activeIdx - range);
+            const endIdx = Math.min(pathSegments.length, activeIdx + range + 1);
+            
+            const segmentsToDraw = activeIdx >= 0 
+                ? pathSegments.slice(startIdx, endIdx)
+                : pathSegments;
+
+            segmentsToDraw.forEach(seg => {
+                const p1 = toIso(seg.x1, seg.y1, seg.z1);
+                const p2 = toIso(seg.x2, seg.y2, seg.z2);
+                
+                const midV = (seg.v1 + seg.v2) / 2;
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.strokeStyle = getVelocityColor(midV);
+                ctx.lineWidth = seg.type === 'G1' ? 2.5 : 1;
+                ctx.setLineDash(seg.type === 'G0' ? [5, 3] : []);
+                ctx.globalAlpha = 0.8;
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+                ctx.setLineDash([]);
+            });
+        }
+
+        function drawCutter(x, y, z, power) {
+            const p = toIso(x, y, z);
+            
+            if (power > 0) {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255, 152, 0, ${0.5 + power / 510})`;
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(p.x, p.y - 10);
+                ctx.lineTo(p.x - 4, p.y - 18);
+                ctx.lineTo(p.x + 4, p.y - 18);
+                ctx.closePath();
+                ctx.fillStyle = '#ff9800';
+                ctx.fill();
+            } else {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+                ctx.fillStyle = '#607d8b';
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+        }
+
+        function updateSimulationPosition() {
+            if (pathSegments.length === 0) return;
+            
+            let accumulatedTime = 0;
+            simState.activeSegment = null;
+            
+            for (let seg of pathSegments) {
+                const segDuration = seg.duration || 0.001;
+                if (simState.currentTime <= accumulatedTime + segDuration) {
+                    const localTime = simState.currentTime - accumulatedTime;
+                    const t = Math.min(localTime / segDuration, 1);
+                    
+                    simState.currentPos = {
+                        x: seg.x1 + (seg.x2 - seg.x1) * t,
+                        y: seg.y1 + (seg.y2 - seg.y1) * t,
+                        z: seg.z1 + (seg.z2 - seg.z1) * t,
+                        v: seg.v1 + (seg.v2 - seg.v1) * t,
+                        power: seg.S
+                    };
+                    
+                    simState.activeSegment = seg;
+                    break;
+                }
+                accumulatedTime += segDuration;
+            }
+            
+            if (simState.currentTime >= simState.totalTime) {
+                simState.running = false;
+                document.getElementById('btnSimPlay').textContent = '▶ Play';
+            }
+        }
+
+        function updateSimStatusDisplay() {
+            document.getElementById('simX').textContent = simState.currentPos.x.toFixed(2);
+            document.getElementById('simY').textContent = simState.currentPos.y.toFixed(2);
+            document.getElementById('simZ').textContent = simState.currentPos.z.toFixed(2);
+            document.getElementById('simV').textContent = Math.round(simState.currentPos.v);
+            document.getElementById('simPower').textContent = Math.round(simState.currentPos.power * 100 / 255);
+            
+            const simInfo = document.getElementById('simInfo');
+            if (simState.running || simState.currentTime > 0) {
+                simInfo.style.display = 'block';
+            } else {
+                simInfo.style.display = 'none';
+            }
+        }
+
+        function runSimulation() {
+            if (!simState.running) return;
+            
+            const now = performance.now();
+            const dt = (now - simState.lastFrameTime) / 1000;
+            simState.lastFrameTime = now;
+            
+            simState.currentTime += dt * simState.speedMultiplier;
+            
+            if (simState.currentTime > simState.totalTime) {
+                simState.currentTime = simState.totalTime;
+            }
+            
+            updateSimulationPosition();
+            updateSimStatusDisplay();
+            requestDraw();
+            
+            if (simState.currentTime < simState.totalTime) {
+                requestAnimationFrame(runSimulation);
+            } else {
+                simState.running = false;
+                document.getElementById('btnSimPlay').textContent = '▶ Play';
+            }
+        }
+
+        function toggleSimulation() {
+            if (pathSegments.length === 0) {
+                alert('Please parse G-code first');
+                return;
+            }
+            
+            simState.running = !simState.running;
+            if (simState.running) {
+                if (simState.currentTime >= simState.totalTime) {
+                    simState.currentTime = 0;
+                }
+                document.getElementById('btnSimPlay').textContent = '⏸ Pause';
+                simState.lastFrameTime = performance.now();
+                runSimulation();
+            } else {
+                document.getElementById('btnSimPlay').textContent = '▶ Play';
+            }
+        }
+
+        function resetSimulation() {
+            simState.running = false;
+            simState.currentTime = 0;
+            simState.currentPos = { x: 0, y: 0, z: 0, v: 0, power: 0 };
+            simState.activeSegment = null;
+            document.getElementById('btnSimPlay').textContent = '▶ Play';
+            updateSimStatusDisplay();
+            requestDraw();
+        }
+
+        function updateSimSpeed() {
+            simState.speedMultiplier = parseInt(document.getElementById('simSpeed').value);
+        }
+
+        function drawWithSimulation() {
+            if (simState.running || simState.currentTime > 0) {
+                drawPathSegments();
+                drawCutter(simState.currentPos.x, simState.currentPos.y, simState.currentPos.z, simState.currentPos.power);
+            }
+        }
+
+        resizeCanvas();
+        loadSample();
+        syncHighlight();
+
+        const jobParam = getParam('job');
+        if (jobParam) loadJob(jobParam);
+    </script>
+</body>
+</html>

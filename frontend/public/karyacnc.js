@@ -451,35 +451,13 @@ function updatewmode() {
 // ============================================================
 
 function resizedisplay(reload = 1) {
-    if (!window.myCanvas1) return;
-
-    const canvas = $('myCanvas1');
-    const container = $('myCanvas1div');
-    const gcodePreview = $('title2_c');
-    const sc = 1;
-
-    if (hidd3) {
-        gcodePreview.classList.add('hidden');
-    } else {
-        gcodePreview.classList.remove('hidden');
-    }
-
-    setTimeout(() => {
-        const containerWidth = container.clientWidth;
-        const containerHeight = window.innerHeight - 124;
-
-        container.style.height = `${containerHeight}px`;
-        canvas.width = containerWidth * sc;
-        canvas.height = containerHeight * sc;
-
-        if ($("regcodeX").checked) karya_ready = 1;
-        karya_ready = 1;
-    }, 50);
+    // No longer needed - GCode editor toggles instantly without affecting canvas
+    // With pan/zoom, canvas size remains constant
 }
 
-window.onresize = function () {
-    setTimeout(resizedisplay, 600);
-}
+window.onresize = function() {
+    // No-op - InfiniteCanvas handles pan/zoom independently
+};
 
 // ============================================================
 // SETTINGS & PROFILES
@@ -907,24 +885,8 @@ var smallWCSS = sheet.cssRules[i];
 setclick("wxbt1", wxClick1);
 setclick("wxbt2", wxClick2);
 
-setclick("btcopy1", function () {
-    copygcode();
-});
-
 setclick("btcopy2", function () {
     copygcode();
-});
-
-setclick("tracingbt", function () {
-    tr = document.getElementById('title2');
-    tb = document.getElementById('tracingbt');
-    if (tb.innerHTML == "GCODE SENDER") {
-        tb.innerHTML = "KARYACNC CAM";
-        tr.hidden = true;
-    } else {
-        tb.innerHTML = "GCODE SENDER";
-        tr.hidden = false;
-    }
 });
 
 setevent("change", "cmode", modechange);
@@ -953,10 +915,6 @@ setclick("btrecode2", function() {
 });
 
 setclick("btsaveset", savesetting);
-setclick("btgcode2vec", function () {
-    text1 = gcodetoText1(getvalue("gcode"));
-    refreshgcode();
-});
 setclick("btupload", function () {
     var combinedGcode;
     if (getchecked("engravecut")) {
@@ -1066,7 +1024,13 @@ setclick("bthidden2", function () {
 
 setclick("bthidden3", function () {
     hidd3 = !hidd3;
-    resizedisplay();
+    const gcodePreview = $('title2_c');
+    if (hidd3) {
+        gcodePreview.classList.add('hidden');
+    } else {
+        gcodePreview.classList.remove('hidden');
+    }
+    // No canvas resize or redraw needed - InfiniteCanvas handles view independently
 });
 
 setclick("btzoom", function () {
@@ -1075,12 +1039,275 @@ setclick("btzoom", function () {
 
 setevent("change", "wmode", updatewmode);
 
+setevent("change", "strokewidth", function() {
+    // Redraw canvas with new stroke width without regenerating G-code
+    if (window.myCanvas1 && window.myCanvas1._redraw) {
+        window.myCanvas1._redraw();
+    }
+});
+
+setevent("change", "isdarktheme", function() {
+    // Redraw canvas when dark mode changes
+    if (currentViewMode === 'gcode') {
+        parseAndRenderGCode();
+    }
+});
+
 document.getElementById('btInstallInkscapeExt').addEventListener('click', async () => {
     try {
         await window.go.main.App.InstallInkscapeExtension();
         alert("Extension installed successfully!");
     } catch (error) {
         alert("Failed to install extension: " + error);
+    }
+});
+
+// ============================================================
+// GCODEX RENDERER - 2D View from GCode Text
+// ============================================================
+
+var currentViewMode = 'original'; // 'original' or 'gcode'
+var gcodeParsedData = [];
+var originalDrawOperations = []; // Backup untuk original path
+
+function switchViewTab(mode) {
+    currentViewMode = mode;
+    
+    // Update tab styles
+    var tabOriginal = document.getElementById('tabOriginalPath');
+    var tabGCode = document.getElementById('tabGCodeRender');
+    
+    if (mode === 'original') {
+        tabOriginal.style.background = '#3498db';
+        tabOriginal.style.color = 'white';
+        tabOriginal.style.fontWeight = 'bold';
+        tabGCode.style.background = '#e0e0e0';
+        tabGCode.style.color = '#333';
+        tabGCode.style.fontWeight = 'normal';
+        
+        // Restore original operations dan redraw
+        if (window.myCanvas1) {
+            window.myCanvas1._drawOperations = originalDrawOperations.slice();
+            if (window.myCanvas1._redraw) {
+                window.myCanvas1._redraw();
+            }
+        }
+    } else {
+        tabGCode.style.background = '#3498db';
+        tabGCode.style.color = 'white';
+        tabGCode.style.fontWeight = 'bold';
+        tabOriginal.style.background = '#e0e0e0';
+        tabOriginal.style.color = '#333';
+        tabOriginal.style.fontWeight = 'normal';
+        
+        // Backup original operations sebelum render GCode
+        if (window.myCanvas1) {
+            originalDrawOperations = window.myCanvas1._drawOperations.slice();
+        }
+        
+        // Parse and render GCode
+        parseAndRenderGCode();
+    }
+}
+
+function parseGCodeText(text) {
+    var lines = text.split('\n');
+    var moves = [];
+    var currentPos = { x: 0, y: 0, z: 0 };
+    
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim().toUpperCase();
+        if (!line || line.startsWith(';')) continue;
+        
+        if (line.startsWith('G0') || line.startsWith('G1')) {
+            var move = {
+                type: line.startsWith('G0') ? 'G0' : 'G1',
+                lineIndex: i,
+                startX: currentPos.x,
+                startY: currentPos.y,
+                startZ: currentPos.z,
+                endX: currentPos.x,
+                endY: currentPos.y,
+                endZ: currentPos.z
+            };
+            
+            // Parse coordinates
+            var xMatch = line.match(/X(-?\d+\.?\d*)/);
+            var yMatch = line.match(/Y(-?\d+\.?\d*)/);
+            var zMatch = line.match(/Z(-?\d+\.?\d*)/);
+            
+            if (xMatch) move.endX = parseFloat(xMatch[1]);
+            if (yMatch) move.endY = parseFloat(yMatch[1]);
+            if (zMatch) move.endZ = parseFloat(zMatch[1]);
+            
+            moves.push(move);
+            currentPos = { x: move.endX, y: move.endY, z: move.endZ };
+        }
+    }
+    
+    return moves;
+}
+
+function parseAndRenderGCode() {
+    if (!window.myCanvas1) return;
+    
+    // Get GCode from both editors
+    var cuttingGCode = getvalue('gcode') || '';
+    var engraveGCode = getvalue('engcode') || '';
+    var combinedGCode = cuttingGCode + '\n' + engraveGCode;
+    
+    // Parse GCode
+    gcodeParsedData = parseGCodeText(combinedGCode);
+    
+    if (gcodeParsedData.length === 0) {
+        console.log('No GCode to render');
+        return;
+    }
+    
+    // Clear operations untuk GCode view (tidak menghapus backup)
+    window.myCanvas1._drawOperations = [];
+    renderGCodeToCanvas(gcodeParsedData);
+    
+    // Redraw with current transform
+    window.myCanvas1._redraw();
+}
+
+function renderGCodeToCanvas(moves) {
+    if (!window.myCanvas1) return;
+    
+    var ctx = window.myCanvas1.getContext('2d');
+    
+    // Calculate bounds
+    var minX = Infinity, maxX = -Infinity;
+    var minY = Infinity, maxY = -Infinity;
+    
+    for (var i = 0; i < moves.length; i++) {
+        var m = moves[i];
+        minX = Math.min(minX, m.startX, m.endX);
+        maxX = Math.max(maxX, m.startX, m.endX);
+        minY = Math.min(minY, m.startY, m.endY);
+        maxY = Math.max(maxY, m.startY, m.endY);
+    }
+    
+    if (minX === Infinity) return;
+    
+    // Calculate scale to fit canvas
+    var canvasWidth = window.myCanvas1.width;
+    var canvasHeight = window.myCanvas1.height;
+    var boundsWidth = maxX - minX || 1;
+    var boundsHeight = maxY - minY || 1;
+    
+    var scaleX = (canvasWidth - 100) / boundsWidth;
+    var scaleY = (canvasHeight - 100) / boundsHeight;
+    var scale = Math.min(scaleX, scaleY);
+    
+    // Center offset
+    var offsetX = (canvasWidth - boundsWidth * scale) / 2 - minX * scale;
+    var offsetY = (canvasHeight - boundsHeight * scale) / 2 - minY * scale;
+    
+    // Draw grid
+    drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY);
+    
+    // Draw GCode paths
+    for (var i = 0; i < moves.length; i++) {
+        var m = moves[i];
+        var x1 = m.startX * scale + offsetX;
+        var y1 = m.startY * scale + offsetY;
+        var x2 = m.endX * scale + offsetX;
+        var y2 = m.endY * scale + offsetY;
+        
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        
+        if (m.type === 'G1') {
+            // Cut move - red
+            ctx.strokeStyle = '#ff4444';
+            ctx.lineWidth = 2;
+        } else {
+            // Travel move - gray with dash
+            ctx.strokeStyle = '#808080';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 3]);
+        }
+        
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+    
+    // Draw origin
+    var ox = offsetX;
+    var oy = offsetY;
+    ctx.beginPath();
+    ctx.moveTo(ox - 10, oy);
+    ctx.lineTo(ox + 10, oy);
+    ctx.moveTo(ox, oy - 10);
+    ctx.lineTo(ox, oy + 10);
+    ctx.strokeStyle = '#ff6b6b';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Draw bounds rectangle
+    ctx.beginPath();
+    ctx.rect(minX * scale + offsetX, minY * scale + offsetY, 
+             boundsWidth * scale, boundsHeight * scale);
+    ctx.strokeStyle = '#9b59b6';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+}
+
+function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {
+    // Draw grid every 10mm
+    var gridSize = 10;
+    var startX = Math.floor(minX / gridSize) * gridSize;
+    var endX = Math.ceil(maxX / gridSize) * gridSize;
+    var startY = Math.floor(minY / gridSize) * gridSize;
+    var endY = Math.ceil(maxY / gridSize) * gridSize;
+    
+    var isDarkMode = getchecked("isdarktheme");
+    var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
+    var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
+    var majorLineWidth = 0.5;
+    var minorLineWidth = 0.3;
+    
+    // Vertical lines
+    for (var x = startX; x <= endX; x += gridSize) {
+        var isMajor = (x % 50 === 0);
+        ctx.beginPath();
+        ctx.moveTo(x * scale + offsetX, startY * scale + offsetY);
+        ctx.lineTo(x * scale + offsetX, endY * scale + offsetY);
+        ctx.strokeStyle = isMajor ? majorLineColor : minorLineColor;
+        ctx.lineWidth = isMajor ? majorLineWidth : minorLineWidth;
+        ctx.stroke();
+    }
+    
+    // Horizontal lines
+    for (var y = startY; y <= endY; y += gridSize) {
+        var isMajor = (y % 50 === 0);
+        ctx.beginPath();
+        ctx.moveTo(startX * scale + offsetX, y * scale + offsetY);
+        ctx.lineTo(endX * scale + offsetX, y * scale + offsetY);
+        ctx.strokeStyle = isMajor ? majorLineColor : minorLineColor;
+        ctx.lineWidth = isMajor ? majorLineWidth : minorLineWidth;
+        ctx.stroke();
+    }
+}
+
+// Auto-update GCode render when editors change
+setevent("input", "gcodeEditor", function() {
+    if (currentViewMode === 'gcode') {
+        // Debounce to avoid too many renders
+        if (window.gcodeRenderTimeout) clearTimeout(window.gcodeRenderTimeout);
+        window.gcodeRenderTimeout = setTimeout(parseAndRenderGCode, 500);
+    }
+});
+
+setevent("input", "engcodeEditor", function() {
+    if (currentViewMode === 'gcode') {
+        if (window.gcodeRenderTimeout) clearTimeout(window.gcodeRenderTimeout);
+        window.gcodeRenderTimeout = setTimeout(parseAndRenderGCode, 500);
     }
 });
 
@@ -1251,7 +1478,13 @@ modechange(1);
 document.addEventListener('DOMContentLoaded', function () {
     function highlightGCode(code) {
         if (!code) return '';
-        return code
+        // Limit processing to first 10000 lines for performance
+        const lines = code.split('\n');
+        const maxLines = 10000;
+        const shouldTruncate = lines.length > maxLines;
+        const codeToProcess = shouldTruncate ? lines.slice(0, maxLines).join('\n') : code;
+        
+        const result = codeToProcess
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/;.*/gm, m => `<span class="gcode-comment">${m}</span>`)
             .replace(/\bG\d+(\.\d+)?\b/g, '<span class="gcode-g">$&</span>')
@@ -1259,6 +1492,8 @@ document.addEventListener('DOMContentLoaded', function () {
             .replace(/\b[XYZIJKR]-?\d+\.?\d*\b/g, '<span class="gcode-axis">$&</span>')
             .replace(/\bF-?\d+\.?\d*\b/g, '<span class="gcode-feed">$&</span>')
             .replace(/\b[SE]-?\d+\.?\d*\b/g, '<span class="gcode-num">$&</span>');
+        
+        return shouldTruncate ? result + '\n<span class="gcode-comment">... [File too large, syntax highlighting truncated]</span>' : result;
     }
 
     function setupEditor(textareaId, highlightId) {
@@ -1267,9 +1502,15 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!editor || !highlight) return;
 
         let isScrolling = false;
+        let debounceTimer = null;
 
         function syncHighlight() {
             highlight.innerHTML = highlightGCode(editor.value);
+        }
+
+        function syncHighlightDebounced() {
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(syncHighlight, 300);
         }
 
         function syncScroll() {
@@ -1282,9 +1523,10 @@ document.addEventListener('DOMContentLoaded', function () {
             });
         }
 
-        editor.addEventListener('input', syncHighlight);
+        editor.addEventListener('input', syncHighlightDebounced);
         editor.addEventListener('scroll', syncScroll, { passive: true });
-        syncHighlight();
+        // Delay initial highlight to let animation finish
+        setTimeout(syncHighlight, 100);
     }
 
     setupEditor('gcodeEditor', 'gcodeHighlight');
@@ -1295,17 +1537,24 @@ document.addEventListener('DOMContentLoaded', function () {
     window.getEngcodeValue = function() { return document.getElementById('engcodeEditor').value; };
     window.setEngcodeValue = function(v) { document.getElementById('engcodeEditor').value = v; syncHighlightById('engcodeEditor', 'engcodeHighlight'); };
 
+    let highlightDebounceTimer = null;
     function syncHighlightById(textareaId, highlightId) {
         const editor = document.getElementById(textareaId);
         const highlight = document.querySelector(`#${highlightId} code`);
         if (editor && highlight) {
-            highlight.innerHTML = highlightGCode(editor.value);
+            // Debounce to prevent blocking during animation
+            if (highlightDebounceTimer) clearTimeout(highlightDebounceTimer);
+            highlightDebounceTimer = setTimeout(() => {
+                highlight.innerHTML = highlightGCode(editor.value);
+            }, 100);
         }
     }
 
     const canvas = document.getElementById('myCanvas1x');
     if (canvas && typeof InfiniteCanvas !== 'undefined') {
         window.myCanvas1 = new InfiniteCanvas(canvas);
+        // Note: InfiniteCanvas now handles redrawing internally using stored draw operations
+        // No need to call gcode_verify on transform changes - it would regenerate G-code which is slow
     }
 });
 
@@ -1585,8 +1834,20 @@ function refreshgcode() {
 
     $("segm").style.display = d;
     myFunction(0);
+    
+    // Save original operations setelah myFunction selesai menggambar
+    if (window.myCanvas1 && window.myCanvas1._drawOperations) {
+        originalDrawOperations = window.myCanvas1._drawOperations.slice();
+    }
+    
     savesetting();
     updatedownload2();
+    
+    // If in GCode render mode, update the view
+    if (currentViewMode === 'gcode') {
+        // Backup sudah tersimpan di atas, sekarang render GCode
+        parseAndRenderGCode();
+    }
 }
 
 function copyStringToClipboard(str) {

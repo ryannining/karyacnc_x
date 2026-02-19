@@ -257,7 +257,11 @@ var warningpath = 0;
 // ------------------------------------------------------------------------
 // Geometry Helpers
 // ------------------------------------------------------------------------
-
+function arrayRotate(arr, count) {
+	count -= arr.length * Math.floor(count / arr.length);
+	arr.push.apply(arr, arr.splice(0, count));
+	return arr;
+}
 function degSin(d) {
 	return Math.sin(Math.PI * d / 180);
 }
@@ -1016,8 +1020,8 @@ function prepare_line2(lenmm, lines, ofs1) {
 // ------------------------------------------------------------------------
 // Engrave Drawing Function
 // ------------------------------------------------------------------------
-
 function drawengrave() {
+	//	if (cmd!=CMD_LASER)return;
 	if (!getchecked("enableraster")) return;
 	var c = $("myCanvas1");
 	var ctx = c.getContext("2d");
@@ -1506,6 +1510,13 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 	var c = $("myCanvas1");
 	var ctx = c.getContext("2d");
 	ctx.font = "8px Arial";
+	
+	// Apply stroke width setting
+	var strokeWidth = getnumber("strokewidth");
+	if (strokeWidth <= 0) strokeWidth = 1;
+	var scale = (window.myCanvas1 && window.myCanvas1._scale) ? window.myCanvas1._scale : 1;
+	ctx.lineWidth = strokeWidth / scale; // Adjust for zoom level to keep consistent visual width
+	
 	var g = 0;
 	var X1 = 0;
 	var Y1 = 0;
@@ -2709,6 +2720,7 @@ function gcode_verify(en = 0) {
 	cglines = [];
 	already = [];
 	var c = $("myCanvas1");
+	var sc = 1; // Scale variable for canvas operations
 
 	ENGRAVE = 0;
 	cmd = getvalue('cmode');
@@ -2729,10 +2741,23 @@ function gcode_verify(en = 0) {
 	}
 	firstline = 1;
 	jmltravel = 0;
+	
+	// Clear stored draw operations in InfiniteCanvas before drawing new G-code
+	if (window.myCanvas1 && window.myCanvas1.clearDrawOperations) {
+		window.myCanvas1.clearDrawOperations();
+	}
+	
 	var ctx = c.getContext("2d");
-	ctx.reset();
+	if (ctx.reset) {
+		ctx.reset();
+	} else {
+		// Fallback for browsers without reset() method
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, c.width, c.height);
+	}
 	var sfinal = 0;
 	$("segm").value = "";
+	var theme = typeof window.theme !== 'undefined' ? window.theme : (getchecked("isdarktheme") ? 1 : 0);
 	ctx.fillStyle = theme == 0 ? "#ffffff" : "#000000";
 	$("myCanvas1div").style.background = ctx.fillStyle;
 	ctx.fillRect(-10, -10, c.width + 10, c.height + 10);
@@ -2869,6 +2894,10 @@ function gcode_verify(en = 0) {
 	area_dimension.innerHTML += "<br><b>Tool offset : " + getoffset() + "mm";
 	area_dimension.innerHTML += " &nbsp; Start : " + getvalue("startat");
 
+	// Ensure transform is applied after all drawing is done
+	if (window.myCanvas1 && window.myCanvas1._redraw) {
+		window.myCanvas1._redraw();
+	}
 }
 // ============================================================================
 // SECTION: SVG Path Parsing - Part A (svgPathToCommands)
