@@ -342,6 +342,7 @@ function vcarve(maxr, angle, step, path, dstep, dstep2) {
 	console.time("vcarve_opt");
 	segsvdraw = [];
 	gcodecarve = "";
+	if (path.length==0) return;
 
 	// --- Constants & Setup ---
 	const ve = 1 / Math.tan(angle * Math.PI / 360);
