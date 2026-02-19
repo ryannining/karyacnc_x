@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVG Parts Nesting</title>
+    <script src="https://cdn.jsdelivr.net/npm/poly-decomp@0.3.0/build/decomp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+            background-color: white;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+
+        .container {
+            flex: 1;
+            display: flex;
+            gap: 10px;
+            min-height: 0;
+            /* Important for nested flex containers */
+        }
+
+        .input-area,
+        .output-area {
+            flex: 1;
+            border: 1px solid #ccc;
+            padding: 10px;
+            border-radius: 5px;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            /* Important for nested flex containers */
+        }
+
+        h2 {
+            margin: 0 0 10px 0;
+        }
+
+        .controls {
+            margin-bottom: 10px;
+            z-index: 1;
+            /* Ensure controls are above canvas */
+            position: relative;
+        }
+
+        .controls label {
+            display: block;
+            margin: 5px 0;
+        }
+
+        canvas {
+            border: 1px solid #ddd;
+            width: 100%;
+        }
+
+        .preview-container {
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .solutions {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .solutions>div {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .solutions h3 {
+            text-align: center;
+            margin: 0 0 5px 0;
+        }
+
+        .solution-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+            padding: 0 5px;
+        }
+
+        .canvas-container {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        button {
+            padding: 5px 10px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        .progress-container {
+            margin: 10px 0;
+            text-align: center;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background-color: #4CAF50;
+            transition: width 0.3s ease-in-out;
+        }
+
+        .progress-text {
+            margin-top: 5px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="input-area">
+            <h1>KaryaCNC Nesting</h1>
+            <h2>Input Area</h2>
+            <div class="controls">
+                <input type="file" id="svgInput" accept=".svg">
+                <label>
+                    Sheet Width (mm):
+                    <input type="number" id="sheetWidth" value="1000">
+                </label>
+                <label>
+                    Sheet Height (mm):
+                    <input type="number" id="sheetHeight" value="1000">
+                </label>
+                <label>
+                    Rotation Options:
+                    <input type="text" id="rotation" list="rotation-presets" value="0,90,180,270">
+                    <datalist id="rotation-presets">
+                        <option value="0">No rotation</option>
+                        <option value="0,180">2 rotations (0°, 180°)</option>
+                        <option value="0,90">2 rotations (0°, 90°)</option>
+                        <option value="0,90,180,270">4 rotations (0°, 90°, 180°, 270°)</option>
+                        <option value="0,45,90,135,180,225,270,315">8 rotations</option>
+                    </datalist>
+                </label>
+                <label>
+                    Part Spacing (mm):
+                    <input type="number" id="spacing" value="0" min="0">
+                </label>
+                <label>
+                    Grid Spacing:
+                    <input type="number" id="gridSpacing" value="4" min="1" max="100">
+                </label>
+                <label>
+                    <input type="checkbox" id="allowFlip">
+                    Allow Flip
+                </label>
+                <label>
+                    <input type="checkbox" id="multiCPU">
+                    Use Multi-CPU
+                </label>
+                <label>
+                    <input type="checkbox" id="useNFP2">
+                    Use True NFP Algorithm (Experimental)
+                </label>
+                <div class="button-container">
+
+                    <button id="startNest">Start Nesting</button>
+
+                </div>
+                <div id="progressContainer" style="width: 100%; margin-top: 10px;">
+                    <div id="progressBar"
+                        style="width: 100%; background-color: #f0f0f0; border-radius: 4px; overflow: hidden;">
+                        <div id="progressFill"
+                            style="width: 0%; height: 20px; background-color: #4CAF50; transition: width 0.3s ease-in-out;">
+                        </div>
+                    </div>
+                    <div id="progressText" style="text-align: center; margin-top: 5px; font-size: 14px;"></div>
+                </div>
+            </div>
+            <div class="preview-container">
+                <div class="preview-info">
+                    <span>Paths: <span id="inputPathCount">0</span></span>
+                </div>
+                <canvas id="previewCanvas"></canvas>
+            </div>
+        </div>
+        <div class="output-area">
+            <h2>Output Area</h2>
+            <div class="solutions">
+                <div>
+                    <h3>Current Solution</h3>
+                    <div class="solution-info">
+                        <span>Area: <span id="currentArea">0</span></span>
+                        <span>Paths: <span id="currentPathCount">0</span></span>
+                        <div class="button-group">
+                            <button id="recompactCurrent" style="background-color: #2196F3;">Recompact</button>
+                            <button id="selectAsBest">Select as Best</button>
+                        </div>
+                    </div>
+                    <div class="canvas-container">
+                        <canvas id="currentSolutionCanvas"></canvas>
+                    </div>
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill"></div>
+                        </div>
+                        <div class="progress-text">Progress: 0%</div>
+                    </div>
+                </div>
+                <div>
+                    <h3>Best Solution</h3>
+                    <div class="solution-info">
+                        <span>Area: <span id="bestArea">0</span></span>
+                        <span>Paths: <span id="bestPathCount">0</span></span>
+                        <button id="downloadBest">Download Solution</button>
+                    </div>
+                    <div class="canvas-container">
+                        <canvas id="bestSolutionCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="js/canvas.js"></script>
+    <script src="js/clipper.js"></script>
+    <script src="js/geometry.js"></script>
+    <script src="js/nfp.js"></script>
+    <script src="js/nfp2.js"></script>
+    <script src="js/main.js"></script>
+
+</body>
+
+</html>
