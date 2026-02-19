@@ -1074,12 +1074,27 @@ var gcodeViewMode = '2d'; // '2d' or 'isometric'
 var gcodeParsedData = [];
 var originalDrawOperations = []; // Backup untuk original path
 
+// Separate pan/zoom state for each view mode
+var viewState = {
+    original: { scale: 1, offsetX: 0, offsetY: 0 },
+    gcode: { scale: 1, offsetX: 0, offsetY: 0 }
+};
+
 // Isometric view constants
 var ISO_ANGLE = Math.PI / 6; // 30 degrees
 var ISO_COS = Math.cos(ISO_ANGLE);
 var ISO_SIN = Math.sin(ISO_ANGLE);
 
 function switchViewTab(mode) {
+    // Save current state before switching
+    if (window.myCanvas1 && currentViewMode) {
+        viewState[currentViewMode] = {
+            scale: window.myCanvas1._scale,
+            offsetX: window.myCanvas1._offsetX,
+            offsetY: window.myCanvas1._offsetY
+        };
+    }
+    
     currentViewMode = mode;
     
     // Update tab styles
@@ -1103,6 +1118,20 @@ function switchViewTab(mode) {
         // Restore original operations dan redraw
         if (window.myCanvas1) {
             window.myCanvas1._drawOperations = originalDrawOperations.slice();
+            // Restore saved state for original mode
+            var savedState = viewState.original;
+            window.myCanvas1._scale = savedState.scale;
+            window.myCanvas1._offsetX = savedState.offsetX;
+            window.myCanvas1._offsetY = savedState.offsetY;
+            window.myCanvas1._transformation = {
+                a: savedState.scale,
+                b: 0,
+                c: 0,
+                d: savedState.scale,
+                e: savedState.offsetX,
+                f: savedState.offsetY
+            };
+            window.myCanvas1.viewBox.transformation = window.myCanvas1._transformation;
             if (window.myCanvas1._redraw) {
                 window.myCanvas1._redraw();
             }
@@ -1122,6 +1151,20 @@ function switchViewTab(mode) {
         // Backup original operations sebelum render GCode
         if (window.myCanvas1) {
             originalDrawOperations = window.myCanvas1._drawOperations.slice();
+            // Restore saved state for gcode mode
+            var savedState = viewState.gcode;
+            window.myCanvas1._scale = savedState.scale;
+            window.myCanvas1._offsetX = savedState.offsetX;
+            window.myCanvas1._offsetY = savedState.offsetY;
+            window.myCanvas1._transformation = {
+                a: savedState.scale,
+                b: 0,
+                c: 0,
+                d: savedState.scale,
+                e: savedState.offsetX,
+                f: savedState.offsetY
+            };
+            window.myCanvas1.viewBox.transformation = window.myCanvas1._transformation;
         }
         
         // Parse and render GCode
@@ -1349,7 +1392,7 @@ function renderGCodeToCanvas(moves) {
     }
     
     // Draw GCode paths
-    for (var i = 0; i < moves.length-1; i++) {
+    for (var i = 0; i < moves.length; i++) {
         var m = moves[i];
         var s = toScreen(m.startX, m.startY, m.startZ, scale, offsetX, offsetY);
         var e = toScreen(m.endX, m.endY, m.endZ, scale, offsetX, offsetY);
@@ -1764,6 +1807,33 @@ document.addEventListener('DOMContentLoaded', function () {
         window.myCanvas1 = new InfiniteCanvas(canvas);
         // Note: InfiniteCanvas now handles redrawing internally using stored draw operations
         // No need to call gcode_verify on transform changes - it would regenerate G-code which is slow
+        
+        // Save state on pan/zoom
+        canvas.addEventListener('wheel', function() {
+            setTimeout(function() {
+                if (currentViewMode && window.myCanvas1) {
+                    viewState[currentViewMode] = {
+                        scale: window.myCanvas1._scale,
+                        offsetX: window.myCanvas1._offsetX,
+                        offsetY: window.myCanvas1._offsetY
+                    };
+                }
+            }, 50);
+        });
+        
+        canvas.addEventListener('mousemove', function() {
+            if (window.myCanvas1 && window.myCanvas1.canvas.style.cursor === 'grabbing') {
+                setTimeout(function() {
+                    if (currentViewMode && window.myCanvas1) {
+                        viewState[currentViewMode] = {
+                            scale: window.myCanvas1._scale,
+                            offsetX: window.myCanvas1._offsetX,
+                            offsetY: window.myCanvas1._offsetY
+                        };
+                    }
+                }, 50);
+            }
+        });
     }
 });
 
