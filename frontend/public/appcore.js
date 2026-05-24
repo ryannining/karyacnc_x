@@ -294,6 +294,27 @@ function mx1(p, mt) {
 	p[0] * mt[1] + p[1] * mt[3] + mt[5]];
 }
 
+
+function intersects_p(a, b, c, d, p, q, r, s) {
+	var A = {
+		x: a,
+		y: b
+	};
+	var B = {
+		x: c,
+		y: d
+	};
+	var C = {
+		x: p,
+		y: q
+	};
+	var D = {
+		x: r,
+		y: s
+	};
+	return intersect_point(A, B, C, D);
+}
+
 function isClockwise(poly, px = 1, py = 2) {
 	var sum = 0;
 	for (var i = 0; i < poly.length; i++) {

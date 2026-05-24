@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"io/fs"
 	"log"
@@ -21,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/gorilla/websocket"
+	"github.com/kbinani/screenshot"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -40,8 +44,6 @@ type App struct {
 	streamMutex         sync.Mutex
 	wsServer            *http.Server
 	wsServerMutex       sync.Mutex
-	telegramServer      *http.Server
-	telegramServerMutex sync.Mutex
 
 	storedSvgData       string
 	storedSvgTimestamp  int64
@@ -202,53 +204,6 @@ func (a *App) StartWSServer(port uint16) {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			if SHOWDEBUG {
 				fmt.Printf("[WS] Failed to start WebSocket server: %v\n", err)
-			}
-		}
-	}()
-}
-
-// StartTelegramServer starts an HTTP server on the specified port for handling /t endpoint
-func (a *App) StartTelegramServer(port uint16) {
-	// Close previous server if running
-	a.telegramServerMutex.Lock()
-	if a.telegramServer != nil {
-		if SHOWDEBUG {
-			fmt.Println("Closing Telegram server")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		a.telegramServer.Shutdown(ctx)
-		a.telegramServer = nil
-		time.Sleep(10 * time.Millisecond)
-	}
-	a.telegramServerMutex.Unlock()
-
-	if SHOWDEBUG {
-		fmt.Printf("Starting Telegram server on port %d...\n", port)
-	}
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/t", a.handleTelegramRequest)
-
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	a.telegramServerMutex.Lock()
-	a.telegramServer = server
-	a.telegramServerMutex.Unlock()
-
-	go func() {
-		if SHOWDEBUG {
-			fmt.Printf("[Telegram] Server listening on %s\n", addr)
-		}
-		runtime.EventsEmit(a.ctx, "TELEGRAM_SERVER_STARTED", addr)
-
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			if SHOWDEBUG {
-				fmt.Printf("[Telegram] Failed to start server: %v\n", err)
 			}
 		}
 	}()
@@ -685,4 +640,36 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 func Float32frombytes(b []byte) float32 {
 	bits := binary.LittleEndian.Uint32(b)
 	return *(*float32)(unsafe.Pointer(&bits))
+}
+
+// CaptureScreenshot captures the application window and returns base64 image data
+func (a *App) CaptureScreenshot() (string, error) {
+	// Get window position and size
+	posX, posY := runtime.WindowGetPosition(a.ctx)
+	width, height := runtime.WindowGetSize(a.ctx)
+
+	// Create bounds rectangle for the window
+	bounds := image.Rect(posX, posY, posX+width, posY+height)
+
+	// Capture just the window area
+	img, err := screenshot.CaptureRect(bounds)
+	if err != nil {
+		return "", fmt.Errorf("failed to capture window: %w", err)
+	}
+
+	// Encode to PNG
+	var buf bytes.Buffer
+	err = png.Encode(&buf, img)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode image: %w", err)
+	}
+
+	// Convert to base64
+	base64Data := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	if SHOWDEBUG {
+		fmt.Printf("Screenshot captured: %dx%d at (%d,%d)\n", width, height, posX, posY)
+	}
+
+	return base64Data, nil
 }

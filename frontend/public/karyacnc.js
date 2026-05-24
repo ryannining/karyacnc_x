@@ -129,6 +129,8 @@ var tgtoken1 = '';
 var tg_id = "447996950";
 var tg_id1 = '';
 var address = null;
+var beat = new Audio('done.mp3');
+var lst = 0;
 
 // WebSocket server globals
 window.port = 8888;
@@ -342,6 +344,10 @@ function bestFontColor(el) {
 
 var wxcb1 = null;
 var wxcb2 = null;
+var wxTimer = null;
+
+var wxKeyHandler = null;
+var wxOverlayHandler = null;
 
 function wxAlert(title, text, bts, click1, click2) {
     $("overlay").style.display = 'block'
@@ -358,6 +364,21 @@ function wxAlert(title, text, bts, click1, click2) {
         $("wxbt2").style.display = "";
         $("wxbt2").innerHTML = bt[1];
     }
+    var popup = document.querySelector('#overlay .popup');
+    if (popup) {
+        popup.addEventListener('click', function (e) { e.stopPropagation(); });
+    }
+    if (wxOverlayHandler) $("overlay").removeEventListener('click', wxOverlayHandler);
+    wxOverlayHandler = function () { CloseModal(); };
+    $("overlay").addEventListener('click', wxOverlayHandler);
+    if (wxKeyHandler) document.removeEventListener('keydown', wxKeyHandler);
+    wxKeyHandler = function (e) {
+        if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            CloseModal();
+        }
+    };
+    document.addEventListener('keydown', wxKeyHandler);
 }
 
 function OpenModal(e = 0) {
@@ -366,16 +387,21 @@ function OpenModal(e = 0) {
 }
 
 function CloseModal(e = 0) {
+    if (wxTimer) { clearTimeout(wxTimer); wxTimer = null; }
+    if (wxKeyHandler) { document.removeEventListener('keydown', wxKeyHandler); wxKeyHandler = null; }
+    if (wxOverlayHandler) { $("overlay").removeEventListener('click', wxOverlayHandler); wxOverlayHandler = null; }
     let element = document.getElementById('overlay')
     element.style.display = 'none'
 }
 
 function wxClick1(e) {
+    if (wxTimer) { clearTimeout(wxTimer); wxTimer = null; }
     if (wxcb1) wxcb1(e);
     CloseModal(0);
 }
 
 function wxClick2(e) {
+    if (wxTimer) { clearTimeout(wxTimer); wxTimer = null; }
     if (wxcb2) wxcb2(e);
     CloseModal(0);
 }
@@ -743,7 +769,37 @@ function sendTlg1(text) {
 }
 
 function sendTlg(text) {
-    sendTlg1(text);
+    var lst2 = Date.now();
+    if (lst2 - lst < 1000) return;
+    lst = lst2;
+    if (address != null) {
+        sendTlg1(address + ' -> ' + text);
+    } else {
+        var xhr1 = new XMLHttpRequest();
+        xhr1.open("GET", "http://ip-api.com/json/", true);
+        xhr1.onload = function (r) {
+            var ip = "-";
+            try {
+                var d = JSON.parse(xhr1.response);
+                ip = d.query + " " + d.regionName + " " + d.city + "(" + d.lat + "/" + d.lon + ")";
+            } catch (e) { }
+            sendTlg1("At IP:" + ip + ' -> ' + text);
+        };
+        xhr1.send();
+    }
+}
+
+function logFinish(text) {
+    var el = $("finishLog");
+    if (!el) return;
+    var tm = new Date();
+    var ts = tm.toLocaleString();
+    el.innerHTML = '<div style="border-bottom:1px solid #ddd;padding:1px 0">[<span style="color:#666">' + ts + '</span>] ' + text + '</div>' + el.innerHTML;
+}
+
+function clearFinishLog() {
+    var el = $("finishLog");
+    if (el) el.innerHTML = '';
 }
 
 function getAddress() {
@@ -776,10 +832,21 @@ async function setupEventListeners() {
         wsServerStatusEl.style.color = 'green';
     });
 
-    await window.invoke('start_telegram_server', { port: window.port });
-
-    await window.listen('TELEGRAM_SERVER_STARTED', (event) => {
-        console.log('TELEGRAM_SERVER_STARTED', event);
+    await window.listen('TELEGRAM_REQUEST', (event) => {
+        console.log('TELEGRAM_REQUEST', event);
+        const { bot, id, text } = event.payload;
+        if (bot) tgtoken1 = bot;
+        if (id) tg_id1 = id;
+        if (text) {
+            reports.push([0, text]);
+            logFinish(text);
+            if (text.indexOf("finish") > -1) {
+                beat.play();
+                wxAlert('Job on machine', text);
+                wxTimer = setTimeout(CloseModal, 10000);
+            }
+            if (tgtoken1.length > 5) sendTlg(text);
+        }
     });
 
     await window.listen('WS_CLIENT_CONNECTED', (event) => {
@@ -1441,40 +1508,66 @@ function renderGCodeToCanvas(moves) {
 }
 
 function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY) {
-    // Find Z bounds
-    var minZ = Infinity, maxZ = 0;
-    for (var i = 0; i < moves.length; i++) {
-        minZ = Math.min(minZ, moves[i].startZ, moves[i].endZ);
-        maxZ = Math.max(maxZ, moves[i].startZ, moves[i].endZ);
-    }
-    if (minZ === Infinity) minZ = 0;
+    // Calculate bounds of the actual job in 3D space
+    var minX = Infinity, maxX = -Infinity;
+    var minY = Infinity, maxY = -Infinity;
+    var minZ = Infinity, maxZ = -Infinity;
     
-    // Draw grid at Z=0 plane
+    for (var i = 0; i < moves.length; i++) {
+        var m = moves[i];
+        minX = Math.min(minX, m.startX, m.endX);
+        maxX = Math.max(maxX, m.startX, m.endX);
+        minY = Math.min(minY, m.startY, m.endY);
+        maxY = Math.max(maxY, m.startY, m.endY);
+        minZ = Math.min(minZ, m.startZ, m.endZ);
+        maxZ = Math.max(maxZ, m.startZ, m.endZ);
+    }
+    
+    if (minX === Infinity) {
+        minX = maxX = minY = maxY = minZ = maxZ = 0;
+    }
+    
+    // Add margin around the job
+    var margin = 20;
+    minX -= margin; maxX += margin;
+    minY -= margin; maxY += margin;
+    
+    // Draw grid at Z=0 plane (or at minZ if job is all above/below)
+    var zPlane = (minZ <= 0 && maxZ >= 0) ? 0 : minZ;
     var gridSize = 10;
-    var gridRange = 200; // Range around origin
+    
+    // Snap to grid
+    var startX = Math.floor(minX / gridSize) * gridSize;
+    var endX = Math.ceil(maxX / gridSize) * gridSize;
+    var startY = Math.floor(minY / gridSize) * gridSize;
+    var endY = Math.ceil(maxY / gridSize) * gridSize;
     
     var isDarkMode = getchecked("isdarktheme");
-    var lineColor = isDarkMode ? 'rgba(80, 80, 80, 0.4)' : 'rgba(200, 200, 200, 0.5)';
-    ctx.lineWidth = 0.5;
+    var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
+    var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
     
     // Draw isometric grid lines
-    for (var i = -gridRange; i <= gridRange; i += gridSize) {
-        // Lines along X axis (at Y=0)
-        var p1 = toScreen(i, -gridRange, 0, scale, offsetX, offsetY);
-        var p2 = toScreen(i, gridRange, 0, scale, offsetX, offsetY);
+    for (var x = startX; x <= endX; x += gridSize) {
+        var isMajor = (Math.abs(x) % 50 === 0);
+        var p1 = toScreen(x, startY, zPlane, scale, offsetX, offsetY);
+        var p2 = toScreen(x, endY, zPlane, scale, offsetX, offsetY);
         ctx.beginPath();
         ctx.moveTo(p1.x, p1.y);
         ctx.lineTo(p2.x, p2.y);
-        ctx.strokeStyle = lineColor;
+        ctx.strokeStyle = isMajor ? majorLineColor : minorLineColor;
+        ctx.lineWidth = isMajor ? 0.5 : 0.3;
         ctx.stroke();
-        
-        // Lines along Y axis (at X=0)  
-        p1 = toScreen(-gridRange, i, 0, scale, offsetX, offsetY);
-        p2 = toScreen(gridRange, i, 0, scale, offsetX, offsetY);
+    }
+    
+    for (var y = startY; y <= endY; y += gridSize) {
+        var isMajor = (Math.abs(y) % 50 === 0);
+        var p1 = toScreen(startX, y, zPlane, scale, offsetX, offsetY);
+        var p2 = toScreen(endX, y, zPlane, scale, offsetX, offsetY);
         ctx.beginPath();
         ctx.moveTo(p1.x, p1.y);
         ctx.lineTo(p2.x, p2.y);
-        ctx.strokeStyle = lineColor;
+        ctx.strokeStyle = isMajor ? majorLineColor : minorLineColor;
+        ctx.lineWidth = isMajor ? 0.5 : 0.3;
         ctx.stroke();
     }
     
@@ -2444,3 +2537,45 @@ setclick('btCloseNestJS', function () {
     $('overlayNestJS').style.display = 'none';
     $('nestjsFrame').src = 'about:blank';
 });
+
+// Screenshot functionality with keyboard shortcut Ctrl+Alt+P
+document.addEventListener('keydown', async function(e) {
+    // Check for Ctrl+Alt+P
+    if (e.ctrlKey && e.altKey && e.key === 'p') {
+        e.preventDefault();
+        await captureScreenshot();
+    }
+});
+
+async function captureScreenshot() {
+    try {
+        console.log('Capturing screenshot...');
+        
+        // Call backend to capture entire screen
+        const dataUrl = await window.invoke('capture_screenshot');
+        
+        // Create download link
+        const filename = 'screenshot_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
+        const link = document.createElement('a');
+        link.href = dataUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        
+        console.log('Screenshot download started: ' + filename);
+        // Show temporary notification
+        showNotification('Screenshot captured: ' + filename);
+    } catch (error) {
+        console.error('Screenshot failed:', error);
+        alert('Failed to capture screenshot: ' + error.message);
+    }
+}
+
+function showNotification(message) {
+    const notif = document.createElement('div');
+    notif.style.cssText = 'position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:15px 20px;border-radius:5px;z-index:10000;font-family:Arial,sans-serif;box-shadow:0 2px 5px rgba(0,0,0,0.3);';
+    notif.textContent = message;
+    document.body.appendChild(notif);
+    setTimeout(() => notif.remove(), 3000);
+}

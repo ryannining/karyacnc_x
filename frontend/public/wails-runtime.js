@@ -44,6 +44,9 @@
                         case 'installInkscapeExtension':
                             return await window.go.main.App.InstallInkscapeExtension(args);
 
+                        case 'capture_screenshot':
+                            return await window.go.main.App.CaptureScreenshot();
+
                         default:
                             throw new Error(`Unknown command: ${command}`);
                     }
