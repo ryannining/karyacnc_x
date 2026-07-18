@@ -261,8 +261,9 @@ class laser_gcode(inkex.Effect):
             return etree.fromstring(etree.tostring(element))
         return path
 
-    def import_nested_svg(self, nested_svg):
-        """Import the nested SVG content into the current document."""
+    def import_nested_svg(self, nested_svg, position=None):
+        """Import the nested SVG content into the current document.
+        If position (x, y) is given, the imported group is translated to that point."""
         # Get the current layer or create a new one
         try:
             layer = self.svg.get_current_layer()
@@ -272,6 +273,9 @@ class laser_gcode(inkex.Effect):
         # Create a group for the nested paths
         group = etree.SubElement(layer, inkex.addNS('g', 'svg'))
         group.set(inkex.addNS('label', 'inkscape'), 'Nested Parts')
+        if position is not None:
+            x, y = position
+            group.set('transform', f'translate({x},{y})')
 
         # Import each path from the nested SVG
         for element in nested_svg:
@@ -281,6 +285,41 @@ class laser_gcode(inkex.Effect):
                 # Copy attributes
                 for attr, value in element.items():
                     path.set(attr, value)
+
+    def find_text_marker(self, keyword):
+        """Find a selected text element whose content exactly matches `keyword`
+        (case-insensitive, whitespace-trimmed). Returns (element, (x, y_below))
+        with the position just below the text in document user space, or
+        (None, None) if not found."""
+        keyword = keyword.strip().lower()
+        for layer in self.selected_paths:
+            for elem in self.selected_paths[layer]:
+                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                if tag not in ('text', 'tspan'):
+                    continue
+                text_content = ''.join(elem.itertext()).strip().lower()
+                if text_content != keyword:
+                    continue
+                return elem, self._text_position_below(elem)
+        return None, None
+
+    def _text_position_below(self, elem):
+        """Compute a point at the bottom-center of the given text element in document space."""
+        try:
+            bbox = elem.bounding_box()
+            if bbox is not None and (bbox.width > 0 or bbox.height > 0):
+                return (bbox.center.x, bbox.bottom)
+        except Exception:
+            logger.exception("Error computing bounding box for nest marker")
+        # Fallback: use x/y attributes and font-size from style
+        x = float(elem.get('x', 0))
+        y = float(elem.get('y', 0))
+        font_size = 0.0
+        style = elem.get('style', '')
+        m = re.search(r'font-size:\s*([0-9.]+)', style)
+        if m:
+            font_size = float(m.group(1))
+        return (x, y + font_size)
 
     def export_path(self,paths,xmin,ymin):
         f=0
@@ -361,7 +400,6 @@ class laser_gcode(inkex.Effect):
         self.arg_parser.add_argument("--directory",type=str,default="",help="Output directory")
         self.arg_parser.add_argument("--filename",type=str,default="output.gcode",help="File name")
         self.arg_parser.add_argument("--karyaws",type=str,default=";",help="KaryaCNC WS Server IP last number")
-        self.arg_parser.add_argument("--action",type=str,default="karyacnc",help="Action: karyacnc or nesting")        
         self.arg_parser.add_argument("--nesting_port",type=int,default=3000,help="Nesting port")
         self.arg_parser.add_argument("--flatten",type=float,default="0.1",help="Flatten resolution")
         self.arg_parser.add_argument("--port",type=str,default="8888",help="Karyacnc port")
@@ -460,21 +498,42 @@ class laser_gcode(inkex.Effect):
         if (self.karyacnc):gcode = ";KARYACNC,"+self.karyacnc+"\n"
         
         getstyles=('fill:','stroke:','stroke-width:')
-        def getStyles(node):
-            res={"fill:":"#ffffff","stroke:":"#000000","stroke-width:":"0","deep:":0,"repeat:":0}
-            #if 'deep' in node.attrib:
-            res['deep:']=node.get('deep')
-            res['repeat:']=node.get('repeat')
+        attr_map={'fill':'fill:','stroke':'stroke:','stroke-width':'stroke-width:'}
+        def parseStyle(node):
+            res={}
+            for attr,key in attr_map.items():
+                v=node.get(attr)
+                if v is not None:
+                    res[key]=v
             if 'style' in node.attrib:
-                style=node.get('style') # fixme: this will break for presentation attributes!
+                style=node.get('style')
                 if style!='':
-                    #inkex.debug('old style:'+style)
                     styles=style.split(';')
                     for i in range(len(styles)):
                         for st in getstyles:
                             if styles[i].startswith(st):
                                 res[st]=styles[i][len(st):]
-            
+            return res
+
+        def getStyles(node):
+            res={"fill:":"#ffffff","stroke:":"#000000","stroke-width:":"0","deep:":0,"repeat:":0}
+            res['deep:']=node.get('deep')
+            res['repeat:']=node.get('repeat')
+            inherited = {}
+            current = node
+            root = self.document.getroot()
+            while current is not None and current != root:
+                parsed = parseStyle(current)
+                for st in getstyles:
+                    if st in parsed and st not in inherited:
+                        inherited[st] = parsed[st]
+                current = current.getparent()
+            node_style = parseStyle(node)
+            for st in getstyles:
+                if st in node_style:
+                    res[st] = node_style[st]
+                elif st in inherited:
+                    res[st] = inherited[st]
             return res
 
         
@@ -490,6 +549,9 @@ class laser_gcode(inkex.Effect):
 
         for layer in [layer for layer in self.layers if layer in paths]:
             for path in paths[layer]:
+                tag = path.tag.split('}')[-1] if '}' in path.tag else path.tag
+                if tag in ('text', 'tspan'):
+                    continue
                 pstyle = getStyles(path)
                 col = pstyle["fill:"]
                 xpath = path.to_path_element()
@@ -528,51 +590,69 @@ class laser_gcode(inkex.Effect):
 ################################################################################
     def effect(self) :
         self.get_info()
-        if self.options.action == 'karyacnc':
+        nest_elem, nest_position = self.find_text_marker("nest")
+        result_elem, result_position = self.find_text_marker("result")
+
+        # Collect selected non-text objects, excluding any marker text
+        other_objects = {}
+        for layer in self.selected_paths:
+            for elem in self.selected_paths[layer]:
+                if elem is nest_elem or elem is result_elem:
+                    continue
+                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                if tag in ('text', 'tspan'):
+                    continue
+                other_objects.setdefault(layer, []).append(elem)
+
+        # Upload: nest text with other objects
+        if nest_elem is not None and other_objects:
+            try:
+                svg_data = self.create_svg_from_selection(other_objects)
+                fields = {'inkscape': 'y'}
+                files = {'svg_data': ('input.svg', svg_data, 'image/svg+xml')}
+                status_code, _ = self.send_nesting_request("POST", "/upload_svg", fields, files)
+                if status_code != 200:
+                    inkex.errormsg(f"Failed to upload. Status code: {status_code}")
+            except Exception as e:
+                inkex.errormsg(f"Error during nesting upload: {str(e)}")
+            return
+
+        # Error: result text with other objects (must be alone)
+        if result_elem is not None and other_objects:
+            inkex.errormsg("Untuk download hasil nesting, pilih hanya teks 'result' tanpa objek lain.")
+            return
+
+        # Download: nest alone, or result alone
+        dl_trigger = nest_elem if nest_elem is not None else result_elem
+        dl_position = nest_position if nest_elem is not None else result_position
+
+        if dl_trigger is not None:
+            try:
+                status_code, svg_content = self.send_nesting_request("GET", "/result_svg")
+                if status_code == 200:
+                    try:
+                        start_idx = svg_content.find('<')
+                        if start_idx != -1:
+                            svg_content = svg_content[start_idx:]
+                        nested_svg = etree.fromstring(svg_content.strip().encode('utf-8'))
+                        self.import_nested_svg(nested_svg, position=dl_position)
+                    except Exception as e:
+                        logger.exception("Parser error")
+                        inkex.errormsg(f"Error parsing SVG response: {str(e)}")
+                elif status_code == 404:
+                    inkex.errormsg("Blom ada hasil. Jalankan nesting lalu klik 'Select as Best' dulu.")
+                else:
+                    inkex.errormsg(f"Failed to retrieve solution. Status code: {status_code}")
+            except Exception as e:
+                inkex.errormsg(f"Error during nesting download: {str(e)}")
+            return
+
+        # No markers: gcode if there are objects, otherwise error
+        if other_objects:
             self.laser()
-        elif self.options.action == 'nesting':
-            # Nesting logic with quiet mode support
-            quiet_mode = True #self.options.quiet_mode.lower() in ('true', '1', 'yes')
-            has_selection = False
-            for layer in self.selected_paths:
-                if self.selected_paths[layer]:
-                    has_selection = True
-                    break
-            
-            if has_selection:
-                # Upload to nesting
-                try:
-                    svg_data = self.create_svg_from_selection(self.selected_paths)
-                    fields = {'inkscape': 'y'}
-                    files = {'svg_data': ('input.svg', svg_data, 'image/svg+xml')}
-                    status_code, response_text = self.send_nesting_request("POST", "/upload_svg", fields, files)
-                    if status_code == 200:
-                        if not quiet_mode:
-                            inkex.errormsg("Selection uploaded successfully to Nesting App.")
-                    else:
-                        inkex.errormsg(f"Failed to upload. Status code: {status_code}")
-                except Exception as e:
-                    inkex.errormsg(f"Error during nesting upload: {str(e)}")
-            else:
-                # Download from nesting
-                try:
-                    status_code, svg_content = self.send_nesting_request("GET", "/result_svg")
-                    if status_code == 200:
-                        try:
-                            start_idx = svg_content.find('<')
-                            if start_idx != -1:
-                                svg_content = svg_content[start_idx:]
-                            nested_svg = etree.fromstring(svg_content.strip().encode('utf-8'))
-                            self.import_nested_svg(nested_svg)
-                        except Exception as e:
-                            logger.exception("Parser error")
-                            inkex.errormsg(f"Error parsing SVG response: {str(e)}")
-                    elif status_code == 404:
-                        inkex.errormsg("No solution SVG found on server. Please run nesting and click 'Select as Best' first.")
-                    else:
-                        inkex.errormsg(f"Failed to retrieve solution. Status code: {status_code}")
-                except Exception as e:
-                    inkex.errormsg(f"Error during nesting download: {str(e)}")
+        else:
+            inkex.errormsg("Tidak ada seleksi. Pilih objek untuk G-code, teks 'nest' + objek untuk upload nesting, atau teks 'nest'/'result' sendirian untuk download hasil.")
+
 
 if __name__ == '__main__':
     laser_gcode().run()

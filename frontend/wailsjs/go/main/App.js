@@ -6,6 +6,10 @@ export function CaptureScreenshot() {
   return window['go']['main']['App']['CaptureScreenshot']();
 }
 
+export function ClearInvoiceCache() {
+  return window['go']['main']['App']['ClearInvoiceCache']();
+}
+
 export function ConnectToMachine(arg1, arg2) {
   return window['go']['main']['App']['ConnectToMachine'](arg1, arg2);
 }
@@ -18,6 +22,14 @@ export function FrontendLog(arg1, arg2) {
   return window['go']['main']['App']['FrontendLog'](arg1, arg2);
 }
 
+export function GetInvoiceCacheStats() {
+  return window['go']['main']['App']['GetInvoiceCacheStats']();
+}
+
+export function GetRajaOngkirKey() {
+  return window['go']['main']['App']['GetRajaOngkirKey']();
+}
+
 export function InstallInkscapeExtension() {
   return window['go']['main']['App']['InstallInkscapeExtension']();
 }
@@ -26,8 +38,24 @@ export function OpenDevtools() {
   return window['go']['main']['App']['OpenDevtools']();
 }
 
+export function OpenInvoice() {
+  return window['go']['main']['App']['OpenInvoice']();
+}
+
 export function ProxyRequest(arg1) {
   return window['go']['main']['App']['ProxyRequest'](arg1);
+}
+
+export function RajaOngkirKeyStatus() {
+  return window['go']['main']['App']['RajaOngkirKeyStatus']();
+}
+
+export function RefreshSingleCost(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['RefreshSingleCost'](arg1, arg2, arg3, arg4);
+}
+
+export function SetRajaOngkirKey(arg1) {
+  return window['go']['main']['App']['SetRajaOngkirKey'](arg1);
 }
 
 export function StartReceiving() {

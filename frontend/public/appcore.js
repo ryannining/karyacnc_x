@@ -245,6 +245,17 @@ var ink_images = [];
 var engravebounds = [];
 var cuttabs = [];
 var starttabs = [];
+var virtualStartPoints = [];
+// ------------------------------------------------------------------------
+// Spatial-hash indices (rebuilt on each pathstoText1 / sortedgcode call).
+// - cuttabGrid / starttabGrid: maps cell → cuttab / starttab indices, for
+//   O(1) edge-vs-tab intersection lookup in prepare_line2
+// - srtGrid: built inside sortedgcode for O(1) nearest-polygon lookup
+// (parent/child detection uses brute-force intentionally — see note in
+//  pathstoText1 — since a 3x3 grid window can miss valid parents.)
+// ------------------------------------------------------------------------
+// var cuttabGrid = null;     // { grid: Object, cellSize: number, items: [...] }
+// var starttabGrid = null;   // { grid: Object, cellSize: number, items: [...] }
 
 // ------------------------------------------------------------------------
 // Warning and Output
@@ -914,7 +925,7 @@ function prepare_line2(lenmm, lines, ofs1) {
 			for (var i = 0; i < offsetted_paths.length; i++) {
 				var newline = [];
 				var path = offsetted_paths[i];
-				var path = ClipperLib.JS.Lighten(offsetted_paths[i], detail * scale);
+				// var path = ClipperLib.JS.Lighten(offsetted_paths[i], detail * scale);
 				if (sty.dovcarve) {
 					combinedpath.push([path, clk]);
 				} else {
@@ -935,26 +946,65 @@ function prepare_line2(lenmm, lines, ofs1) {
 
 							if (j > 0) {
 								ds = sqrt(sqr(x - ox) + sqr(y - oy));
-								if (cektab)
-									for (var k = 0; k < cuttabs.length; k++) {
-										var p1 = cuttabs[k][0];
-										var p2 = cuttabs[k][1];
-										var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
-										if (si != null) {
-											si = s + ds * (si);
-											console.log("Intersect at" + (si));
-											cuts.push(si);
+								if (cektab) {
+									// Spatial-hash lookup: expanding-ring query around
+									// the edge midpoint (mx, my). Cell size is 1.0
+									// and the ring expands until all tabs are
+									// covered, preserving the original "test all
+									// tabs against all edges" semantic.
+									var _mx = (ox + x) * 0.5;
+									var _my = (oy + y) * 0.5;
+									// if (cuttabGrid) {
+									// 	var _cands = gridQueryRing(cuttabGrid, _mx, _my, cuttabs.length);
+									// 	for (var _ci = 0; _ci < _cands.length; _ci++) {
+									// 		var k = _cands[_ci];
+									// 		var p1 = cuttabs[k][0];
+									// 		var p2 = cuttabs[k][1];
+									// 		var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
+									// 		if (si != null) {
+									// 			si = s + ds * (si);
+									// 			console.log("Intersect at" + (si));
+									// 			cuts.push(si);
+									// 		}
+									// 	}
+									// } else 
+									{
+										for (var k = 0; k < cuttabs.length; k++) {
+											var p1 = cuttabs[k][0];
+											var p2 = cuttabs[k][1];
+											var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
+											if (si != null) {
+												si = s + ds * (si);
+												console.log("Intersect at" + (si));
+												cuts.push(si);
+											}
 										}
 									}
-								for (var k = 0; k < starttabs.length; k++) {
-									var p1 = starttabs[k][0];
-									var p2 = starttabs[k][1];
-									var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
-									if (si != null) {
-										si = s + ds * (si);
-										console.log("Intersect at" + (si));
-										starts.push(si);
-									}
+									// if (starttabGrid) {
+									// 	var _cands2 = gridQueryRing(starttabGrid, _mx, _my, starttabs.length);
+									// 	for (var _ci2 = 0; _ci2 < _cands2.length; _ci2++) {
+									// 		var k = _cands2[_ci2];
+									// 		var p1 = starttabs[k][0];
+									// 		var p2 = starttabs[k][1];
+									// 		var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
+									// 		if (si != null) {
+									// 			si = s + ds * (si);
+									// 			console.log("Intersect at" + (si));
+									// 			starts.push(si);
+									// 		}
+									// 	}
+									// } else {
+									// 	for (var k = 0; k < starttabs.length; k++) {
+									// 		var p1 = starttabs[k][0];
+									// 		var p2 = starttabs[k][1];
+									// 		var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
+									// 		if (si != null) {
+									// 			si = s + ds * (si);
+									// 			console.log("Intersect at" + (si));
+									// 			starts.push(si);
+									// 		}
+									// 	}
+									// }
 								}
 
 							}
@@ -1180,10 +1230,14 @@ function doengrave() {
 		var tly = 1000;
 		var lsofs = getnumber("laserofs") * 0.5;
 		var pass = 0;
+		var bidir = (getchecked("engrave_y_bidirectional"));
+		if (!bidir) dir = !dir;
 		while (run && maxrun) {
 			run = 0;
 			maxrun--;
-			dir = !dir;
+			if (bidir) dir = !dir;
+			// dir = !dir;
+			// skipx = 0;
 			var first = 1;
 			first = 1;
 			for (var fi = 0; fi < ry.length; fi++) {
@@ -1200,30 +1254,31 @@ function doengrave() {
 				var y = ry[i];
 				engr = aengrave[y];
 				if (engr.length == 0) continue;
-
+				first = 1;
+				skipx = 0;
 				var slowdown = 0;
 				var slowx = [];
 
-				if ((cmd == CMD_CNC) && (i > 1)) {
-					var temp = [];
-					for (var c = 0; c < engr.length; c++) {
-						temp.push([engr[c], 0]);
-					}
-					for (var c = 0; c < lengr.length; c++) {
-						temp.push([lengr[c], 1]);
-					}
-					temp = temp.sort(nsortx);
-					var lc = [0, 0];
+				// if ((cmd == CMD_CNC) && (i > 1)) {
+				// 	var temp = [];
+				// 	for (var c = 0; c < engr.length; c++) {
+				// 		temp.push([engr[c], 0]);
+				// 	}
+				// 	for (var c = 0; c < lengr.length; c++) {
+				// 		temp.push([lengr[c], 1]);
+				// 	}
+				// 	temp = temp.sort(nsortx);
+				// 	var lc = [0, 0];
 
-					for (var c = 0; c < temp.length - 2; c++) {
-						var t = temp[c];
-						lc[t[1]] = !lc[t[1]];
-						if (c > 1 && t[1] && lc[0] && !lc[1] && (Math.abs(t[0] - temp[c + 1][0]) > 5)) {
-							slowdown = 1;
-							break;
-						}
-					}
-				}
+				// 	for (var c = 0; c < temp.length - 2; c++) {
+				// 		var t = temp[c];
+				// 		lc[t[1]] = !lc[t[1]];
+				// 		if (c > 1 && t[1] && lc[0] && !lc[1] && (Math.abs(t[0] - temp[c + 1][0]) > 5)) {
+				// 			slowdown = 1;
+				// 			break;
+				// 		}
+				// 	}
+				// }
 				var ctxstrokeStyle;
 				if (slowdown) {
 					gc += ";Y:" + mround2(y) + " Slowdown .. \nG1 F" + (f2 * 0.5) + "\n";
@@ -1531,13 +1586,13 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 	var c = $("myCanvas1");
 	var ctx = c.getContext("2d");
 	ctx.font = "8px Arial";
-	
+
 	// Apply stroke width setting
 	var strokeWidth = getnumber("strokewidth");
 	if (strokeWidth <= 0) strokeWidth = 1;
 	var scale = (window.myCanvas1 && window.myCanvas1._scale) ? window.myCanvas1._scale : 1;
 	ctx.lineWidth = strokeWidth / scale; // Adjust for zoom level to keep consistent visual width
-	
+
 	var g = 0;
 	var X1 = 0;
 	var Y1 = 0;
@@ -2301,49 +2356,253 @@ function sortedgcode() {
 	var ov = getchecked("overcut");
 
 	var mustF = 0;
-	function findnearest(closed, lx, ly, pts, sty) {
+	// function findnearest(closed, lx, ly, pts, sty) {
 
+	// 	var pstep = Math.floor(pts.length / 100) + 1;
+	// 	var newx = 0;
+	// 	var newy = 0;
+	// 	var shift = 0;
+	// 	var flip = 0;
+	// 	var dis = 100000000;
+	// 	if (closed) {
+	// 		for (var p = 0; p < pts.length; p += pstep) {
+	// 			var dx = pts[p][1] - lx;
+	// 			var dy = pts[p][2] - ly;
+	// 			var dis2 = (dx * dx + dy * dy);
+	// 			if (dis2 < dis) {
+	// 				shift = p;
+	// 				dis = dis2;
+	// 				newx = pts[p][1];
+	// 				newy = pts[p][2];
+	// 			}
+	// 		}
+	// 	} else {
+	// 		var dx = pts[0][1] - lx;
+	// 		var dy = pts[0][2] - ly;
+	// 		dis = (dx * dx + dy * dy);
+	// 		dx = pts[pts.length - 1][1] - lx;
+	// 		dy = pts[pts.length - 1][2] - ly;
+	// 		var dis2 = (dx * dx + dy * dy);
+	// 		flip = 0;
+	// 		if (dis2 < dis) {
+	// 			flip = 1;
+	// 			dis = dis2;
+	// 			newx = pts[pts.length - 1][1];
+	// 			newy = pts[pts.length - 1][2];
+	// 		}
+	// 	}
+	// 	dis = sqrt(dis);
+	// 	if (sty.greentravel) dis -= 10000;
+	// 	if (sty.sortadd)
+	// 		dis += sty.sortadd;
+	// 	return [newx, newy, dis, shift, flip];
+	// }
+	function findnearest(closed, lx, ly, pts, sty, shapeIndex) {
 		var pstep = Math.floor(pts.length / 100) + 1;
 		var newx = 0;
 		var newy = 0;
 		var shift = 0;
 		var flip = 0;
 		var dis = 100000000;
-		if (closed) {
-			for (var p = 0; p < pts.length; p += pstep) {
-				var dx = pts[p][1] - lx;
-				var dy = pts[p][2] - ly;
-				var dis2 = (dx * dx + dy * dy);
-				if (dis2 < dis) {
-					shift = p;
-					dis = dis2;
-					newx = pts[p][1];
-					newy = pts[p][2];
+
+		if (closed && virtualStartPoints[shapeIndex] && virtualStartPoints[shapeIndex].points.length > 0) {
+			var vdata = virtualStartPoints[shapeIndex];
+
+			// Lazy compute cache
+			if (vdata.realPointCache === null) {
+				console.log("calc start point cache");
+				vdata.realPointCache = [];
+				for (var v = 0; v < vdata.points.length; v++) {
+					var bestIdx = 0;
+					var bestDist = 100000000;
+					for (var p = 0; p < pts.length; p++) {
+						var dx = vdata.points[v][0] - pts[p][1];
+						var dy = vdata.points[v][1] - pts[p][2];
+						var d2 = dx * dx + dy * dy;
+						if (d2 < bestDist) {
+							bestDist = d2;
+							bestIdx = p;
+						}
+					}
+					vdata.realPointCache.push(bestIdx);
 				}
 			}
-		} else {
-			var dx = pts[0][1] - lx;
-			var dy = pts[0][2] - ly;
-			dis = (dx * dx + dy * dy);
-			dx = pts[pts.length - 1][1] - lx;
-			dy = pts[pts.length - 1][2] - ly;
-			var dis2 = (dx * dx + dy * dy);
-			flip = 0;
-			if (dis2 < dis) {
-				flip = 1;
-				dis = dis2;
-				newx = pts[pts.length - 1][1];
-				newy = pts[pts.length - 1][2];
+
+			// Cari virtual point terdekat dari (lx, ly)
+			var bestVpIndex = -1;
+			var bestVpDist = 100000000;
+			for (var v = 0; v < vdata.points.length; v++) {
+				var dx = vdata.points[v][0] - lx;
+				var dy = vdata.points[v][1] - ly;
+				var d2 = dx * dx + dy * dy;
+				if (d2 < bestVpDist) {
+					bestVpDist = d2;
+					bestVpIndex = v;
+				}
+			}
+
+			// Ambil real point dari cache
+			if (bestVpIndex >= 0) {
+				var rpi = vdata.realPointCache[bestVpIndex];
+				shift = rpi;
+				newx = pts[rpi][1];
+				newy = pts[rpi][2];
+				var dx = newx - lx;
+				var dy = newy - ly;
+				dis = dx * dx + dy * dy;
 			}
 		}
+
+		// Fallback ke logic lama jika tidak ada virtual point
+		if (dis === 100000000) {
+			if (closed) {
+				for (var p = 0; p < pts.length; p += pstep) {
+					var dx = pts[p][1] - lx;
+					var dy = pts[p][2] - ly;
+					var dis2 = (dx * dx + dy * dy);
+					if (dis2 < dis) {
+						shift = p;
+						dis = dis2;
+						newx = pts[p][1];
+						newy = pts[p][2];
+					}
+				}
+			} else {
+				var dx = pts[0][1] - lx;
+				var dy = pts[0][2] - ly;
+				dis = (dx * dx + dy * dy);
+				dx = pts[pts.length - 1][1] - lx;
+				dy = pts[pts.length - 1][2] - ly;
+				var dis2 = (dx * dx + dy * dy);
+				flip = 0;
+				if (dis2 < dis) {
+					flip = 1;
+					dis = dis2;
+					newx = pts[pts.length - 1][1];
+					newy = pts[pts.length - 1][2];
+				}
+			}
+		}
+
 		dis = sqrt(dis);
 		if (sty.greentravel) dis -= 10000;
-		if (sty.sortadd)
-			dis += sty.sortadd;
+		if (sty.sortadd) dis += sty.sortadd;
 		return [newx, newy, dis, shift, flip];
 	}
 	var lasttarget = 0;
 	var dosafesort = getchecked("safesort");
+
+	// Build spatial-hash index over gcodes for the nearest-polygon sort.
+	// Keyed on each gcode's first vertex (gcodes[i][4][0]). The query
+	// point is the current head (lx, ly). Cell size is the median of the
+	// total drawing span, so cells are a sensible fraction of the work
+	// envelope regardless of the absolute scale. The inner loop falls
+	// back to expanding ring search if the 3x3 query returns fewer
+	// items than gcodes.length (safety net for the worst case).
+	var srtGrid = null;
+	{
+		// Compute cell size from the gcode bounding box (not just median
+		// span). For a single horizontal line that spans 841 units with
+		// both endpoints at the same cell, median span is 0 → cellSize
+		// would be 1.0, which is way too small relative to the drawing
+		// extent. The sort head can then jump ~841 units away from any
+		// gcode cell, forcing the ring query to walk maxR=841000+ rings.
+		//
+		// Fix: use the gcode bounding box diagonal divided by 32 as a
+		// floor for cellSize. This keeps the cell size proportional to
+		// the drawing extent so the ring query stays fast.
+		var _nG = gcodes.length;
+		if (_nG > 0) {
+			var _minX = Infinity, _maxX = -Infinity, _minY = Infinity, _maxY = -Infinity;
+			for (var _gi = 0; _gi < _nG; _gi++) {
+				var _pts = gcodes[_gi][4];
+				if (!_pts || _pts.length === 0) continue;
+				for (var _vi = 0; _vi < _pts.length; _vi++) {
+					var _vx = _pts[_vi][1], _vy = _pts[_vi][2];
+					if (_vx < _minX) _minX = _vx;
+					if (_vx > _maxX) _maxX = _vx;
+					if (_vy < _minY) _minY = _vy;
+					if (_vy > _maxY) _maxY = _vy;
+				}
+			}
+			if (!isFinite(_minX)) { _minX = 0; _maxX = 0; _minY = 0; _maxY = 0; }
+			var _extent = Math.max(_maxX - _minX, _maxY - _minY, 1);
+			// Cell size = drawing extent / 32 (so ~32 cells across the
+			// drawing) and at least 1.0. Also respect median for dense
+			// layouts where we want smaller cells.
+			var _spans = new Array(_nG);
+			for (var _gi3 = 0; _gi3 < _nG; _gi3++) {
+				var _pts2 = gcodes[_gi3][4];
+				if (_pts2 && _pts2.length > 0) {
+					_spans[_gi3] = Math.abs(_pts2[0][1]) + Math.abs(_pts2[0][2]);
+				} else _spans[_gi3] = 0;
+			}
+			_spans.sort(function (a, b) { return a - b; });
+			var _medSpan = _spans[Math.floor(_nG / 2)] || 0;
+			var _srtCell = Math.max(Math.abs(_medSpan) / 8, _extent / 32, 1.0);
+			srtGrid = { grid: Object.create(null), cellSize: _srtCell };
+			for (var _gi2 = 0; _gi2 < _nG; _gi2++) {
+				var _p = gcodes[_gi2][4];
+				if (!_p || _p.length === 0) continue;
+				var _ccx = Math.floor(_p[0][1] / _srtCell);
+				var _ccy = Math.floor(_p[0][2] / _srtCell);
+				var _k = _ccx + "," + _ccy;
+				if (!srtGrid.grid[_k]) srtGrid.grid[_k] = [];
+				srtGrid.grid[_k].push(_gi2);
+			}
+		}
+	}
+
+	// Expanding-ring query: returns up to maxItems indices in increasing
+	// distance from (x, y). Stops when the grid extent is fully covered.
+	// (Reverted from the 3x3-with-fallback version that was missing
+	// gcodes far from the query point.)
+	function srtQuery(x, y, maxItems) {
+		if (!srtGrid) {
+			var _all = new Array(gcodes.length);
+			for (var _ai = 0; _ai < gcodes.length; _ai++) _all[_ai] = _ai;
+			return _all;
+		}
+		var _cs = srtGrid.cellSize;
+		var _ccx0 = Math.floor(x / _cs);
+		var _ccy0 = Math.floor(y / _cs);
+		// Compute L-inf max ring needed to cover the grid extent
+		var _minCx = Infinity, _maxCx = -Infinity, _minCy = Infinity, _maxCy = -Infinity;
+		for (var _gk in srtGrid.grid) {
+			var _cma = _gk.indexOf(",");
+			var _gcx = +_gk.substring(0, _cma);
+			var _gcy = +_gk.substring(_cma + 1);
+			if (_gcx < _minCx) _minCx = _gcx;
+			if (_gcx > _maxCx) _maxCx = _gcx;
+			if (_gcy < _minCy) _minCy = _gcy;
+			if (_gcy > _maxCy) _maxCy = _gcy;
+		}
+		var _maxR = Math.max(_maxCx - _ccx0, _ccx0 - _minCx, _maxCy - _ccy0, _ccy0 - _minCy) + 1;
+		if (!isFinite(_maxR) || _maxR < 1) _maxR = 1;
+		var _seen = Object.create(null);
+		var _out = [];
+		// Walk L-infinity rings outward to the grid extent. Do NOT break
+		// on empty rings (sparse grids have many empty rings but still
+		// hold items far from the query).
+		for (var _r = 0; _r <= _maxR; _r++) {
+			for (var _dx = -_r; _dx <= _r; _dx++) {
+				for (var _dy = -_r; _dy <= _r; _dy++) {
+					if (_r > 0 && Math.max(Math.abs(_dx), Math.abs(_dy)) !== _r) continue;
+					var _cell = srtGrid.grid[(_ccx0 + _dx) + "," + (_ccy0 + _dy)];
+					if (!_cell) continue;
+					for (var _ci = 0; _ci < _cell.length; _ci++) {
+						var _idx = _cell[_ci];
+						if (_seen[_idx]) continue;
+						_seen[_idx] = 1;
+						_out.push(_idx);
+						if (_out.length >= maxItems) return _out;
+					}
+				}
+			}
+		}
+		return _out;
+	}
+
 	for (var kk = 0; kk < 2; kk++) {
 		for (var i = 0; i < gcodes.length; i++) {
 			var sty = gcstyle[gcodes[i][8]];
@@ -2370,7 +2629,15 @@ function sortedgcode() {
 					}
 
 				}
-				for (var i = 0; i < gcodes.length; i++) {
+				// Spatial-hash-accelerated nearest-polygon scan. Query the
+				// expanding ring around (lx, ly) until we have enough
+				// candidates or the grid is exhausted. If exhausted and we
+				// still have room, fall back to the remaining gcodes that
+				// aren't in the seen set (preserves correctness even when
+				// the grid cell size is too small for the workspace).
+				var _qResults = srtQuery(lx, ly, gcodes.length);
+				for (var _qi = 0; _qi < _qResults.length; _qi++) {
+					var i = _qResults[_qi];
 					var sty = gcstyle[gcodes[i][8]];
 					var subch = gcodes[i][10];
 					k1 = sty.doEngrave || sty.domarking || sty.dovcarve || sty.dopocket;
@@ -2388,7 +2655,7 @@ function sortedgcode() {
 					var pts = gcodes[i][4];
 					var shift = 0;
 					var flip = 0;
-					var near = findnearest(gcodes[i][7], lx, ly, pts, sty);
+					var near = findnearest(gcodes[i][7], lx, ly, pts, sty, gcodes[i][8]);
 					newx = near[0];
 					newy = near[1];
 					dis += near[2];
@@ -2440,7 +2707,7 @@ function sortedgcode() {
 
 				if (dosafesort && (!(sty.greentravel || sty.greenskip))) {
 					if (lasttarget) {
-						var recheck = findnearest(lasttarget[0][7], lx, ly, lasttarget[0][4], gcstyle[lasttarget[0][8]]);
+						var recheck = findnearest(lasttarget[0][7], lx, ly, lasttarget[0][4], gcstyle[lasttarget[0][8]], lasttarget[0][8]);
 						lasttarget[4] = lasttarget[3];
 						lasttarget[3] = recheck[3];
 					}
@@ -2762,12 +3029,12 @@ function gcode_verify(en = 0) {
 	}
 	firstline = 1;
 	jmltravel = 0;
-	
+
 	// Clear stored draw operations in InfiniteCanvas before drawing new G-code
 	if (window.myCanvas1 && window.myCanvas1.clearDrawOperations) {
 		window.myCanvas1.clearDrawOperations();
 	}
-	
+
 	var ctx = c.getContext("2d");
 	if (ctx.reset) {
 		ctx.reset();
@@ -3149,12 +3416,185 @@ function myFunction(scale1) {
 
 }
 // ============================================================================
+// SECTION: Spatial-Hash Helpers
+// ============================================================================
+//
+// Generic 2-D spatial-hash. Items are placed into uniform cells; a query
+// (x,y,radius) walks the 3×3 neighbourhood and returns the items whose
+// position (read via getX/getY) is within radius. Coordinates and items
+// can be in any system (unscaled user units, scaled-1000 pixel units, ...);
+// the cell size is supplied by the caller.
+//
+// buildSpatialGrid(items, getX, getY, cellSize)
+//     returns { grid, cellSize, items }
+//     grid: Object map  "cx,cy" -> [itemIdx, ...]
+//
+// gridQueryCells(grid, x, y, cellSize)
+//     returns flat list of indices in the 3x3 cells around (x,y)
+//
+// gridNearestK(grid, x, y, k, getX, getY, maxRadius)
+//     returns up to k closest items by squared distance, capped at maxRadius.
+//     If maxRadius <= 0 the radius check is skipped (O(per-cell) scan).
+//
+// All helpers are pure functions of the inputs. They never mutate the
+// items array and never read module-level state.
+
+function buildSpatialGrid(items, getX, getY, cellSize) {
+	var grid = Object.create(null);
+	var cs = cellSize > 0 ? cellSize : 1;
+	for (var i = 0; i < items.length; i++) {
+		var ix = getX(items[i], i);
+		var iy = getY(items[i], i);
+		var cx = Math.floor(ix / cs);
+		var cy = Math.floor(iy / cs);
+		var k = cx + "," + cy;
+		if (!grid[k]) grid[k] = [];
+		grid[k].push(i);
+	}
+	return { grid: grid, cellSize: cs, items: items };
+}
+
+function gridQueryCells(gridObj, x, y) {
+	var cs = gridObj.cellSize;
+	var ccx = Math.floor(x / cs);
+	var ccy = Math.floor(y / cs);
+	var out = [];
+	var g = gridObj.grid;
+	for (var dx = -1; dx <= 1; dx++) {
+		for (var dy = -1; dy <= 1; dy++) {
+			var cell = g[(ccx + dx) + "," + (ccy + dy)];
+			if (!cell) continue;
+			for (var i = 0; i < cell.length; i++) out.push(cell[i]);
+		}
+	}
+	return out;
+}
+
+function gridNearestK(gridObj, x, y, k, getX, getY, maxRadius) {
+	var cands = gridQueryCells(gridObj, x, y);
+	if (cands.length === 0) return [];
+	var best = [];
+	var bestD2 = [];
+	var r2 = maxRadius > 0 ? maxRadius * maxRadius : -1;
+	for (var i = 0; i < cands.length; i++) {
+		var idx = cands[i];
+		var ix = getX(gridObj.items[idx], idx);
+		var iy = getY(gridObj.items[idx], idx);
+		var dxs = x - ix, dys = y - iy;
+		var d2 = dxs * dxs + dys * dys;
+		if (r2 > 0 && d2 > r2) continue;
+		// Insertion into top-k (smallest distance)
+		if (best.length < k) {
+			best.push(idx); bestD2.push(d2);
+			// bubble up
+			for (var j = best.length - 1; j > 0 && bestD2[j - 1] > bestD2[j]; j--) {
+				var ti = best[j]; best[j] = best[j - 1]; best[j - 1] = ti;
+				var td = bestD2[j]; bestD2[j] = bestD2[j - 1]; bestD2[j - 1] = td;
+			}
+		} else if (d2 < bestD2[best.length - 1]) {
+			best[best.length - 1] = idx; bestD2[best.length - 1] = d2;
+			for (var j2 = best.length - 1; j2 > 0 && bestD2[j2 - 1] > bestD2[j2]; j2--) {
+				var ti2 = best[j2]; best[j2] = best[j2 - 1]; best[j2 - 1] = ti2;
+				var td2 = bestD2[j2]; bestD2[j2] = bestD2[j2 - 1]; bestD2[j2 - 1] = td2;
+			}
+		}
+	}
+	return best;
+}
+
+function gridQueryAll(gridObj, x, y, getX, getY, maxRadius) {
+	var cands = gridQueryCells(gridObj, x, y);
+	if (cands.length === 0) return [];
+	var r2 = maxRadius > 0 ? maxRadius * maxRadius : -1;
+	var out = [];
+	for (var i = 0; i < cands.length; i++) {
+		var idx = cands[i];
+		var ix = getX(gridObj.items[idx], idx);
+		var iy = getY(gridObj.items[idx], idx);
+		var dxs = x - ix, dys = y - iy;
+		if (r2 > 0 && dxs * dxs + dys * dys > r2) continue;
+		out.push(idx);
+	}
+	return out;
+}
+
+// Expanding-ring query. Starts with the 3x3 cell neighbourhood; if the
+// caller asks for more items than were found, expands the search one cell
+// at a time (L-infinity ring of radius r) until either the request is
+// satisfied or no new items are found in a full ring. Returns at most
+// maxItems unique item indices.
+//
+// This is the safe replacement for gridQueryCells when the grid cell size
+// is not guaranteed to cover the query radius.
+function gridQueryRing(gridObj, x, y, maxItems, maxR) {
+	if (!gridObj || !gridObj.grid) return [];
+	var cs = gridObj.cellSize;
+	var ccx0 = Math.floor(x / cs);
+	var ccy0 = Math.floor(y / cs);
+	var g = gridObj.grid;
+	var seen = Object.create(null);
+	var out = [];
+	if (maxItems <= 0) maxItems = 1e9;
+	// If maxR is provided, the caller is bounding the search to a known
+	// radius. Otherwise, use the precomputed grid extent (cached on
+	// gridObj at build time). Fall back to scanning keys if no cached
+	// extent is available.
+	if (maxR === undefined || maxR === null || maxR < 0) {
+		if (gridObj.minCx !== undefined) {
+			maxR = Math.max(gridObj.maxCx - ccx0, ccx0 - gridObj.minCx,
+				gridObj.maxCy - ccy0, ccy0 - gridObj.minCy) + 1;
+		} else {
+			maxR = 0;
+			var minCx = Infinity, maxCx = -Infinity, minCy = Infinity, maxCy = -Infinity;
+			for (var _k in g) {
+				var _comma = _k.indexOf(",");
+				var _cx = +_k.substring(0, _comma);
+				var _cy = +_k.substring(_comma + 1);
+				if (_cx < minCx) minCx = _cx;
+				if (_cx > maxCx) maxCx = _cx;
+				if (_cy < minCy) minCy = _cy;
+				if (_cy > maxCy) maxCy = _cy;
+			}
+			maxR = Math.max(maxCx - ccx0, ccx0 - minCx, maxCy - ccy0, ccy0 - minCy) + 1;
+		}
+		if (!isFinite(maxR) || maxR < 1) maxR = 1;
+	}
+	// Walk the L-infinity ring outward. We do NOT break on empty rings:
+	// a sparse grid has many empty rings but still contains items far
+	// from the query. The cost of visiting empty cells is one map
+	// lookup each, which is far cheaper than running the per-item
+	// distance test in a full O(N) scan.
+	for (var r = 0; r <= maxR; r++) {
+		for (var dx = -r; dx <= r; dx++) {
+			for (var dy = -r; dy <= r; dy++) {
+				if (r > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+				var cell = g[(ccx0 + dx) + "," + (ccy0 + dy)];
+				if (!cell) continue;
+				for (var ci = 0; ci < cell.length; ci++) {
+					var idx = cell[ci];
+					if (seen[idx]) continue;
+					seen[idx] = 1;
+					out.push(idx);
+					if (out.length >= maxItems) return out;
+				}
+			}
+		}
+	}
+	return out;
+}
+
+// ============================================================================
 // SECTION: SVG Path Parsing - Part C (pathstoText1)
 // ============================================================================
 
 function pathstoText1(gx) {
 	cache_ink_img = [];
 	mind = getnumber("minR");
+
+	// Invalidate spatial-hash indices at the start of every pathstoText1
+	// call so stale data from a prior SVG never bleeds through.
+	// cuttabGrid = null;
+	// starttabGrid = null;
 
 	var join = getchecked("enablejoin");
 	gcstyle = [];
@@ -3412,21 +3852,24 @@ function pathstoText1(gx) {
 		var sty = paths[i][9];
 		var stro = sty["stroke"];
 		var cuttab = (stro == "#800000");
-		var starttab = (stro == "#550000");
+		var starttab = false;//(stro == "#550000");
 		var centerpos = (stro == "#008080");
 		var engravebound = (stro == "#ffff00");
+		var cp = paths[i][0];
+		if (centerpos && cp.length == 2) {
+			starttab = true;
+			centerpos = false;
+		}
 		if (cuttab) {
-			var cp = paths[i][0];
-			if (cp.length >= 2) cuttabs.push([cp[0], cp[cp.length - 1]]);
+			if (cp.length == 2) cuttabs.push([cp[0], cp[cp.length - 1]]);
 			continue;
 		}
 		if (starttab) {
-			var cp = paths[i][0];
 			if (cp.length >= 2) starttabs.push([cp[0], cp[cp.length - 1]]);
 			continue;
 		}
 		if (engravebound) {
-			var pa = paths[i][0];
+			var pa = cp;
 			if (pa.length > 2) {
 				engravebounds.push(paths[i]);
 				paths[i][1] = isClockwise(pa);
@@ -3436,19 +3879,22 @@ function pathstoText1(gx) {
 			sty.bound = 1;
 		}
 		if (centerpos) {
-			var ps = paths[i][0];
-			var sx = 0;
-			var sy = 0;
+			var ps = cp;
+			var xmin = 1000000, xmax = -1000000;
+			var ymin = 1000000, ymax = -1000000;
 
-			for (j in ps) {
+			for (var j = 0; j < ps.length; j++) {
 				var p = ps[j];
-				sx += p[0];
-				sy += p[1];
+				xmin = Math.min(xmin, p[0]);
+				xmax = Math.max(xmax, p[0]);
+				ymin = Math.min(ymin, p[1]);
+				ymax = Math.max(ymax, p[1]);
 			}
+
 			if (ps.length > 0) {
-				xzero += sx;
-				yzero += sy;
-				czero += ps.length;
+				xzero += (xmin + xmax) / 2;
+				yzero += (ymin + ymax) / 2;
+				czero += 1;
 			}
 			continue;
 		}
@@ -3498,6 +3944,68 @@ function pathstoText1(gx) {
 		p[1][1] -= yofs;
 
 	}
+	virtualStartPoints = [];
+	for (var i in paths) {
+		var ps = paths[i][0];
+		var closed = paths[i][8];
+		var vpoints = [];
+
+		if (closed && starttabs.length > 0) {
+			for (var k = 0; k < starttabs.length; k++) {
+				var p1 = starttabs[k][0];
+				var p2 = starttabs[k][1];
+
+				for (var e = 0; e < ps.length - 1; e++) {
+					var si = intersects_p(p1[0], p1[1], p2[0], p2[1],
+						ps[e][0], ps[e][1], ps[e + 1][0], ps[e + 1][1]);
+					if (si !== null) {
+						var ix = ps[e][0] + si * (ps[e + 1][0] - ps[e][0]);
+						var iy = ps[e][1] + si * (ps[e + 1][1] - ps[e][1]);
+						vpoints.push([ix, iy]);
+
+						// // Insert point ke path setelah index e
+						// ps.splice(e + 1, 0, [ix, iy]);
+						// e++; // skip inserted point untuk iterasi berikutnya
+					}
+				}
+			}
+		}
+		virtualStartPoints.push({
+			points: vpoints,
+			realPointCache: null  // lazy computed
+		});
+	}
+	// Build spatial-hash indices for cuttab and starttab segments so the
+	// O(E·T) intersection scan in prepare_line2 becomes O(E·k). Each entry
+	// in arr is [p1, p2], indexed by segment midpoint. Cell size = 1.0
+	// (matches the typical pathstoText1 "minR" magnitude). The lookup in
+	// prepare_line2 uses gridQueryRing which expands the search to cover
+	// far-away tabs, preserving the original "test all tabs against all
+	// edges" semantic.
+	{
+		function _buildTabGrid(arr) {
+			var _tabCell = 1.0;
+			var items = new Array(arr.length);
+			var midX = new Float64Array(arr.length);
+			var midY = new Float64Array(arr.length);
+			for (var _ti = 0; _ti < arr.length; _ti++) {
+				items[_ti] = arr[_ti];
+				midX[_ti] = (arr[_ti][0][0] + arr[_ti][1][0]) * 0.5;
+				midY[_ti] = (arr[_ti][0][1] + arr[_ti][1][1]) * 0.5;
+			}
+			var _g = Object.create(null);
+			for (var _ti2 = 0; _ti2 < arr.length; _ti2++) {
+				var _ccx = Math.floor(midX[_ti2] / _tabCell);
+				var _ccy = Math.floor(midY[_ti2] / _tabCell);
+				var _k = _ccx + "," + _ccy;
+				if (!_g[_k]) _g[_k] = [];
+				_g[_k].push(_ti2);
+			}
+			return { grid: _g, cellSize: _tabCell, items: items, midX: midX, midY: midY };
+		}
+		// if (cuttabs.length > 0) cuttabGrid = _buildTabGrid(cuttabs);
+		// if (starttabs.length > 0) starttabGrid = _buildTabGrid(starttabs);
+	}
 
 	for (var i in paths) {
 		var pa = paths[i];
@@ -3540,6 +4048,18 @@ function pathstoText1(gx) {
 	}
 	var etime = new Date();
 	var ms = etime.getTime();
+
+
+	// Note: parent/child (inside/outside) detection below uses a brute-
+	// force O(n^2) loop on purpose. A 3x3 spatial-hash optimization was
+	// tried here but produced wrong results for layouts where a small
+	// path sits inside a much larger one (e.g. 1 box with 4 holes): the
+	// 3x3 cell window around the small path's centroid could miss the
+	// large outer path, leaving the small path's "flip" state unchanged
+	// and reporting it as outside. Correctness here is critical — this
+	// drives cut direction and tab placement, so a wrong flip can ruin
+	// the workpiece. The brute-force loop is O(n^2) but `isInside` and
+	// the radius filter keep it fast enough for typical CNC jobs.
 
 	for (i in paths) {
 		var path = paths[i][0];
@@ -3700,6 +4220,7 @@ function pathstoText1(gx) {
 	gcstyle.push(sty);
 	gcstyle.push(sty);
 	gcstyle.push(sty);
+	console.log("path1totext done.");
 	return t1;
 
 }

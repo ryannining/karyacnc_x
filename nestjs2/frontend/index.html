@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVG Parts Nesting V2</title>
+    <script src="https://cdn.jsdelivr.net/npm/poly-decomp@0.3.0/build/decomp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            background: #f4f4f4;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            padding: 4px;
+        }
+
+        /* ───── Main layout ───── */
+        .container {
+            flex: 1;
+            display: flex;
+            gap: 0;
+            min-height: 0;
+        }
+
+        /* ───── Left panel (params + preview) ───── */
+        #leftPanel {
+            width: 240px;
+            min-width: 160px;
+            max-width: 50%;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background: #fff;
+            overflow: hidden;
+        }
+
+        .panel-title {
+            background: #2c2c2c;
+            color: #fff;
+            padding: 3px 8px;
+            font-size: 10px;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        .version-badge {
+            background: #2196F3;
+            color: white;
+            padding: 1px 5px;
+            border-radius: 10px;
+            font-size: 8px;
+        }
+
+        .controls {
+            padding: 4px 6px;
+            overflow-y: auto;
+            flex-shrink: 0;
+        }
+
+        .ctrl-row {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin: 2px 0;
+        }
+
+        .ctrl-row label {
+            flex: 0 0 85px;
+            color: #444;
+            font-size: 10px;
+        }
+
+        .ctrl-row input[type="number"],
+        .ctrl-row input[type="text"],
+        .ctrl-row select {
+            flex: 1;
+            padding: 1px 4px;
+            font-size: 10px;
+            border: 1px solid #bbb;
+            border-radius: 2px;
+            height: 20px;
+        }
+
+        .ctrl-row input[type="checkbox"] {
+            margin: 0;
+        }
+
+        .ctrl-row input[type="file"] {
+            flex: 1;
+            font-size: 9px;
+        }
+
+        /* ───── Preset box ───── */
+        .preset-box {
+            margin: 2px 6px;
+            padding: 4px 6px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            background: #fafafa;
+        }
+
+        .preset-box h4 {
+            margin: 0 0 3px 0;
+            font-size: 9px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .preset-row {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 2px;
+            align-items: center;
+        }
+
+        .preset-row select,
+        .preset-row input[type="text"] {
+            flex: 1;
+            padding: 1px 4px;
+            font-size: 10px;
+            border: 1px solid #bbb;
+            border-radius: 2px;
+            height: 20px;
+        }
+
+        /* ───── Buttons ───── */
+        button {
+            padding: 2px 6px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 2px;
+            font-size: 10px;
+            white-space: nowrap;
+            height: 20px;
+        }
+
+        button:hover {
+            filter: brightness(0.9);
+        }
+
+        button:disabled {
+            background-color: #9e9e9e;
+            color: #eee;
+            cursor: not-allowed;
+        }
+
+        button:disabled:hover {
+            filter: none;
+        }
+
+        #startNest {
+            width: 100%;
+            margin: 3px 0 1px;
+            padding: 4px;
+            font-size: 11px;
+            height: 26px;
+        }
+
+        /* ───── Progress ───── */
+        .progress-wrap {
+            margin: 2px 7px 4px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: #e0e0e0;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #4CAF50, #8BC34A);
+            transition: width 0.3s ease-in-out;
+        }
+
+        .progress-text {
+            text-align: center;
+            font-size: 10px;
+            color: #555;
+            margin-top: 1px;
+        }
+
+        /* ───── Preview canvas ───── */
+        .preview-wrap {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .canvas-header {
+            background: #f0f0f0;
+            border-top: 1px solid #ddd;
+            border-bottom: 1px solid #ddd;
+            padding: 2px 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        .canvas-header .title {
+            font-weight: bold;
+            font-size: 11px;
+            color: #333;
+        }
+
+        .canvas-header .info {
+            font-size: 10px;
+            color: #666;
+        }
+
+        .canvas-header .spacer {
+            flex: 1;
+        }
+
+        .canvas-container {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #fff;
+        }
+
+        /* ───── Vertical resizer (left/right) ───── */
+        #resizerV {
+            width: 5px;
+            background: #ddd;
+            cursor: col-resize;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
+            z-index: 10;
+        }
+
+        #resizerV:hover,
+        #resizerV.dragging {
+            background: #2196F3;
+        }
+
+        #resizerV::after {
+            content: '';
+            display: block;
+            width: 1px;
+            height: 20px;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        /* ───── Right panel (output) ───── */
+        #rightPanel {
+            flex: 1;
+            min-width: 200px;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background: #fff;
+            overflow: hidden;
+        }
+
+        /* ───── Output top bar ───── */
+        .output-topbar {
+            background: #2c2c2c;
+            color: #fff;
+            padding: 2px 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+
+        .output-topbar .title {
+            font-size: 10px;
+            font-weight: bold;
+        }
+
+        .output-topbar label {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 10px;
+            cursor: pointer;
+        }
+
+        /* ───── Solutions area ───── */
+        .solutions {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .solution-panel {
+            display: flex;
+            flex-direction: column;
+            min-height: 40px;
+            overflow: hidden;
+        }
+
+        /* ───── Horizontal resizer (top/bottom solutions) ───── */
+        #resizerH {
+            height: 5px;
+            background: #ddd;
+            cursor: row-resize;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
+            z-index: 10;
+        }
+
+        #resizerH:hover,
+        #resizerH.dragging {
+            background: #FF5722;
+        }
+
+        #resizerH::after {
+            content: '';
+            display: block;
+            height: 1px;
+            width: 20px;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        /* ───── Compact solution header ───── */
+        .sol-header {
+            background: #f5f5f5;
+            border-bottom: 1px solid #ddd;
+            padding: 1px 6px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-shrink: 0;
+            font-size: 10px;
+        }
+
+        .sol-header .sol-title {
+            font-weight: bold;
+            color: #333;
+            min-width: 70px;
+        }
+
+        .sol-header .sol-info {
+            color: #666;
+            font-size: 9px;
+        }
+
+        .sol-header .spacer {
+            flex: 1;
+        }
+
+        /* R-key hint */
+        .r-hint {
+            font-size: 9px;
+            color: #888;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            padding: 1px 4px;
+            display: none;
+        }
+
+        #enableDragDrop:checked~* .r-hint,
+        body.drag-active .r-hint {
+            display: inline-block;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- ════ LEFT PANEL ════ -->
+        <div id="leftPanel">
+            <div class="panel-title">
+                KaryaCNC Nesting <span class="version-badge">V2</span>
+            </div>
+
+            <div class="controls">
+                <div class="ctrl-row">
+                    <input type="file" id="svgInput" accept=".svg">
+                </div>
+
+                <div class="ctrl-row">
+                    <label>Sheet W (mm)</label>
+                    <input type="number" id="sheetWidth" value="1000">
+                </div>
+                <div class="ctrl-row">
+                    <label>Sheet H (mm)</label>
+                    <input type="number" id="sheetHeight" value="1000">
+                </div>
+                <div class="ctrl-row">
+                    <label>Rotation</label>
+                    <input type="text" id="rotation" list="rotation-presets" value="0,90,180,270">
+                    <datalist id="rotation-presets">
+                        <option value="0">No rotation</option>
+                        <option value="0,180">0°,180°</option>
+                        <option value="0,90">0°,90°</option>
+                        <option value="0,90,180,270">4 rot</option>
+                        <option value="0,45,90,135,180,225,270,315">8 rot</option>
+                        <option value="0-360:90">Range 0-360 step 90</option>
+                        <option value="0-360:45">Range 0-360 step 45</option>
+                        <option value="0-90:15,180,270">Mixed: range + angles</option>
+                    </datalist>
+                </div>
+                <div class="ctrl-row">
+                    <label>Spacing (mm)</label>
+                    <input type="number" id="spacing" value="0" min="0">
+                </div>
+                <div class="ctrl-row">
+                    <label>Grid Snap</label>
+                    <input type="number" id="gridSpacing" value="4" min="1" max="100">
+                </div>
+                <div class="ctrl-row">
+                    <input type="checkbox" id="allowFlip">
+                    <label style="flex:unset">Allow Flip</label>
+                </div>
+                <div class="ctrl-row">
+                    <input type="checkbox" id="multiCPU">
+                    <label style="flex:unset">Multi-CPU</label>
+                </div>
+                <div class="ctrl-row">
+                    <label>Algorithm</label>
+                    <select id="algorithm">
+                        <option value="grid">Grid</option>
+                        <option value="nfp2">NFP2</option>
+                        <option value="optimized" selected>Optimized</option>
+                    </select>
+                </div>
+
+                <!-- Presets -->
+                <div class="preset-box">
+                    <h4>Presets</h4>
+                    <div class="preset-row">
+                        <select id="presetSelect">
+                            <option value="">-- Select --</option>
+                        </select>
+                        <button id="deletePreset" style="background:#f44336">Del</button>
+                    </div>
+                    <div class="preset-row">
+                        <input type="text" id="presetNameInput" placeholder="Preset name...">
+                        <button id="savePreset" style="background:#2196F3">Save</button>
+                    </div>
+                </div>
+
+                <div style="padding:0 0 2px 0; display:flex; gap:3px">
+                    <button id="startNest" style="flex:1">▶ Start Nesting</button>
+                    <button id="stopNest" style="background:#f44336; display:none">■ Stop</button>
+                </div>
+                <label style="display:flex; align-items:center; gap:5px; font-size:12px; margin-top:4px">
+                    <input type="checkbox" id="infiniteNesting" /> Infinite loop (stop to keep best)
+                </label>
+            </div>
+
+            <div class="progress-wrap">
+                <div class="progress-bar">
+                    <div class="progress-fill"></div>
+                </div>
+                <div class="progress-text" id="progressText"></div>
+            </div>
+
+            <!-- Preview canvas -->
+            <div class="preview-wrap">
+                <div class="canvas-header">
+                    <span class="title">Preview</span>
+                    <span class="info">Paths: <span id="inputPathCount">0</span></span>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="previewCanvas"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- ════ VERTICAL RESIZER ════ -->
+        <div id="resizerV"></div>
+
+        <!-- ════ RIGHT PANEL ════ -->
+        <div id="rightPanel">
+            <div class="output-topbar">
+                <span class="title">Output</span>
+                <label>
+                    <input type="checkbox" id="enableDragDrop">
+                    Drag &amp; Drop
+                </label>
+                <span id="rKeyHint" style="font-size:9px;color:#aaa;display:none">[ R = cycle variation ]</span>
+            </div>
+
+            <div class="solutions">
+                <!-- ─── Current Solution ─── -->
+                <div class="solution-panel" id="currentPanel" style="flex:1">
+                    <div class="sol-header">
+                        <span class="sol-title">Current</span>
+                        <span class="sol-info">Area: <strong id="currentArea">0</strong></span>
+                        <span class="sol-info">Paths: <span id="currentPathCount">0</span></span>
+                        <span class="spacer"></span>
+                        <button id="recompactCurrent" style="background:#2196F3">Recompact</button>
+                        <button id="renestOutside" style="background:#673AB7">Renesting</button>
+                        <button id="selectAsBest">→ Best</button>
+                    </div>
+                    <div class="canvas-container">
+                        <canvas id="currentSolutionCanvas"></canvas>
+                    </div>
+                </div>
+
+                <!-- ─── Horizontal resizer ─── -->
+                <div id="resizerH"></div>
+
+                <!-- ─── Best Solution ─── -->
+                <div class="solution-panel" id="bestPanel" style="flex:1">
+                    <div class="sol-header">
+                        <span class="sol-title">Best</span>
+                        <span class="sol-info">Area: <strong id="bestArea">0</strong></span>
+                        <span class="sol-info">Paths: <span id="bestPathCount">0</span></span>
+                        <span class="spacer"></span>
+                        <button id="downloadBest" style="background:#FF9800">Download</button>
+                    </div>
+                    <div class="canvas-container">
+                        <canvas id="bestSolutionCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="js/canvas.js"></script>
+    <script src="js/clipper.js"></script>
+    <script src="js/geometry.js"></script>
+    <script src="js/nfp.js"></script>
+    <script src="js/nfp2.js"></script>
+    <script src="js/nfp_optimized.js"></script>
+    <script src="js/main.js"></script>
+</body>
+
+</html>

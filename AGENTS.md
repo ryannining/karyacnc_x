@@ -79,7 +79,7 @@ karyacnc/
 │       ├── karyacnc1.py     # Extension Python script
 │       └── websocket/       # Embedded websocket-client library
 │
-├── nestjs/                  # SVG Nesting tool (separate web app)
+├── nestjs2/                 # SVG Nesting tool V2 (separate web app)
 │   └── frontend/
 │       ├── index.html       # Nesting UI
 │       └── js/              # Nesting algorithms

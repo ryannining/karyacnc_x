@@ -47,6 +47,9 @@
                         case 'capture_screenshot':
                             return await window.go.main.App.CaptureScreenshot();
 
+                        case 'open_invoice':
+                            return await window.go.main.App.OpenInvoice();
+
                         default:
                             throw new Error(`Unknown command: ${command}`);
                     }

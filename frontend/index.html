@@ -19,57 +19,96 @@
 
 
 		.editor-container {
-				position: relative;
-				background: #ffffff;
-				font-size: 10px;
-				width: 100%;
-			}
-			#gcode-container { overflow: auto; flex: 1; position: relative; }
-			#engcode-container { overflow: auto; flex: 1; position: relative; }
-			.editor-container textarea {
-				position: absolute;
-				top: 0; left: 0;
-				width: 100%;
-				height: 100%;
-				padding: 5px;
-				font-family: 'Consolas', monospace;
-				font-size: 13px;
-				line-height: 1.5;
-				white-space: pre;
-				overflow: auto;
-				box-sizing: border-box;
-				margin: 0;
-				border: 1px solid #ccc;
-				background: transparent;
-				color: transparent;
-				caret-color: #000;
-				z-index: 2;
-				resize: none;
-			}
-			.editor-container pre {
-				position: absolute;
-				top: 0; left: 0;
-				width: 100%;
-				height: 100%;
-				padding: 5px;
-				font-family: 'Consolas', monospace;
-				font-size: 13px;
-				line-height: 1.5;
-				white-space: pre;
-				overflow: auto;
-				box-sizing: border-box;
-				margin: 0;
-				border: 1px solid #ccc;
-				color: #333;
-				pointer-events: none;
-				z-index: 1;
-			}
-			.gcode-comment { color: #228b22; font-weight: bold; }
-			.gcode-g { color: #0000ff; font-weight: bold; }
-			.gcode-m { color: #8b008b; font-weight: bold; }
-			.gcode-axis { color: #008b8b; font-weight: bold; }
-			.gcode-feed { color: #910000; font-weight: bold; }
-			.gcode-num { color: #006400; font-weight: bold; }
+			position: relative;
+			background: #ffffff;
+			font-size: 10px;
+			width: 100%;
+		}
+
+		#gcode-container {
+			overflow: auto;
+			flex: 1;
+			position: relative;
+		}
+
+		#engcode-container {
+			overflow: auto;
+			flex: 1;
+			position: relative;
+		}
+
+		.editor-container textarea {
+			position: absolute;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			padding: 5px;
+			font-family: 'Consolas', monospace;
+			font-size: 13px;
+			line-height: 1.5;
+			white-space: pre;
+			overflow: auto;
+			box-sizing: border-box;
+			margin: 0;
+			border: 1px solid #ccc;
+			background: transparent;
+			color: transparent;
+			caret-color: #000;
+			z-index: 2;
+			resize: none;
+		}
+
+		.editor-container pre {
+			position: absolute;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			padding: 5px;
+			font-family: 'Consolas', monospace;
+			font-size: 13px;
+			line-height: 1.5;
+			white-space: pre;
+			overflow: auto;
+			box-sizing: border-box;
+			margin: 0;
+			border: 1px solid #ccc;
+			color: #333;
+			pointer-events: none;
+			z-index: 1;
+		}
+
+		.gcode-comment {
+			color: #228b22;
+			font-weight: bold;
+		}
+
+		.gcode-g {
+			color: #0000ff;
+			font-weight: bold;
+		}
+
+		.gcode-m {
+			color: #8b008b;
+			font-weight: bold;
+		}
+
+		.gcode-axis {
+			color: #008b8b;
+			font-weight: bold;
+		}
+
+		.gcode-feed {
+			color: #910000;
+			font-weight: bold;
+		}
+
+		.gcode-num {
+			color: #006400;
+			font-weight: bold;
+		}
+
 		.smallwindow tr {
 			font-size: 9pt;
 			text-align: right;
@@ -168,6 +207,8 @@
 			z-index: 4000;
 		}
 
+
+
 		.popup_nestjs {
 			position: absolute;
 			width: 90%;
@@ -263,13 +304,14 @@
 	<div class="overlay_nestjs" id="overlayNestJS">
 		<div class="popup_nestjs">
 			<div class="popup_nestjs_header">
-				<span>NestJS Frame</span>
+				<span>Nesting Frame</span>
 				<button id="btCloseNestJS"
 					style="background: red; color: white; border: none; padding: 5px 10px; cursor: pointer;">Close</button>
 			</div>
 			<iframe id="nestjsFrame" src="about:blank"></iframe>
 		</div>
 	</div>
+
 	<table class=hideit width=100% id=title1 style="background:lightgray;font-weight:600">
 		<tr>
 			<td>
@@ -466,6 +508,11 @@
 											<td colspan=2>Smart Engrave </td>
 											<td colspan=2><input size=3 id=skiplength value=50 class=saveit>mm <input
 													size=2 type=checkbox id=enablesmartraster class=saveit></td>
+										</tr>
+										<tr class="notsimple notcnc notplasma">
+											<td colspan=2>Y Bidirectional </td>
+											<td colspan=2><input size=2 type=checkbox id=engrave_y_bidirectional checked
+													class=saveit></td>
 										</tr>
 										<tr class="notsimple">
 											<td colspan=2>Finish per part </td>
@@ -673,7 +720,8 @@
 								</td>
 								<td>Output Image
 									<hr>
-									<canvas id=dithercanv style="border:1px solid #000; min-width:200px; min-height:200px; background:#fff;"></canvas>
+									<canvas id=dithercanv
+										style="border:1px solid #000; min-width:200px; min-height:200px; background:#fff;"></canvas>
 								</td>
 							</tr>
 						</table>
@@ -863,7 +911,8 @@
 				<tr>
 					<td colspan=3 align=left>
 						<div id=infolain></div>
-						<hr>Total in Minute<input id=totaltime value=0 size=8 class=saveit> Real: <span id=realtimetime>-</span>
+						<hr>Total in Minute<input id=totaltime value=0 size=8 class=saveit> Real: <span
+							id=realtimetime>-</span>
 						<hr>
 						<button id=btzoom>Reset view</button>&nbsp;&nbsp;&nbsp;&nbsp;
 						<button id=btcopycanvas>Copy Canvas</button><br>
@@ -883,7 +932,9 @@
 								<b>Finish Log:</b>
 								<button onclick="clearFinishLog()" style="font-size:9px;padding:1px 4px">Clear</button>
 							</div>
-							<div id=finishLog style="max-height:120px;overflow-y:auto;font-size:11px;background:#f5f5f5;padding:2px 4px;border:1px solid #ccc"></div>
+							<div id=finishLog
+								style="max-height:120px;overflow-y:auto;font-size:11px;background:#f5f5f5;padding:2px 4px;border:1px solid #ccc">
+							</div>
 						</span>
 
 					</td>
@@ -914,7 +965,8 @@
 				</div>
 			</div>
 		</div>
-		<div id="myCanvas1td" class="grid-column" style="background:white;padding:5px;border:solid 1px;display:flex;flex-direction:column;min-height:500px;">
+		<div id="myCanvas1td" class="grid-column"
+			style="background:white;padding:5px;border:solid 1px;display:flex;flex-direction:column;min-height:500px;">
 			<div style="display: flex; justify-content: space-between;">
 				<div style="font-size: 13px;background:rgba(255,255,100,0.5);color:black" id="area_dimension">
 
@@ -929,24 +981,47 @@
 			<!-- <iframe src="graf.html" style="width:750;height:500;position:absolute;background:lightgray"></iframe>-->
 
 			<div style="display:flex;border-bottom:1px solid #ccc;background:#f5f5f5;align-items:center;">
-				<button id="tabOriginalPath" class="view-tab active" style="flex:1;padding:8px;border:none;background:#3498db;color:white;cursor:pointer;font-weight:bold;" onclick="switchViewTab('original')">Original Path</button>
-				<button id="tabGCodeRender" class="view-tab" style="flex:1;padding:8px;border:none;background:#e0e0e0;color:#333;cursor:pointer;" onclick="switchViewTab('gcode')">GCode Render</button>
-				<div id="gcodeViewControls" style="padding:0 10px;display:none;">
-					<select id="gcodeViewMode" onchange="changeGCodeViewMode(this.value)" style="padding:4px;border:1px solid #ccc;border-radius:3px;">
+				<button id="tabOriginalPath" class="view-tab active"
+					style="flex:1;padding:8px;border:none;background:#3498db;color:white;cursor:pointer;font-weight:bold;"
+					onclick="switchViewTab('original')">Original Path</button>
+				<button id="tabSimulator" class="view-tab"
+					style="flex:1;padding:8px;border:none;background:#e0e0e0;color:#333;cursor:pointer;"
+					onclick="switchViewTab('simulator')">Simulator</button>
+				<div id="gcodeViewControls" style="padding:0 10px;display:none;align-items:center;gap:8px;">
+					<select id="gcodeViewMode" onchange="changeGCodeViewMode(this.value)"
+						style="padding:4px;border:1px solid #ccc;border-radius:3px;">
 						<option value="2d">2D Top View</option>
 						<option value="isometric">Isometric View</option>
 					</select>
+					<div id="simControls" style="display:none;align-items:center;gap:6px;margin-left:4px;">
+						<button id="btnSimPlay" onclick="simToggle()" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#3498db;color:white;">▶ Play</button>
+						<button onclick="simReset()" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#6c757d;color:white;">⏹</button>
+						<input type="range" id="simProgress" min="0" max="1000" value="0" oninput="simSeek(this.value/1000)" style="width:100px;cursor:pointer;accent-color:#3498db;">
+						<span id="simTimeDisplay" style="font-size:11px;font-family:Consolas;color:#555;min-width:85px">0:00 / 0:00</span>
+						<select id="simSpeedSelect" onchange="simUpdateSpeed()" style="padding:3px 4px;border:1px solid #ccc;border-radius:3px;font-size:11px;">
+							<option value="1">1x</option>
+							<option value="2">2x</option>
+							<option value="5">5x</option>
+							<option value="10" selected>10x</option>
+							<option value="50">50x</option>
+						</select>
+					</div>
 				</div>
 			</div>
 
-			<div id="myCanvas1div" style="flex:1;min-height:400px;height:calc(100vh - 200px);overflow:hidden;position:relative;background:#f0f0f0;border:1px solid #ccc;">
+			<div id="myCanvas1div"
+				style="flex:1;min-height:400px;height:calc(100vh - 200px);overflow:hidden;position:relative;background:#f0f0f0;border:1px solid #ccc;">
 				<canvas id="myCanvas1x" width="1400" height="1200" style="cursor:grab;"></canvas>
+				<canvas id="simCanvas" width="1400" height="1200" style="display:none;cursor:grab;touch-action:none;"></canvas>
 				<!-- Bounding Box Info Panel -->
-				<div id="gcodeBoundingBox" style="position:absolute;top:10px;right:10px;background:rgba(30,30,30,0.9);border:1px solid #3498db;border-radius:6px;padding:12px;font-size:11px;color:#e0e0e0;z-index:100;min-width:150px;display:none;font-family:'Consolas',monospace;">
-					<h3 style="margin:0 0 8px 0;font-size:12px;color:#3498db;border-bottom:1px solid #444;padding-bottom:6px;">Bounding Box</h3>
+				<div id="gcodeBoundingBox"
+					style="position:absolute;top:10px;right:10px;background:rgba(30,30,30,0.9);border:1px solid #3498db;border-radius:6px;padding:12px;font-size:11px;color:#e0e0e0;z-index:100;min-width:150px;display:none;font-family:'Consolas',monospace;">
+					<h3
+						style="margin:0 0 8px 0;font-size:12px;color:#3498db;border-bottom:1px solid #444;padding-bottom:6px;">
+						Bounding Box</h3>
 					<div style="margin:3px 0;">
-						<span style="color:#888;">Size:</span> 
-						<span id="bboxWidth" style="color:#ff6b6b;font-weight:bold;">-</span> × 
+						<span style="color:#888;">Size:</span>
+						<span id="bboxWidth" style="color:#ff6b6b;font-weight:bold;">-</span> ×
 						<span id="bboxHeight" style="color:#4ecdc4;font-weight:bold;">-</span> mm
 					</div>
 					<div style="margin:6px 0;border-top:1px solid #444;padding-top:6px;">
@@ -1035,17 +1110,24 @@
 					<td colspan=2><input id=regcodeX class=saveit type=checkbox></td>
 				</tr>
 				<tr>
-					<td colspan=2>Edit Materials</td>
-					<td colspan=2><button id=btEditMaterials>Edit</button></td>
+					<td colspan=4>
+						<hr>
+						Extra tools
+					</td>
 				</tr>
 				<tr>
-					<td colspan="2" align="center"><button id="btOpenDevTools">Open Dev Console</button></td>
+					<td colspan="4" align="left"><button id=btEditMaterials>Edit Materials</button>
+						<button id="btOpenNestJSV2">Nesting V2</button><button id="btInstallInkscapeExt">Install
+							Extension</button>
+					</td>
 				</tr>
 				<tr>
-					<td colspan="2" align="center"><button id="btOpenNestJS">Open NestJS Frame</button></td>
+					<td colspan="4" align="center">
+						<button id="btOpenInvoice">Invoice Generator</button>
+					</td>
 				</tr>
 				<tr>
-					<td colspan="2" align="center"><button id="btInstallInkscapeExt">Install Inkscape Extension</button>
+					<td colspan="4" align="left">
 					</td>
 				</tr>
 

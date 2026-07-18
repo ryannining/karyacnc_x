@@ -4,17 +4,31 @@ import {context} from '../models';
 
 export function CaptureScreenshot():Promise<string>;
 
+export function ClearInvoiceCache():Promise<string>;
+
 export function ConnectToMachine(arg1:string,arg2:number):Promise<string>;
 
 export function DisconnectFromMachine():Promise<string>;
 
 export function FrontendLog(arg1:context.Context,arg2:string):Promise<void>;
 
+export function GetInvoiceCacheStats():Promise<string>;
+
+export function GetRajaOngkirKey():Promise<string>;
+
 export function InstallInkscapeExtension():Promise<void>;
 
 export function OpenDevtools():Promise<void>;
 
+export function OpenInvoice():Promise<void>;
+
 export function ProxyRequest(arg1:string):Promise<string>;
+
+export function RajaOngkirKeyStatus():Promise<string>;
+
+export function RefreshSingleCost(arg1:string,arg2:string,arg3:number,arg4:string):Promise<string>;
+
+export function SetRajaOngkirKey(arg1:string):Promise<string>;
 
 export function StartReceiving():Promise<void>;
 

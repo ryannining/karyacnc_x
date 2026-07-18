@@ -118,6 +118,7 @@ var storage = localStorage;
 
 var jobsettings = {};
 var text1_history = [];
+var text1 = '';
 var jobcnt = 0;
 var jobs = [];
 var ink_images = [];
@@ -481,7 +482,7 @@ function resizedisplay(reload = 1) {
     // With pan/zoom, canvas size remains constant
 }
 
-window.onresize = function() {
+window.onresize = function () {
     // No-op - InfiniteCanvas handles pan/zoom independently
 };
 
@@ -866,11 +867,20 @@ async function setupEventListeners() {
         savehistory(buff);
         refreshgcode();
     });
+
+    await window.listen('NESTING_UPLOAD_RECEIVED', (event) => {
+        console.log('NESTING_UPLOAD_RECEIVED', event);
+        // Show nestjs V2 frame and reload it so the previous result is cleared
+        $('overlayNestJS').style.display = 'block';
+        $('nestjsFrame').src = 'http://localhost:3000/v2/?t=' + Date.now();
+    });
 }
 
 function startserver() {
     window.port = getvalue("wsport") * 1;
     $("portnum").innerHTML = window.port;
+    // Note: RajaOngkir API key sekarang disimpan & di-set dari invoice.html
+    // (modal Pengaturan Toko) lewat endpoint /api/shop-config.
     window.setupEventListeners();
 }
 
@@ -972,11 +982,11 @@ setclick("btsavep", saveprofile);
 setclick("btdelp", delprofile);
 setclick("btloadp", loadprofile);
 
-setclick("btrecode", function() {
+setclick("btrecode", function () {
     console.log("btrecode clicked");
     refreshgcode();
 });
-setclick("btrecode2", function() {
+setclick("btrecode2", function () {
     console.log("btrecode2 clicked");
     refreshgcode();
 });
@@ -990,7 +1000,7 @@ setclick("btupload", function () {
         combinedGcode = startgcode + "\n" + getvalue("gcode") + "\n" + getvalue("engcode") + finishgcode;
     }
     begincompress(combinedGcode);
-    
+
     try {
         var result = CncPlanner.calculateJobTime(combinedGcode, defaultConfig);
         $("realtimetime").innerHTML = result.formatted;
@@ -998,7 +1008,7 @@ setclick("btupload", function () {
         console.error("Error calculating real time:", err);
         $("realtimetime").innerHTML = "Error";
     }
-    
+
     upload(getvalue("jobname") + ".gcode");
 });
 function startprint() {
@@ -1106,20 +1116,16 @@ setclick("btzoom", function () {
 
 setevent("change", "wmode", updatewmode);
 
-setevent("change", "strokewidth", function() {
+setevent("change", "strokewidth", function () {
     // Redraw canvas with new stroke width without regenerating G-code
     if (window.myCanvas1 && window.myCanvas1._redraw) {
         window.myCanvas1._redraw();
     }
 });
 
-setevent("change", "isdarktheme", function() {
-    // Redraw canvas when dark mode changes
-    if (currentViewMode === 'gcode' && gcodeParsedData.length > 0) {
-        // Clear operations untuk GCode view
-        window.myCanvas1._drawOperations = [];
-        renderGCodeToCanvas(gcodeParsedData);
-        window.myCanvas1._redraw();
+setevent("change", "isdarktheme", function () {
+    if (currentViewMode === 'simulator' && simState.moves.length > 0) {
+        simDraw();
     }
 });
 
@@ -1136,7 +1142,7 @@ document.getElementById('btInstallInkscapeExt').addEventListener('click', async 
 // GCODEX RENDERER - 2D View from GCode Text
 // ============================================================
 
-var currentViewMode = 'original'; // 'original' or 'gcode'
+var currentViewMode = 'original'; // 'original' or 'simulator'
 var gcodeViewMode = '2d'; // '2d' or 'isometric'
 var gcodeParsedData = [];
 var originalDrawOperations = []; // Backup untuk original path
@@ -1144,7 +1150,7 @@ var originalDrawOperations = []; // Backup untuk original path
 // Separate pan/zoom state for each view mode
 var viewState = {
     original: { scale: 1, offsetX: 0, offsetY: 0 },
-    gcode: { scale: 1, offsetX: 0, offsetY: 0 }
+    simulator: { scale: 1, offsetX: 0, offsetY: 0 }
 };
 
 // Isometric view constants
@@ -1153,99 +1159,59 @@ var ISO_COS = Math.cos(ISO_ANGLE);
 var ISO_SIN = Math.sin(ISO_ANGLE);
 
 function switchViewTab(mode) {
-    // Save current state before switching
-    if (window.myCanvas1 && currentViewMode) {
-        viewState[currentViewMode] = {
+    // Save InfiniteCanvas state when leaving original mode
+    if (mode !== 'original' && currentViewMode === 'original' && window.myCanvas1) {
+        viewState.original = {
             scale: window.myCanvas1._scale,
             offsetX: window.myCanvas1._offsetX,
             offsetY: window.myCanvas1._offsetY
         };
     }
-    
+    if (currentViewMode === 'simulator') simDeactivate();
+
     currentViewMode = mode;
-    
-    // Update tab styles
-    var tabOriginal = document.getElementById('tabOriginalPath');
-    var tabGCode = document.getElementById('tabGCodeRender');
-    var viewControls = document.getElementById('gcodeViewControls');
-    var bboxPanel = document.getElementById('gcodeBoundingBox');
-    
+    var tabOrig = document.getElementById('tabOriginalPath');
+    var tabSim = document.getElementById('tabSimulator');
+    var viewCtrls = document.getElementById('gcodeViewControls');
+    var bbox = document.getElementById('gcodeBoundingBox');
+
+    function reset(el) { if (el) { el.style.background = '#e0e0e0'; el.style.color = '#333'; el.style.fontWeight = 'normal'; } }
+    function active(el) { if (el) { el.style.background = '#3498db'; el.style.color = 'white'; el.style.fontWeight = 'bold'; } }
+
+    reset(tabOrig); reset(tabSim);
+
     if (mode === 'original') {
-        tabOriginal.style.background = '#3498db';
-        tabOriginal.style.color = 'white';
-        tabOriginal.style.fontWeight = 'bold';
-        tabGCode.style.background = '#e0e0e0';
-        tabGCode.style.color = '#333';
-        tabGCode.style.fontWeight = 'normal';
-        
-        // Hide view controls and bounding box panel
-        if (viewControls) viewControls.style.display = 'none';
-        if (bboxPanel) bboxPanel.style.display = 'none';
-        
-        // Restore original operations dan redraw
+        active(tabOrig);
+        if (viewCtrls) viewCtrls.style.display = 'none';
+        if (bbox) bbox.style.display = 'none';
+        var simEl = document.getElementById('simCanvas');
+        var infEl = document.getElementById('myCanvas1x');
+        if (simEl) simEl.style.display = 'none';
+        if (infEl) infEl.style.display = 'block';
         if (window.myCanvas1) {
             window.myCanvas1._drawOperations = originalDrawOperations.slice();
-            // Restore saved state for original mode
-            var savedState = viewState.original;
-            window.myCanvas1._scale = savedState.scale;
-            window.myCanvas1._offsetX = savedState.offsetX;
-            window.myCanvas1._offsetY = savedState.offsetY;
-            window.myCanvas1._transformation = {
-                a: savedState.scale,
-                b: 0,
-                c: 0,
-                d: savedState.scale,
-                e: savedState.offsetX,
-                f: savedState.offsetY
-            };
+            var s = viewState.original;
+            window.myCanvas1._scale = s.scale; window.myCanvas1._offsetX = s.offsetX; window.myCanvas1._offsetY = s.offsetY;
+            window.myCanvas1._transformation = { a: s.scale, b: 0, c: 0, d: s.scale, e: s.offsetX, f: s.offsetY };
             window.myCanvas1.viewBox.transformation = window.myCanvas1._transformation;
-            if (window.myCanvas1._redraw) {
-                window.myCanvas1._redraw();
-            }
+            if (window.myCanvas1._redraw) window.myCanvas1._redraw();
         }
     } else {
-        tabGCode.style.background = '#3498db';
-        tabGCode.style.color = 'white';
-        tabGCode.style.fontWeight = 'bold';
-        tabOriginal.style.background = '#e0e0e0';
-        tabOriginal.style.color = '#333';
-        tabOriginal.style.fontWeight = 'normal';
-        
-        // Show view controls
-        if (viewControls) viewControls.style.display = 'block';
-        // Bounding box panel will be shown by renderGCodeToCanvas
-        
-        // Backup original operations sebelum render GCode
+        active(tabSim);
+        if (viewCtrls) viewCtrls.style.display = 'flex';
+        if (bbox) bbox.style.display = 'none';
         if (window.myCanvas1) {
             originalDrawOperations = window.myCanvas1._drawOperations.slice();
-            // Restore saved state for gcode mode
-            var savedState = viewState.gcode;
-            window.myCanvas1._scale = savedState.scale;
-            window.myCanvas1._offsetX = savedState.offsetX;
-            window.myCanvas1._offsetY = savedState.offsetY;
-            window.myCanvas1._transformation = {
-                a: savedState.scale,
-                b: 0,
-                c: 0,
-                d: savedState.scale,
-                e: savedState.offsetX,
-                f: savedState.offsetY
-            };
-            window.myCanvas1.viewBox.transformation = window.myCanvas1._transformation;
         }
-        
-        // Parse and render GCode
-        parseAndRenderGCode();
+        simActivate();
     }
 }
 
 function changeGCodeViewMode(mode) {
     gcodeViewMode = mode;
-    if (currentViewMode === 'gcode' && gcodeParsedData.length > 0) {
-        // Clear operations untuk GCode view
-        window.myCanvas1._drawOperations = [];
-        renderGCodeToCanvas(gcodeParsedData);
-        window.myCanvas1._redraw();
+    if (currentViewMode === 'simulator' && simState.moves.length > 0) {
+        simCenter(simState.moves);
+        simDraw();
     }
 }
 
@@ -1273,17 +1239,17 @@ function parseGCodeText(text) {
     var moves = [];
     var currentPos = { x: 0, y: 0, z: 0 };
     var g92Offset = { x: 0, y: 0, z: 0 }; // Offset dari G92
-    
+
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim().toUpperCase();
         if (!line || line.startsWith(';')) continue;
-        
+
         // Handle G92 - Set Position Offset
         if (line.startsWith('G92')) {
             var xMatch = line.match(/X(-?\d+\.?\d*)/);
             var yMatch = line.match(/Y(-?\d+\.?\d*)/);
             var zMatch = line.match(/Z(-?\d+\.?\d*)/);
-            
+
             // G92 Xval Yval - Set current position to the specified values
             // Update currentPos to the G92 values so subsequent moves start from here
             if (xMatch !== null) {
@@ -1300,26 +1266,26 @@ function parseGCodeText(text) {
             }
             continue;
         }
-        
+
         // Handle G28 - Reset offsets
         if (line.startsWith('G28')) {
             g92Offset = { x: 0, y: 0, z: 0 };
             currentPos = { x: 0, y: 0, z: 0 };
             continue;
         }
-        
+
         if (line.startsWith('G0') || line.startsWith('G1')) {
             // Parse coordinates
             var xMatch = line.match(/X(-?\d+\.?\d*)/);
             var yMatch = line.match(/Y(-?\d+\.?\d*)/);
             var zMatch = line.match(/Z(-?\d+\.?\d*)/);
-            
+
             // Hanya buat move jika ada perubahan koordinat (X, Y, atau Z)
             // Jika hanya F (feedrate), skip untuk rendering
             if (!xMatch && !yMatch && !zMatch) {
                 continue; // Skip lines that only set feedrate/power without moving
             }
-            
+
             var move = {
                 type: line.startsWith('G0') ? 'G0' : 'G1',
                 lineIndex: i,
@@ -1330,58 +1296,58 @@ function parseGCodeText(text) {
                 endY: currentPos.y + g92Offset.y,
                 endZ: currentPos.z + g92Offset.z
             };
-            
+
             if (xMatch) move.endX = parseFloat(xMatch[1]) + g92Offset.x;
             if (yMatch) move.endY = parseFloat(yMatch[1]) + g92Offset.y;
             if (zMatch) move.endZ = parseFloat(zMatch[1]) + g92Offset.z;
-            
+
             moves.push(move);
             // Simpan posisi GCode asli (tanpa offset) untuk perhitungan G92 berikutnya
-            currentPos = { 
-                x: move.endX - g92Offset.x, 
-                y: move.endY - g92Offset.y, 
-                z: move.endZ - g92Offset.z 
+            currentPos = {
+                x: move.endX - g92Offset.x,
+                y: move.endY - g92Offset.y,
+                z: move.endZ - g92Offset.z
             };
         }
     }
-    
+
     return moves;
 }
 
 function parseAndRenderGCode() {
     if (!window.myCanvas1) return;
-    
+
     // Get GCode from both editors + start/finish gcode
     var cuttingGCode = getvalue('gcode') || '';
     var engraveGCode = getvalue('engcode') || '';
     // Include startgcode which may contain G92 offset
     var combinedGCode = (startgcode || '') + '\n' + cuttingGCode + '\n' + engraveGCode + '\n' + (finishgcode || '');
-    
+
     // Parse GCode
     gcodeParsedData = parseGCodeText(combinedGCode);
-    
+
     if (gcodeParsedData.length === 0) {
         console.log('No GCode to render');
         return;
     }
-    
+
     // Clear operations untuk GCode view (tidak menghapus backup)
     window.myCanvas1._drawOperations = [];
     renderGCodeToCanvas(gcodeParsedData);
-    
+
     // Redraw with current transform
     window.myCanvas1._redraw();
 }
 
 function renderGCodeToCanvas(moves) {
     if (!window.myCanvas1) return;
-    
+
     var ctx = window.myCanvas1.getContext('2d');
-    
+
     // Calculate bounds based on view mode
     var minX = Infinity, maxX = -Infinity;
     var minY = Infinity, maxY = -Infinity;
-    
+
     if (gcodeViewMode === 'isometric') {
         // For isometric, we need to calculate projected bounds
         for (var i = 0; i < moves.length; i++) {
@@ -1409,9 +1375,9 @@ function renderGCodeToCanvas(moves) {
             maxY = Math.max(maxY, m.startY, m.endY);
         }
     }
-    
+
     if (minX === Infinity) return;
-    
+
     // Calculate actual GCode bounds (not projected) for display
     var actualMinX = Infinity, actualMaxX = -Infinity;
     var actualMinY = Infinity, actualMaxY = -Infinity;
@@ -1422,7 +1388,7 @@ function renderGCodeToCanvas(moves) {
         actualMinY = Math.min(actualMinY, m.startY, m.endY);
         actualMaxY = Math.max(actualMaxY, m.startY, m.endY);
     }
-    
+
     // Update bounding box info panel
     var bboxPanel = document.getElementById('gcodeBoundingBox');
     if (bboxPanel) {
@@ -1434,40 +1400,40 @@ function renderGCodeToCanvas(moves) {
         document.getElementById('bboxMaxX').textContent = actualMaxX.toFixed(2);
         document.getElementById('bboxMaxY').textContent = actualMaxY.toFixed(2);
     }
-    
+
     // Calculate scale to fit canvas
     var canvasWidth = window.myCanvas1.width;
     var canvasHeight = window.myCanvas1.height;
     var boundsWidth = maxX - minX || 1;
     var boundsHeight = maxY - minY || 1;
-    
+
     var scaleX = (canvasWidth - 100) / boundsWidth;
     var scaleY = (canvasHeight - 100) / boundsHeight;
     var scale = Math.min(scaleX, scaleY) * 0.9; // 90% to add some margin
-    
+
     // Center offset
     var centerX = canvasWidth / 2;
     var centerY = canvasHeight / 2;
     var offsetX = -((minX + maxX) / 2) * scale + centerX;
     var offsetY = -((minY + maxY) / 2) * scale + centerY;
-    
+
     // Draw grid
     if (gcodeViewMode === '2d') {
         drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY);
     } else {
         drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY);
     }
-    
+
     // Draw GCode paths
     for (var i = 0; i < moves.length; i++) {
         var m = moves[i];
         var s = toScreen(m.startX, m.startY, m.startZ, scale, offsetX, offsetY);
         var e = toScreen(m.endX, m.endY, m.endZ, scale, offsetX, offsetY);
-        
+
         ctx.beginPath();
         ctx.moveTo(s.x, s.y);
         ctx.lineTo(e.x, e.y);
-        
+
         if (m.type === 'G1') {
             // Cut move - red
             ctx.strokeStyle = '#ff4444';
@@ -1478,11 +1444,11 @@ function renderGCodeToCanvas(moves) {
             ctx.lineWidth = 1;
             ctx.setLineDash([5, 3]);
         }
-        
+
         ctx.stroke();
         ctx.setLineDash([]);
     }
-    
+
     // Draw origin
     var origin = toScreen(0, 0, 0, scale, offsetX, offsetY);
     ctx.beginPath();
@@ -1493,12 +1459,12 @@ function renderGCodeToCanvas(moves) {
     ctx.strokeStyle = '#0065b8ff';
     ctx.lineWidth = 2;
     ctx.stroke();
-    
+
     // Draw bounds rectangle (only for 2D view)
     if (gcodeViewMode === '2d') {
         ctx.beginPath();
-        ctx.rect(minX * scale + offsetX, minY * scale + offsetY, 
-                 boundsWidth * scale, boundsHeight * scale);
+        ctx.rect(minX * scale + offsetX, minY * scale + offsetY,
+            boundsWidth * scale, boundsHeight * scale);
         ctx.strokeStyle = '#9b59b6';
         ctx.lineWidth = 1;
         ctx.setLineDash([2, 2]);
@@ -1512,7 +1478,7 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
     var minX = Infinity, maxX = -Infinity;
     var minY = Infinity, maxY = -Infinity;
     var minZ = Infinity, maxZ = -Infinity;
-    
+
     for (var i = 0; i < moves.length; i++) {
         var m = moves[i];
         minX = Math.min(minX, m.startX, m.endX);
@@ -1522,30 +1488,30 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
         minZ = Math.min(minZ, m.startZ, m.endZ);
         maxZ = Math.max(maxZ, m.startZ, m.endZ);
     }
-    
+
     if (minX === Infinity) {
         minX = maxX = minY = maxY = minZ = maxZ = 0;
     }
-    
+
     // Add margin around the job
     var margin = 20;
     minX -= margin; maxX += margin;
     minY -= margin; maxY += margin;
-    
+
     // Draw grid at Z=0 plane (or at minZ if job is all above/below)
     var zPlane = (minZ <= 0 && maxZ >= 0) ? 0 : minZ;
     var gridSize = 10;
-    
+
     // Snap to grid
     var startX = Math.floor(minX / gridSize) * gridSize;
     var endX = Math.ceil(maxX / gridSize) * gridSize;
     var startY = Math.floor(minY / gridSize) * gridSize;
     var endY = Math.ceil(maxY / gridSize) * gridSize;
-    
+
     var isDarkMode = getchecked("isdarktheme");
     var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
     var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
-    
+
     // Draw isometric grid lines
     for (var x = startX; x <= endX; x += gridSize) {
         var isMajor = (Math.abs(x) % 50 === 0);
@@ -1558,7 +1524,7 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
         ctx.lineWidth = isMajor ? 0.5 : 0.3;
         ctx.stroke();
     }
-    
+
     for (var y = startY; y <= endY; y += gridSize) {
         var isMajor = (Math.abs(y) % 50 === 0);
         var p1 = toScreen(startX, y, zPlane, scale, offsetX, offsetY);
@@ -1570,11 +1536,11 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
         ctx.lineWidth = isMajor ? 0.5 : 0.3;
         ctx.stroke();
     }
-    
+
     // Draw axes
     var axisLength = 50;
     var origin = toScreen(0, 0, 0, scale, offsetX, offsetY);
-    
+
     // X axis (red)
     var xEnd = toScreen(axisLength, 0, 0, scale, offsetX, offsetY);
     ctx.beginPath();
@@ -1583,7 +1549,7 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
     ctx.strokeStyle = '#ff4444';
     ctx.lineWidth = 2;
     ctx.stroke();
-    
+
     // Y axis (green)
     var yEnd = toScreen(0, axisLength, 0, scale, offsetX, offsetY);
     ctx.beginPath();
@@ -1592,7 +1558,7 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
     ctx.strokeStyle = '#44ff44';
     ctx.lineWidth = 2;
     ctx.stroke();
-    
+
     // Z axis (blue) - goes down in isometric
     var zEnd = toScreen(0, 0, axisLength, scale, offsetX, offsetY);
     ctx.beginPath();
@@ -1610,13 +1576,13 @@ function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {
     var endX = Math.ceil(maxX / gridSize) * gridSize;
     var startY = Math.floor(minY / gridSize) * gridSize;
     var endY = Math.ceil(maxY / gridSize) * gridSize;
-    
+
     var isDarkMode = getchecked("isdarktheme");
     var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
     var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
     var majorLineWidth = 0.5;
     var minorLineWidth = 0.3;
-    
+
     // Vertical lines
     for (var x = startX; x <= endX; x += gridSize) {
         var isMajor = (x % 50 === 0);
@@ -1627,7 +1593,7 @@ function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {
         ctx.lineWidth = isMajor ? majorLineWidth : minorLineWidth;
         ctx.stroke();
     }
-    
+
     // Horizontal lines
     for (var y = startY; y <= endY; y += gridSize) {
         var isMajor = (y % 50 === 0);
@@ -1641,18 +1607,17 @@ function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {
 }
 
 // Auto-update GCode render when editors change
-setevent("input", "gcodeEditor", function() {
-    if (currentViewMode === 'gcode') {
-        // Debounce to avoid too many renders
+setevent("input", "gcodeEditor", function () {
+    if (currentViewMode === 'simulator') {
         if (window.gcodeRenderTimeout) clearTimeout(window.gcodeRenderTimeout);
-        window.gcodeRenderTimeout = setTimeout(parseAndRenderGCode, 500);
+        window.gcodeRenderTimeout = setTimeout(simActivate, 500);
     }
 });
 
-setevent("input", "engcodeEditor", function() {
-    if (currentViewMode === 'gcode') {
+setevent("input", "engcodeEditor", function () {
+    if (currentViewMode === 'simulator') {
         if (window.gcodeRenderTimeout) clearTimeout(window.gcodeRenderTimeout);
-        window.gcodeRenderTimeout = setTimeout(parseAndRenderGCode, 500);
+        window.gcodeRenderTimeout = setTimeout(simActivate, 500);
     }
 });
 
@@ -1704,6 +1669,7 @@ var defaultProfile = {
         "separatecut": true,
         "skiplength": "50",
         "enablesmartraster": true,
+        "engrave_y_bidirectional": true,
         "finishpart": true,
         "pltfeed": "35",
         "pltpw": "100",
@@ -1811,8 +1777,8 @@ var defaultProfile = {
 // ============================================================
 
 setTimeout(function () {
-    startserver();
     loadsettings("");
+    startserver();
     populateMaterialSelect();
     window.onresize();
     karya_ready = 0;
@@ -1828,7 +1794,7 @@ document.addEventListener('DOMContentLoaded', function () {
         const maxLines = 10000;
         const shouldTruncate = lines.length > maxLines;
         const codeToProcess = shouldTruncate ? lines.slice(0, maxLines).join('\n') : code;
-        
+
         const result = codeToProcess
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/;.*/gm, m => `<span class="gcode-comment">${m}</span>`)
@@ -1837,7 +1803,7 @@ document.addEventListener('DOMContentLoaded', function () {
             .replace(/\b[XYZIJKR]-?\d+\.?\d*\b/g, '<span class="gcode-axis">$&</span>')
             .replace(/\bF-?\d+\.?\d*\b/g, '<span class="gcode-feed">$&</span>')
             .replace(/\b[SE]-?\d+\.?\d*\b/g, '<span class="gcode-num">$&</span>');
-        
+
         return shouldTruncate ? result + '\n<span class="gcode-comment">... [File too large, syntax highlighting truncated]</span>' : result;
     }
 
@@ -1877,10 +1843,10 @@ document.addEventListener('DOMContentLoaded', function () {
     setupEditor('gcodeEditor', 'gcodeHighlight');
     setupEditor('engcodeEditor', 'engcodeHighlight');
 
-    window.getGcodeValue = function() { return document.getElementById('gcodeEditor').value; };
-    window.setGcodeValue = function(v) { document.getElementById('gcodeEditor').value = v; syncHighlightById('gcodeEditor', 'gcodeHighlight'); };
-    window.getEngcodeValue = function() { return document.getElementById('engcodeEditor').value; };
-    window.setEngcodeValue = function(v) { document.getElementById('engcodeEditor').value = v; syncHighlightById('engcodeEditor', 'engcodeHighlight'); };
+    window.getGcodeValue = function () { return document.getElementById('gcodeEditor').value; };
+    window.setGcodeValue = function (v) { document.getElementById('gcodeEditor').value = v; syncHighlightById('gcodeEditor', 'gcodeHighlight'); };
+    window.getEngcodeValue = function () { return document.getElementById('engcodeEditor').value; };
+    window.setEngcodeValue = function (v) { document.getElementById('engcodeEditor').value = v; syncHighlightById('engcodeEditor', 'engcodeHighlight'); };
 
     let highlightDebounceTimer = null;
     function syncHighlightById(textareaId, highlightId) {
@@ -1900,10 +1866,10 @@ document.addEventListener('DOMContentLoaded', function () {
         window.myCanvas1 = new InfiniteCanvas(canvas);
         // Note: InfiniteCanvas now handles redrawing internally using stored draw operations
         // No need to call gcode_verify on transform changes - it would regenerate G-code which is slow
-        
+
         // Save state on pan/zoom
-        canvas.addEventListener('wheel', function() {
-            setTimeout(function() {
+        canvas.addEventListener('wheel', function () {
+            setTimeout(function () {
                 if (currentViewMode && window.myCanvas1) {
                     viewState[currentViewMode] = {
                         scale: window.myCanvas1._scale,
@@ -1913,10 +1879,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
             }, 50);
         });
-        
-        canvas.addEventListener('mousemove', function() {
+
+        canvas.addEventListener('mousemove', function () {
             if (window.myCanvas1 && window.myCanvas1.canvas.style.cursor === 'grabbing') {
-                setTimeout(function() {
+                setTimeout(function () {
                     if (currentViewMode && window.myCanvas1) {
                         viewState[currentViewMode] = {
                             scale: window.myCanvas1._scale,
@@ -2196,29 +2162,28 @@ function createSVG(source, blob) {
 function refreshgcode() {
     console.log("refreshgcode called, text1 length:", text1 ? text1.length : 0, "ink_images count:", ink_images.length);
     if (text1 == '') {
+        savesetting();
         console.log("text1 empty, using Paste_rendergcode");
         Paste_rendergcode("myCanvas1");
         return;
-    };
+    }
     var d = 'none';
     if (getchecked("segment"))
         d = 'block';
 
     $("segm").style.display = d;
     myFunction(0);
-    
+
     // Save original operations setelah myFunction selesai menggambar
     if (window.myCanvas1 && window.myCanvas1._drawOperations) {
         originalDrawOperations = window.myCanvas1._drawOperations.slice();
     }
-    
+
     savesetting();
     updatedownload2();
-    
-    // If in GCode render mode, update the view
-    if (currentViewMode === 'gcode') {
-        // Backup sudah tersimpan di atas, sekarang render GCode
-        parseAndRenderGCode();
+
+    if (currentViewMode === 'simulator') {
+        simActivate();
     }
 }
 
@@ -2526,9 +2491,19 @@ setclick('btOpenDevTools', async function () {
     hidd2 = !hidd2;
 });
 
-setclick('btOpenNestJS', function () {
+setclick('btOpenNestJSV2', function () {
     $('overlayNestJS').style.display = 'block';
-    $('nestjsFrame').src = 'http://localhost:3000';
+    $('nestjsFrame').src = 'http://localhost:3000/v2/';
+    $('vars2').style.display = 'none';
+    hidd2 = !hidd2;
+});
+
+setclick('btOpenInvoice', async function () {
+    try {
+        await window.invoke('open_invoice');
+    } catch (e) {
+        console.error('Failed to open invoice generator', e);
+    }
     $('vars2').style.display = 'none';
     hidd2 = !hidd2;
 });
@@ -2539,7 +2514,7 @@ setclick('btCloseNestJS', function () {
 });
 
 // Screenshot functionality with keyboard shortcut Ctrl+Alt+P
-document.addEventListener('keydown', async function(e) {
+document.addEventListener('keydown', async function (e) {
     // Check for Ctrl+Alt+P
     if (e.ctrlKey && e.altKey && e.key === 'p') {
         e.preventDefault();
@@ -2550,10 +2525,10 @@ document.addEventListener('keydown', async function(e) {
 async function captureScreenshot() {
     try {
         console.log('Capturing screenshot...');
-        
+
         // Call backend to capture entire screen
         const dataUrl = await window.invoke('capture_screenshot');
-        
+
         // Create download link
         const filename = 'screenshot_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
         const link = document.createElement('a');
@@ -2562,7 +2537,7 @@ async function captureScreenshot() {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        
+
         console.log('Screenshot download started: ' + filename);
         // Show temporary notification
         showNotification('Screenshot captured: ' + filename);
@@ -2579,3 +2554,414 @@ function showNotification(message) {
     document.body.appendChild(notif);
     setTimeout(() => notif.remove(), 3000);
 }
+
+// ============================================================
+// G-CODE SIMULATOR (Integrated into main canvas view)
+// ============================================================
+
+var simState = {
+    running: false, speed: 10, curTime: 0, totalTime: 0,
+    lastFrame: 0, moves: [], pathSegments: [], activeSeg: null,
+    pos: { x: 0, y: 0, z: 0, v: 0 }
+};
+var simRA = null;
+
+// ============================================================
+// G-CODE SIMULATOR (standalone canvas, own coordinate system)
+// ============================================================
+
+var simCvs, simCtx;
+var simZ = 1, simOX = 0, simOY = 0;
+var simRA = null;
+var simDrag = false, simMX = 0, simMY = 0;
+var simState = {
+    running: false, speed: 10, curTime: 0, totalTime: 0,
+    lastFrame: 0, moves: [], pathSegments: [], activeSeg: null,
+    pos: { x: 0, y: 0, z: 0, v: 0 }, bounds: null
+};
+
+function simGetGCode() {
+    if (getchecked("engravecut"))
+        return startgcode + "\n" + getvalue("engcode") + "\n" + getvalue("gcode") + "\n" + finishgcode;
+    return startgcode + "\n" + getvalue("gcode") + "\n" + getvalue("engcode") + "\n" + finishgcode;
+}
+
+function simFormatTime(s) {
+    var m = Math.floor(s / 60);
+    var sec = Math.floor(s % 60);
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
+function simUpdateDisplay() {
+    var pct = simState.totalTime > 0 ? simState.curTime / simState.totalTime : 0;
+    document.getElementById('simProgress').value = Math.round(pct * 1000);
+    document.getElementById('simTimeDisplay').textContent = simFormatTime(simState.curTime) + ' / ' + simFormatTime(simState.totalTime);
+}
+
+function simToScr(x, y, z) {
+    if (gcodeViewMode === 'isometric') {
+        var ix = (x - y) * ISO_COS;
+        var iy = (x + y) * ISO_SIN - (z || 0);
+        return { x: ix * simZ + simOX, y: iy * simZ + simOY };
+    }
+    return { x: x * simZ + simOX, y: y * simZ + simOY };
+}
+
+function simResize() {
+    if (!simCvs) return;
+    var parent = simCvs.parentElement;
+    if (!parent) return;
+    var r = parent.getBoundingClientRect();
+    simCvs.width = r.width;
+    simCvs.height = r.height;
+}
+
+function simProjectBounds(moves) {
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    if (gcodeViewMode === 'isometric') {
+        for (var i = 0; i < moves.length; i++) {
+            var m = moves[i];
+            var s = { x: (m.startX - m.startY) * ISO_COS, y: (m.startX + m.startY) * ISO_SIN - m.startZ };
+            var e = { x: (m.endX - m.endY) * ISO_COS, y: (m.endX + m.endY) * ISO_SIN - m.endZ };
+            minX = Math.min(minX, s.x, e.x); maxX = Math.max(maxX, s.x, e.x);
+            minY = Math.min(minY, s.y, e.y); maxY = Math.max(maxY, s.y, e.y);
+        }
+    } else {
+        for (var i = 0; i < moves.length; i++) {
+            var m = moves[i];
+            minX = Math.min(minX, m.startX, m.endX);
+            maxX = Math.max(maxX, m.startX, m.endX);
+            minY = Math.min(minY, m.startY, m.endY);
+            maxY = Math.max(maxY, m.startY, m.endY);
+        }
+    }
+    return { minX: minX || 0, maxX: maxX || 1, minY: minY || 0, maxY: maxY || 1 };
+}
+
+function simCenter(moves) {
+    if (moves.length === 0) return;
+    var b = simProjectBounds(moves);
+    // Recalc world bounds for grid use
+    var wMinX = Infinity, wMaxX = -Infinity, wMinY = Infinity, wMaxY = -Infinity;
+    for (var i = 0; i < moves.length; i++) {
+        var m = moves[i];
+        wMinX = Math.min(wMinX, m.startX, m.endX); wMaxX = Math.max(wMaxX, m.startX, m.endX);
+        wMinY = Math.min(wMinY, m.startY, m.endY); wMaxY = Math.max(wMaxY, m.startY, m.endY);
+    }
+    simState.worldBounds = { minX: wMinX || 0, maxX: wMaxX || 1, minY: wMinY || 0, maxY: wMaxY || 1 };
+    var gw = (b.maxX - b.minX) || 1, gh = (b.maxY - b.minY) || 1;
+    var sx = simCvs.width * 0.5 / gw, sy = simCvs.height * 0.5 / gh;
+    simZ = Math.min(sx, sy) * 0.85;
+    var cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    simOX = simCvs.width / 2 - cx * simZ;
+    simOY = simCvs.height / 2 - cy * simZ;
+    simState.bounds = b;
+}
+
+function simDraw() {
+    if (!simCtx || simState.moves.length === 0) return;
+    var ctx = simCtx;
+    var isDark = getchecked("isdarktheme");
+    var bg = isDark ? '#0a0a0a' : '#f5f5f5';
+    var grid1 = isDark ? '#1a1a1a' : '#ddd';
+    var grid5 = isDark ? '#3a3a3a' : '#ccc';
+    var g1Color = isDark ? '#ff4444' : '#cc3333';
+    var g0Color = isDark ? '#555' : '#999';
+    var traveledColor = isDark ? '#2ecc71' : '#27ae60';
+    var cutterFill = isDark ? '#ff9800' : '#e65100';
+    var originColor = '#ff6b6b';
+
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, simCvs.width, simCvs.height);
+
+    // Grid (at Z=0)
+    if (simState.worldBounds) {
+        var wb = simState.worldBounds;
+        var sx = Math.floor(wb.minX / 10) * 10;
+        var ex = Math.ceil(wb.maxX / 10) * 10;
+        var sy = Math.floor(wb.minY / 10) * 10;
+        var ey = Math.ceil(wb.maxY / 10) * 10;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        for (var x = sx; x <= ex; x += 10) {
+            ctx.strokeStyle = x % 50 === 0 ? grid5 : grid1;
+            var p1 = simToScr(x, wb.minY, 0);
+            var p2 = simToScr(x, wb.maxY, 0);
+            ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        }
+        for (var y = sy; y <= ey; y += 10) {
+            ctx.strokeStyle = y % 50 === 0 ? grid5 : grid1;
+            var p1 = simToScr(wb.minX, y, 0);
+            var p2 = simToScr(wb.maxX, y, 0);
+            ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        }
+        ctx.stroke();
+    }
+
+    // Paths: completed = green solid, future = dashed transparent
+    if (simState.activeSeg && simState.pathSegments.length > 0) {
+        var segIdx = simState.pathSegments.indexOf(simState.activeSeg);
+        if (segIdx >= 0) {
+            // Future segments (transparent dashed)
+            ctx.beginPath();
+            var hasFuture = false;
+            for (var i = segIdx; i < simState.pathSegments.length; i++) {
+                var seg = simState.pathSegments[i];
+                var p1 = simToScr(seg.x1, seg.y1, seg.z1);
+                var p2 = simToScr(seg.x2, seg.y2, seg.z2);
+                if (i === segIdx) ctx.moveTo(p1.x, p1.y);
+                else ctx.lineTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                hasFuture = true;
+            }
+            if (hasFuture) {
+                ctx.globalAlpha = 0.35;
+                ctx.setLineDash([4, 4]);
+                ctx.strokeStyle = g1Color;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+                ctx.setLineDash([]);
+            }
+
+            // Completed segments (green solid)
+            ctx.beginPath();
+            var hasCompleted = false;
+            for (var i = 0; i < segIdx; i++) {
+                var seg = simState.pathSegments[i];
+                var p1 = simToScr(seg.x1, seg.y1, seg.z1);
+                var p2 = simToScr(seg.x2, seg.y2, seg.z2);
+                if (i === 0) ctx.moveTo(p1.x, p1.y);
+                else ctx.lineTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                hasCompleted = true;
+            }
+            if (hasCompleted) {
+                ctx.strokeStyle = traveledColor;
+                ctx.lineWidth = 3;
+                ctx.stroke();
+            }
+        }
+    } else {
+        // No simulation active — draw all moves in original style
+        ctx.setLineDash([]);
+        for (var i = 0; i < simState.moves.length; i++) {
+            var m = simState.moves[i];
+            var s = simToScr(m.startX, m.startY, m.startZ);
+            var e = simToScr(m.endX, m.endY, m.endZ);
+            ctx.beginPath();
+            ctx.moveTo(s.x, s.y); ctx.lineTo(e.x, e.y);
+            if (m.type === 'G1') {
+                ctx.strokeStyle = g1Color;
+                ctx.lineWidth = 1.5;
+            } else {
+                ctx.strokeStyle = g0Color;
+                ctx.lineWidth = 1;
+                ctx.setLineDash([5, 3]);
+            }
+            ctx.stroke();
+        }
+        ctx.setLineDash([]);
+    }
+
+    // Cutter
+    var cp = simToScr(simState.pos.x, simState.pos.y, simState.pos.z);
+    ctx.beginPath();
+    ctx.arc(cp.x, cp.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = cutterFill;
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Origin
+    var o = simToScr(0, 0, 0);
+    ctx.strokeStyle = originColor;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(o.x - 10, o.y); ctx.lineTo(o.x + 10, o.y);
+    ctx.moveTo(o.x, o.y - 10); ctx.lineTo(o.x, o.y + 10);
+    ctx.stroke();
+    ctx.fillStyle = originColor;
+    ctx.font = '11px sans-serif';
+    ctx.fillText('(0,0)', o.x + 12, o.y + 4);
+}
+
+function simUpdatePos() {
+    if (simState.pathSegments.length === 0) return;
+    var acc = 0;
+    simState.activeSeg = null;
+    for (var i = 0; i < simState.pathSegments.length; i++) {
+        var seg = simState.pathSegments[i];
+        var dur = seg.duration || 0.001;
+        if (simState.curTime <= acc + dur) {
+            var t = Math.min((simState.curTime - acc) / dur, 1);
+            simState.pos = {
+                x: seg.x1 + (seg.x2 - seg.x1) * t,
+                y: seg.y1 + (seg.y2 - seg.y1) * t,
+                z: seg.z1 + (seg.z2 - seg.z1) * t,
+                v: seg.v1 + (seg.v2 - seg.v1) * t
+            };
+            simState.activeSeg = seg;
+            return;
+        }
+        acc += dur;
+    }
+    if (simState.curTime >= simState.totalTime && simState.totalTime > 0) {
+        simState.running = false;
+        document.getElementById('btnSimPlay').textContent = '▶ Play';
+    }
+}
+
+function simRun() {
+    if (!simState.running) return;
+    var now = performance.now();
+    var dt = (now - simState.lastFrame) / 1000;
+    simState.lastFrame = now;
+    simState.curTime += dt * simState.speed;
+    if (simState.curTime > simState.totalTime) simState.curTime = simState.totalTime;
+    simUpdatePos();
+    simUpdateDisplay();
+    simDraw();
+    if (simState.curTime < simState.totalTime) simRA = requestAnimationFrame(simRun);
+    else { simState.running = false; document.getElementById('btnSimPlay').textContent = '▶ Play'; }
+}
+
+function simToggle() {
+    if (simState.moves.length === 0) return;
+    simState.running = !simState.running;
+    if (simState.running) {
+        if (simState.curTime >= simState.totalTime) simState.curTime = 0;
+        document.getElementById('btnSimPlay').textContent = '⏸ Pause';
+        simState.lastFrame = performance.now();
+        simUpdatePos();
+        simRA = requestAnimationFrame(simRun);
+    } else {
+        document.getElementById('btnSimPlay').textContent = '▶ Play';
+    }
+}
+
+function simReset() {
+    simState.running = false;
+    if (simRA) { cancelAnimationFrame(simRA); simRA = null; }
+    simState.curTime = 0;
+    simState.pos = { x: 0, y: 0, z: 0, v: 0 };
+    simState.activeSeg = null;
+    document.getElementById('btnSimPlay').textContent = '▶ Play';
+    simUpdateDisplay();
+    simDraw();
+}
+
+function simSeek(ratio) {
+    if (simState.moves.length === 0) return;
+    simState.curTime = Math.max(0, Math.min(ratio * simState.totalTime, simState.totalTime));
+    simUpdatePos();
+    simUpdateDisplay();
+    simDraw();
+}
+
+function simUpdateSpeed() {
+    simState.speed = parseInt(document.getElementById('simSpeedSelect').value) || 10;
+}
+
+function simActivate() {
+    simCvs = document.getElementById('simCanvas');
+    if (!simCvs) return;
+    simCtx = simCvs.getContext('2d');
+    simResize();
+    simZ = 1; simOX = 0; simOY = 0;
+    simState.running = false; simState.curTime = 0;
+    simState.pos = { x: 0, y: 0, z: 0, v: 0 };
+    simState.activeSeg = null;
+    document.getElementById('btnSimPlay').textContent = '▶ Play';
+
+    var gcode = simGetGCode();
+    simState.moves = parseGCodeText(gcode);
+    simState.pathSegments = [];
+    simState.totalTime = 0;
+
+    try {
+        CncPlanner.init(defaultConfig);
+        var r = CncPlanner.calculateJobTime(gcode, defaultConfig);
+        simState.pathSegments = r.pathSegments || [];
+        simState.totalTime = r.seconds;
+    } catch(e) { }
+
+    simCenter(simState.moves);
+    simUpdateDisplay();
+    document.getElementById('simControls').style.display = 'flex';
+    document.getElementById('simCanvas').style.display = 'block';
+    document.getElementById('myCanvas1x').style.display = 'none';
+    simDraw();
+}
+
+function simDeactivate() {
+    simState.running = false;
+    if (simRA) { cancelAnimationFrame(simRA); simRA = null; }
+    document.getElementById('simControls').style.display = 'none';
+    var simEl = document.getElementById('simCanvas');
+    var infEl = document.getElementById('myCanvas1x');
+    if (simEl) simEl.style.display = 'none';
+    if (infEl) infEl.style.display = 'block';
+}
+
+// Sim canvas mouse handlers (own coordinate system)
+document.addEventListener('mousedown', function(e) {
+    if (e.target !== simCvs) return;
+    simDrag = true; simMX = e.clientX; simMY = e.clientY;
+    simCvs.style.cursor = 'grabbing';
+});
+
+document.addEventListener('mousemove', function(e) {
+    if (!simDrag) return;
+    simOX += (e.clientX - simMX) / simZ;
+    simOY += (e.clientY - simMY) / simZ;
+    simMX = e.clientX; simMY = e.clientY;
+    simDraw();
+});
+
+document.addEventListener('mouseup', function() {
+    if (!simDrag) return;
+    simDrag = false;
+    if (simCvs) simCvs.style.cursor = 'grab';
+});
+
+document.addEventListener('wheel', function(e) {
+    if (e.target !== simCvs) return;
+    e.preventDefault();
+    var rect = simCvs.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    var my = e.clientY - rect.top;
+    var nz = simZ * (e.deltaY > 0 ? 0.9 : 1.1);
+    simOX = mx - (mx - simOX) * (nz / simZ);
+    simOY = my - (my - simOY) * (nz / simZ);
+    simZ = nz;
+    simDraw();
+}, { passive: false });
+
+document.addEventListener('touchstart', function(e) {
+    if (e.target !== simCvs) return;
+    if (e.touches.length === 1) {
+        simDrag = true; simMX = e.touches[0].clientX; simMY = e.touches[0].clientY;
+    }
+});
+
+document.addEventListener('touchmove', function(e) {
+    if (e.target !== simCvs) return;
+    e.preventDefault();
+    if (e.touches.length === 1 && simDrag) {
+        simOX += (e.touches[0].clientX - simMX) / simZ;
+        simOY += (e.touches[0].clientY - simMY) / simZ;
+        simMX = e.touches[0].clientX; simMY = e.touches[0].clientY;
+        simDraw();
+    }
+}, { passive: false });
+
+document.addEventListener('touchend', function() { simDrag = false; });
+
+window.addEventListener('resize', function() {
+    if (currentViewMode === 'simulator' && simCvs) {
+        simResize();
+        simDraw();
+    }
+});
