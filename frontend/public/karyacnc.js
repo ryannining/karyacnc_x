@@ -118,6 +118,7 @@ var storage = localStorage;
 
 var jobsettings = {};
 var text1_history = [];
+var current_history_index = -1;
 var text1 = '';
 var jobcnt = 0;
 var jobs = [];
@@ -604,7 +605,10 @@ function loadsettings(name) {
     try {
         var h = storage["history"];
         if (h == undefined) text1_history = []; else text1_history = JSON.parse(h);
+        current_history_index = text1_history.length - 1;
+        window.activeHistoryId = current_history_index;
         updatehistory();
+        // Langsung muat data kerja dari history terbaru agar bisa diproses
     } catch (e) { text1_history = []; }
     try {
         gcstyle = storage["gcstyle"];
@@ -724,19 +728,32 @@ function savesetting(name) {
 // HISTORY MANAGEMENT
 // ============================================================
 
-function loadhistory(e) {
-    var n = e.currentTarget.getAttribute('val');
+function loadHistoryIndex(n) {
+    if (n < 0 || n >= text1_history.length) return;
+    current_history_index = n;
+    window.activeHistoryId = n;
     buff = text1_history[n][1];
     text1 = pathstoText1(buff);
     refreshgcode();
     buff = "";
+    // Muat kembali parameter proses (class saveit) yang tersimpan
+    if (text1_history[n].length > 2) updateweb(text1_history[n][2], "");
+    updatehistory();
+}
+
+function loadhistory(e) {
+    var n = e.currentTarget.getAttribute('val') * 1;
+    loadHistoryIndex(n);
 }
 
 function updatehistory() {
     var h = $("dhistory");
     ss = "";
     for (var i = 0; i < text1_history.length; i++) {
-        ss = "<button id=bh" + i + " val=" + i + ">" + text1_history[i][0] + "</button>&nbsp; " + ss;
+        var act = (i == current_history_index)
+            ? " style='background:#ffeb3b;color:#000;border:2px solid #f00;font-weight:bold'"
+            : "";
+        ss = "<button id=bh" + i + " val=" + i + act + ">" + text1_history[i][0] + "</button>&nbsp; " + ss;
     }
     h.innerHTML = ss;
     for (var i = 0; i < text1_history.length; i++) {
@@ -745,10 +762,36 @@ function updatehistory() {
     }
 }
 
+function getSaveItSettings() {
+    var a = document.getElementsByClassName("saveit");
+    var sett = {};
+    for (var i = 0; i < a.length; i++) {
+        if (a[i].type == 'text')
+            sett[a[i].id] = a[i].value;
+        if (a[i].type == 'select-one')
+            sett[a[i].id] = a[i].value;
+        if (a[i].type == 'checkbox')
+            sett[a[i].id] = a[i].checked;
+    }
+    return sett;
+}
+
+// Simpan setting proses (class saveit) ke objek kerja history yang aktif
+function saveProcessToHistory() {
+    if (current_history_index < 0 || current_history_index >= text1_history.length) {
+        if (text1_history.length == 0) return;
+        current_history_index = text1_history.length - 1;
+    }
+    text1_history[current_history_index][2] = getSaveItSettings();
+    try { storage.setItem("history", JSON.stringify(text1_history)); } catch (e) { }
+}
+
 function savehistory(t) {
     var tm = new Date();
-    text1_history.push([tm.toTimeString().split(' ')[0], t]);
+    text1_history.push([tm.toTimeString().split(' ')[0], t, getSaveItSettings()]);
     if (text1_history.length > 10) text1_history = text1_history.slice(1);
+    current_history_index = text1_history.length - 1;
+    window.activeHistoryId = current_history_index;
     updatehistory();
 }
 
@@ -985,10 +1028,12 @@ setclick("btloadp", loadprofile);
 setclick("btrecode", function () {
     console.log("btrecode clicked");
     refreshgcode();
+    saveProcessToHistory();
 });
 setclick("btrecode2", function () {
     console.log("btrecode2 clicked");
     refreshgcode();
+    saveProcessToHistory();
 });
 
 setclick("btsaveset", savesetting);
@@ -1010,11 +1055,13 @@ setclick("btupload", function () {
     }
 
     upload(getvalue("jobname") + ".gcode");
+    saveProcessToHistory();
 });
 function startprint() {
     //urlopen("startprint");
     urlopen("startjob?jobname=/" + getvalue("jobname") + ".gcode",
         function () { }, null);
+    saveProcessToHistory();
 }
 setclick("btuploadstart", startprint);
 setclick("btjob1", function () {
@@ -1022,6 +1069,7 @@ setclick("btjob1", function () {
     jobs.push(getvalue("gcode"));
     $("jobinfo").innerHTML = jobcnt + " JOBS";
     updatedownload();
+    saveProcessToHistory();
 });
 
 setclick("btjob2", function () {
@@ -1029,6 +1077,7 @@ setclick("btjob2", function () {
     jobs.push(getvalue("engcode"));
     $("jobinfo").innerHTML = jobcnt + " JOBS";
     updatedownload();
+    saveProcessToHistory();
 });
 
 setclick("btjob3", function () {
@@ -1782,11 +1831,22 @@ setTimeout(function () {
     populateMaterialSelect();
     window.onresize();
     karya_ready = 0;
+    if (text1_history.length > 0) loadHistoryIndex(current_history_index);
+
 }, 2000);
 
 modechange(1);
 
 document.addEventListener('DOMContentLoaded', function () {
+    // Saat user mengedit setting (class saveit), simpan ke history yang sedang aktif
+    // (bukan history terbaru, tapi yang diklik user).
+    (function bindSaveItHistory() {
+        var kl = document.getElementsByClassName("saveit");
+        for (var i = 0; i < kl.length; i++) {
+            kl[i].addEventListener('change', function () { saveProcessToHistory(); });
+        }
+    })();
+
     function highlightGCode(code) {
         if (!code) return '';
         // Limit processing to first 10000 lines for performance
@@ -2885,7 +2945,7 @@ function simActivate() {
         var r = CncPlanner.calculateJobTime(gcode, defaultConfig);
         simState.pathSegments = r.pathSegments || [];
         simState.totalTime = r.seconds;
-    } catch(e) { }
+    } catch (e) { }
 
     simCenter(simState.moves);
     simUpdateDisplay();
@@ -2906,13 +2966,13 @@ function simDeactivate() {
 }
 
 // Sim canvas mouse handlers (own coordinate system)
-document.addEventListener('mousedown', function(e) {
+document.addEventListener('mousedown', function (e) {
     if (e.target !== simCvs) return;
     simDrag = true; simMX = e.clientX; simMY = e.clientY;
     simCvs.style.cursor = 'grabbing';
 });
 
-document.addEventListener('mousemove', function(e) {
+document.addEventListener('mousemove', function (e) {
     if (!simDrag) return;
     simOX += (e.clientX - simMX) / simZ;
     simOY += (e.clientY - simMY) / simZ;
@@ -2920,13 +2980,13 @@ document.addEventListener('mousemove', function(e) {
     simDraw();
 });
 
-document.addEventListener('mouseup', function() {
+document.addEventListener('mouseup', function () {
     if (!simDrag) return;
     simDrag = false;
     if (simCvs) simCvs.style.cursor = 'grab';
 });
 
-document.addEventListener('wheel', function(e) {
+document.addEventListener('wheel', function (e) {
     if (e.target !== simCvs) return;
     e.preventDefault();
     var rect = simCvs.getBoundingClientRect();
@@ -2939,14 +2999,14 @@ document.addEventListener('wheel', function(e) {
     simDraw();
 }, { passive: false });
 
-document.addEventListener('touchstart', function(e) {
+document.addEventListener('touchstart', function (e) {
     if (e.target !== simCvs) return;
     if (e.touches.length === 1) {
         simDrag = true; simMX = e.touches[0].clientX; simMY = e.touches[0].clientY;
     }
 });
 
-document.addEventListener('touchmove', function(e) {
+document.addEventListener('touchmove', function (e) {
     if (e.target !== simCvs) return;
     e.preventDefault();
     if (e.touches.length === 1 && simDrag) {
@@ -2957,9 +3017,9 @@ document.addEventListener('touchmove', function(e) {
     }
 }, { passive: false });
 
-document.addEventListener('touchend', function() { simDrag = false; });
+document.addEventListener('touchend', function () { simDrag = false; });
 
-window.addEventListener('resize', function() {
+window.addEventListener('resize', function () {
     if (currentViewMode === 'simulator' && simCvs) {
         simResize();
         simDraw();
