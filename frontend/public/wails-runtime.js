@@ -22,6 +22,10 @@
                         case 'proxy_request':
                             return await window.go.main.App.ProxyRequest(args.url);
 
+                        case 'set_profiles':
+                        case 'setProfiles':
+                            return await window.go.main.App.SetProfiles(args.data);
+
                         case 'start_ws_server':
                             return await window.go.main.App.StartWSServer(args.port);
 

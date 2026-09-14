@@ -284,18 +284,21 @@ func ttlForRajaOngkirStatus(status int) time.Duration {
 
 // App struct
 type App struct {
-	ctx                 context.Context
-	stream              net.Conn
-	streamMutex         sync.Mutex
-	wsServer            *http.Server
-	wsServerMutex       sync.Mutex
-	storedSvgMutex      sync.Mutex
-	roCache             *roCache
-	roCacheMu           sync.Mutex
+	ctx            context.Context
+	stream         net.Conn
+	streamMutex    sync.Mutex
+	wsServer       *http.Server
+	wsServerMutex  sync.Mutex
+	storedSvgMutex sync.Mutex
+	roCache        *roCache
+	roCacheMu      sync.Mutex
 
 	storedSvgData       string
 	storedSvgTimestamp  int64
 	storedresultSvgData string
+
+	profilesMutex sync.Mutex
+	profilesJSON  string
 }
 
 // MachinePosition represents the machine position data
@@ -371,6 +374,14 @@ func (a *App) UploadFile(ip string, filename string, data []byte) (string, error
 	}
 
 	return "", fmt.Errorf("upload failed with status: %d", resp.StatusCode)
+}
+
+// SetProfiles menerima JSON jobsettings dari frontend (PC master) untuk
+// diserve ke slave lewat GET /api/profiles.
+func (a *App) SetProfiles(profilesJSON string) {
+	a.profilesMutex.Lock()
+	a.profilesJSON = profilesJSON
+	a.profilesMutex.Unlock()
 }
 
 // ProxyRequest makes a GET request to the specified URL
@@ -816,6 +827,20 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 	case "/api/shop-config":
 		a.handleShopConfig(w, r)
 		return
+	case "/api/profiles", "/profiles":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", 405)
+			return
+		}
+		a.profilesMutex.Lock()
+		data := a.profilesJSON
+		a.profilesMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if data == "" {
+			io.WriteString(w, "{}")
+		} else {
+			io.WriteString(w, data)
+		}
 	case "/stored-svg", "/stored_svg":
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", 405)
@@ -957,7 +982,7 @@ func (a *App) serveInvoiceFile(w http.ResponseWriter, r *http.Request) bool {
 		http.ServeFile(w, r, devPath)
 		return true
 	}
-	embedPath := filepath.Join("tools_invoice", clean)
+	embedPath := "tools_invoice/" + clean
 	data, err := invoiceFiles.ReadFile(embedPath)
 	if err != nil {
 		return false

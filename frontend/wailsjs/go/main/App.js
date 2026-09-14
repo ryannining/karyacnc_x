@@ -54,6 +54,10 @@ export function RefreshSingleCost(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['RefreshSingleCost'](arg1, arg2, arg3, arg4);
 }
 
+export function SetProfiles(arg1) {
+  return window['go']['main']['App']['SetProfiles'](arg1);
+}
+
 export function SetRajaOngkirKey(arg1) {
   return window['go']['main']['App']['SetRajaOngkirKey'](arg1);
 }

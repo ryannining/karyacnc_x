@@ -55,6 +55,7 @@ class NestingApp {
         this.useNFP2Checkbox = document.getElementById('algorithm');
         this.selectAsBestButton = document.getElementById('selectAsBest');
         this.downloadBestButton = document.getElementById('downloadBest');
+        this.loadBestButton = document.getElementById('loadBestToCurrent');
         this.recompactCurrentButton = document.getElementById('recompactCurrent');
         this.renestOutsideButton = document.getElementById('renestOutside');
         this.currentAreaDisplay = document.getElementById('currentArea');
@@ -100,6 +101,7 @@ class NestingApp {
         });
         this.selectAsBestButton.addEventListener('click', this.selectAsBest.bind(this));
         this.downloadBestButton.addEventListener('click', this.downloadBestSolution.bind(this));
+        this.loadBestButton.addEventListener('click', this.loadBestToCurrent.bind(this));
         this.useNFP2Checkbox.addEventListener('change', this.toggleNFPAlgorithm.bind(this));
         this.recompactCurrentButton.addEventListener('click', this.recompactCurrentSolution.bind(this));
         this.renestOutsideButton.addEventListener('click', this.startRenestingWeb.bind(this));
@@ -1434,6 +1436,15 @@ class NestingApp {
 
         if (redraw) this.drawResult();
         this.copyBestSolution();
+    }
+
+    loadBestToCurrent() {
+        if (!this.bestPlacedParts || this.bestPlacedParts.length === 0) return;
+
+        this.placedParts = this.bestPlacedParts.map(part => part.clone());
+        this.currentSolutionCanvas.setParts(this.placedParts);
+        this.updateCurrentSolutionArea();
+        this.updatePathCounts();
     }
 
     svgFromSolution(solution = this.bestPlacedParts) {

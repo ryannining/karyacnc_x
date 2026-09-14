@@ -117,6 +117,10 @@ var hidd3 = true;
 var storage = localStorage;
 
 var jobsettings = {};
+var masterProfiles = null;        // objek {nama: settings} yang diambil dari master (atau null)
+var showLocalProf = true;         // tampilkan profil lokal di dropdown
+var showMasterProf = true;        // tampilkan profil master di dropdown
+var currentProfileSource = 'local'; // 'local' | 'master' dari pilihan terakhir
 var text1_history = [];
 var current_history_index = -1;
 var text1 = '';
@@ -584,10 +588,108 @@ function updateprofile(newdata = null) {
         }
     }
     var p = "";
-    for (var k in jobsettings) {
-        p += "<option value='" + k + "'>" + k + "</option>";
+    // Profil lokal (jobsettings)
+    if (showLocalProf) {
+        for (var k in jobsettings) {
+            p += "<option value='" + k + "' data-src='L'>[L] " + k + "</option>";
+        }
+    }
+    // Profil master (masterProfiles) — read-only dari master
+    if (showMasterProf && masterProfiles) {
+        for (var k in masterProfiles) {
+            p += "<option value='" + k + "' data-src='M'>[M] " + k + "</option>";
+        }
     }
     $("profile").innerHTML = p;
+}
+
+// Baca pilihan dropdown #profile → { name, src } ('L' lokal, 'M' master)
+function profileSelected() {
+    var sel = $("profile");
+    var name = sel ? sel.value : "";
+    var src = "L";
+    if (sel && sel.selectedOptions && sel.selectedOptions[0] && sel.selectedOptions[0].dataset) {
+        src = sel.selectedOptions[0].dataset.src || "L";
+    }
+    return { name: name, src: src };
+}
+
+// Muat setting profil sebuah profil dari lokasi yang sesuai (lokal / master) ke form
+function loadProfileIntoForm(name, src) {
+    var data = null;
+    if (src === 'M' && masterProfiles && masterProfiles[name]) {
+        currentProfileSource = 'M';
+        data = masterProfiles[name];
+    } else {
+        currentProfileSource = 'L';
+        data = jobsettings[name];
+    }
+    if (data) {
+        updateweb(data, name);
+        namamaterial = "(Profile)";
+    } else {
+        loadsettings(name);
+    }
+    // Auto proses ulang G-code supaya harga tidak salah hitung
+    refreshgcode();
+    saveProcessToHistory();
+}
+
+// Ambil daftar profil dari PC master (GET /api/profiles) lalu tampilkan.
+// Dipicu tombol "Load profiles" — TIDAK dibuka otomatis saat boot.
+function loadMasterProfiles() {
+    var ip = getvalue("masterip").trim();
+    if (!ip) { wxAlert("Info", "Isi IP PC master (KaryCNC) di Connection Settings dulu."); return; }
+    if (ip.split(".").length == 2) ip = "192.168." + ip;
+    var url = "http://" + ip + ":3000/api/profiles";
+    window.invoke("proxy_request", { url: url })
+        .then(function (resp) {
+            try {
+                masterProfiles = JSON.parse(resp);
+            } catch (e) { masterProfiles = null; }
+            if (!masterProfiles || typeof masterProfiles != 'object') masterProfiles = null;
+            try { storage.setItem("masterProfiles", JSON.stringify(masterProfiles)); } catch (e) { }
+            markMasterOnline(true);
+            updateprofile();
+        })
+        .catch(function (err) {
+            // Master tidak terjangkau → pakai cache terakhir (kalau ada)
+            try {
+                var c = storage["masterProfiles"];
+                masterProfiles = c ? JSON.parse(c) : null;
+            } catch (e) { masterProfiles = null; }
+            markMasterOnline(false);
+            if (masterProfiles) updateprofile();
+        });
+}
+
+// Toggle visibility alias dari checkbox (di Connection Settings)
+function toggleProfileSource() {
+    var l = $("chklocal"), m = $("chkmaster");
+    showLocalProf = l ? l.checked : true;
+    showMasterProf = m ? m.checked : true;
+    updateprofile();
+}
+
+// PC MASTER: publikasikan jobsettings lokal ke backend Go agar dapat diserve
+// lewat GET /api/profiles untuk PC slave. Dipanggil saat save/load profil.
+function pushProfilesToMaster() {
+    try {
+        window.invoke("set_profiles", { data: JSON.stringify(jobsettings) });
+    } catch (e) { }
+}
+
+// Tandai status koneksi master (strip kecil di list profil)
+function markMasterOnline(ok) {
+    var strip = $("masterStrip");
+    if (!strip) return;
+    if (ok) {
+        strip.innerHTML = "✓ Profil master dimuat";
+        strip.style.color = "#2e7d32";
+    } else {
+        strip.innerHTML = "⚠ Master tidak terjangkau" + (masterProfiles ? " — pakai cache" : "");
+        strip.style.color = "#c62828";
+    }
 }
 
 function loadsettings(name) {
@@ -639,21 +741,30 @@ function loadsettings(name) {
         }
         updateprofile();
     } catch (e) { jobsettings = defaultProfile; }
+    // PC master: publish profile lokal saat boot agar slave bisa menariknya.
+    try { pushProfilesToMaster(); } catch (e) { }
 
 }
 
 function loadprofile() {
-    name = getvalue("profilename");
-    if (name == "") name = getvalue("profile");
+    // Muat pengaturan profil (bisa dari lokal [L] atau master [M]).
+    var sel = profileSelected();
+    var name = getvalue("profilename");
+    if (name == "") name = sel.name;
     setvalue("profilename", name);
-    loadsettings(name);
-    namamaterial = "(Profile)";
+    loadProfileIntoForm(name, sel.src);
 }
 
 function saveprofile() {
-    name = getvalue("profilename");
-    if (name == "") name = getvalue("profile");
+    // Simpan selalu ke lokal. Jika yang dipilih profil master, hasil edit
+    // disimpan sebagai profil lokal dengan nama sama (master tidak ditimpa).
+    var name = getvalue("profilename");
+    if (name == "") {
+        var sel = profileSelected();
+        name = sel.name;
+    }
     setvalue("profilename", name);
+    currentProfileSource = "L"; // setelah save jadi milik lokal
     savesetting(name);
     updateprofile();
 }
@@ -678,7 +789,12 @@ function delprofile() {
 }
 
 function setprofile() {
-    setvalue("profilename", getvalue("profile"));
+    var sel = profileSelected();
+    // Update nama di field profilename
+    var n = getvalue("profile");
+    setvalue("profilename", n);
+    // Muat pengaturan dari sumber yang benar (lokal / master) lalu auto proses.
+    loadProfileIntoForm(sel.name, sel.src);
 }
 
 function savesetting(name) {
@@ -722,6 +838,8 @@ function savesetting(name) {
     }
     updatedownloadprofile();
     updatedownloadsvg();
+    // PC master: publish profil terbaru ke backend untuk diserve ke slave.
+    pushProfilesToMaster();
 }
 
 // ============================================================
@@ -734,11 +852,14 @@ function loadHistoryIndex(n) {
     window.activeHistoryId = n;
     buff = text1_history[n][1];
     text1 = pathstoText1(buff);
-    refreshgcode();
     buff = "";
-    // Muat kembali parameter proses (class saveit) yang tersimpan
+    // Muat kembali parameter proses (class saveit) yang tersimpan TERLEBIH DAHULU
+    // agar G-code diproses ulang dengan setting history yang benar (bukan setting terakhir).
     if (text1_history[n].length > 2) updateweb(text1_history[n][2], "");
     updatehistory();
+    // Auto proses ulang G-code dari data history (tanpa harus tekan tombol Process)
+    refreshgcode();
+    saveProcessToHistory();
 }
 
 function loadhistory(e) {
@@ -1024,6 +1145,9 @@ setevent("change", "profile", setprofile);
 setclick("btsavep", saveprofile);
 setclick("btdelp", delprofile);
 setclick("btloadp", loadprofile);
+setclick("btloadmaster", loadMasterProfiles);
+setevent("change", "chklocal", toggleProfileSource);
+setevent("change", "chkmaster", toggleProfileSource);
 
 setclick("btrecode", function () {
     console.log("btrecode clicked");

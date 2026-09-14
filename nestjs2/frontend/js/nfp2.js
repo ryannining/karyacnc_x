@@ -8,6 +8,8 @@ class NFP2SpatialHash {
     constructor(cellSize) {
         this.cellSize = cellSize;
         this.grid = new Map();
+        this.queryId = 0;
+        this.resultArray = [];
     }
 
     add(part) {
@@ -47,58 +49,37 @@ class NFP2SpatialHash {
         }
     }
 
+    // Returns a REUSABLE array (deduped via queryId stamping) — the caller must
+    // consume it before the next query. Parts may span several cells, so a part
+    // appears in multiple cells; the stamping avoids pushing it more than once.
     query(bx, by, bw, bh) {
         const startX = Math.floor(bx / this.cellSize);
         const endX = Math.floor((bx + bw) / this.cellSize);
         const startY = Math.floor(by / this.cellSize);
         const endY = Math.floor((by + bh) / this.cellSize);
 
-        const parts = new Set();
+        const results = this.resultArray;
+        results.length = 0;
+        const qId = ++this.queryId;
+
         for (let x = startX; x <= endX; x++) {
             for (let y = startY; y <= endY; y++) {
                 const key = (x << 16) | (y & 0xFFFF);
                 const cell = this.grid.get(key);
                 if (cell) {
-                    for (const part of cell) {
-                        parts.add(part);
+                    const cellLen = cell.length;
+                    for (let i = 0; i < cellLen; i++) {
+                        const part = cell[i];
+                        if (part._lastQueryId !== qId) {
+                            part._lastQueryId = qId;
+                            results.push(part);
+                        }
                     }
                 }
             }
         }
-        return parts;
+        return results;
     }
-}
-
-/**
- * A proxy class to represent a translated Path without cloning all points.
- */
-class TranslatedPathProxy {
-    constructor(sourcePart, dx, dy) {
-        this.source = sourcePart;
-        this.dx = dx;
-        this.dy = dy;
-        const b = sourcePart.getBounds();
-        this._bounds = {
-            x: b.x + dx,
-            y: b.y + dy,
-            width: b.width,
-            height: b.height
-        };
-        this._paths = null;
-    }
-
-    getBounds() { return this._bounds; }
-
-    get paths() {
-        if (!this._paths) {
-            this._paths = this.source.paths.map(path =>
-                path.map(p => ({ x: p.x + this.dx, y: p.y + this.dy }))
-            );
-        }
-        return this._paths;
-    }
-
-    get lcolor() { return this.source.lcolor; }
 }
 
 class NFP2 {
@@ -136,8 +117,6 @@ class NFP2 {
             collisionChecks: 0
         };
 
-        // Store initial placements for explicit collision checking fallback
-        this._initialPlacements = initialPlacements || [];
         // Set of originIndexes already fixed as initial placements (renesting).
         // These must NOT be re-placed, otherwise they would appear twice.
         this._initialIndexSet = initialPlacements.length > 0
@@ -278,7 +257,6 @@ class NFP2 {
         const fixedPlacements = (this.lastPlacements || []).filter(p => !markedSet.has(p.originIndex));
 
         this.performanceStats = { boundaryPointsTested: 0, collisionAvoided: 0, collisionChecks: 0 };
-        this._initialPlacements = fixedPlacements;
         this._initialIndexSet = new Set(fixedPlacements.map(p => p.originIndex));
 
         const cellSize = Math.max(50 * GEOM_SCALE, scaledGridSize * 5);
@@ -320,11 +298,21 @@ class NFP2 {
         const yStep = Math.max(4 * GEOM_SCALE, gridSize);
         const xStep = Math.max(4 * GEOM_SCALE, gridSize);
 
+        // Precompute each placed part's vertical span once, so the scanline
+        // loop can skip parts that cannot cross the current y without calling
+        // getBounds() (or getHorizontalIntersections) for every scanline.
+        const scanParts = placedPartsAll.map(p => {
+            const b = p.getBounds();
+            return { p, minY: b.y, maxY: b.y + b.height };
+        });
+
         for (let y = 0; y < sheet.height; y += yStep) {
             const intersections = [];
             let sheetRange = [0, sheet.width];
 
-            for (const placed of placedPartsAll) {
+            for (const sp of scanParts) {
+                if (y < sp.minY || y > sp.maxY) continue;
+                const placed = sp.p;
                 const pts = GeometryUtil.getHorizontalIntersections(placed, y);
                 if (placed.lcolor === "#00ff00") {
                     if (pts.length >= 2) {
@@ -470,42 +458,30 @@ class NFP2 {
         const bw = vBounds.width;
         const bh = vBounds.height;
 
-        let proxy = null;
         // 1. Sheet constraints
         for (const s of sheetParts) {
             this.performanceStats.collisionChecks++;
-            if (!proxy) proxy = new TranslatedPathProxy(variant, dx, dy);
-            if (GeometryUtil.polyOutside(proxy, s)) return true;
+            if (GeometryUtil.polyOutsideAt(variant, dx, dy, s)) return true;
         }
 
         const candidates = this.spatialHash.query(bx, by, bw, bh);
-        
-        // Fallback: also check against initial placements explicitly
-        // (in case spatial hash query misses them due to cell boundaries)
-        const allCandidates = new Set(candidates || []);
-        if (this._initialPlacements) {
-            for (const init of this._initialPlacements) {
-                const ib = init.getBounds();
-                if (!(bx > ib.x + ib.width || bx + bw < ib.x || by > ib.y + ib.height || by + bh < ib.y)) {
-                    allCandidates.add(init);
-                }
-            }
-        }
+
+        // Note: initial/fixed placements are always seeded into the spatial
+        // hash, and overlapping bboxes provably share a grid cell, so the
+        // hash query already returns every relevant placed part.
 
         // 2. Part intersections
-        for (const placed of allCandidates) {
+        for (const placed of candidates) {
             if (placed.lcolor === "#00ff00") continue;
 
-            const pb = placed.getBounds();
+            const pb = placed._cachedBounds || placed.getBounds();
             if (bx > pb.x + pb.width || bx + bw < pb.x ||
                 by > pb.y + pb.height || by + bh < pb.y) {
                 continue;
             }
 
             this.performanceStats.collisionChecks++;
-            if (!proxy) proxy = new TranslatedPathProxy(variant, dx, dy);
-            if (GeometryUtil.polygonsIntersect(proxy, placed, true)) return true;
-            if (proxy.insideBonus) variant.insideBonus = Math.max(variant.insideBonus || 0, proxy.insideBonus);
+            if (GeometryUtil.polygonsIntersectAt(variant, dx, dy, placed, true)) return true;
         }
 
         return false;

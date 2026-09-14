@@ -751,3 +751,71 @@ src/
 ---
 
 *Dokumen ini dibuat untuk membantu refactoring dan pemahaman sistem KaryaCNC*
+
+---
+
+# Fitur: Auto-Process & Profil Master–Slave
+
+Dua fitur yang ditambahkan untuk menjaga konsistensi harga ketika beberapa PC
+(multi-admin) memakai KaryaCNC. Keduanya bekerja di sisi frontend (`karyacnc.js`)
+kecuali satu endpoint kecil di backend.
+
+## A. Auto-Process G-code (warna ulang saat profil/history berubah)
+
+**Masalah:** Harga dihitung dari G-code yang diproses; jika admin ganti/load
+profil atau klik history tanpa menekan tombol "Process", G-code memakai setting
+lama → harga salah.
+
+**Fix:** `refreshgcode()` + `saveProcessToHistory()` diotomatisasi pada semua jalur
+yang mengubah setting/profil:
+- `setprofile()` (dropdown berubah)
+- `loadprofile()` (tombol Load)
+- `loadHistoryIndex()` (klik history) — paparan dimuat untuk history-nya dulu,
+  baru diproses (fix: sebelumnya setting history diterapkan SETELAH proses).
+
+## B. Profil Terpusat Model Master–Slave
+
+**Model:** 1 PC admin = master kurasi profil (lokal). PC lain = slave, baca profil
+dari master via HTTP. Slave bisa edit (disimpan lokal) tapi master tidak pernah
+ditimpa. Master lain gagal → fallback cache.
+
+### Backend (`app.go`)
+```go
+type App struct { ... profilesMutex sync.Mutex; profilesJSON string }
+func (a *App) SetProfiles(profilesJSON string)   // binding dari frontend master
+// route GET /api/profiles (di server :3000) → a.profilesJSON
+```
+
+### Alur data
+
+```
+MASTER (PC admin)                          SLAVE (PC lain)
+jobsettings (localStorage)                 input "Master IP" (opsional)
+   │ pushProfilesToMaster()                   │  [Load Profil] → GET
+   ▼ invoke('set_profiles')                  ▼ http://<ip>:3000/api/profiles
+Go SetProfiles → profilesJSON        masterProfiles {name: settings}
+   │                                          │ cache localStorage
+GET /api/profiles ◀──── HTTP ────────────    │
+   ▼                                          ▼
+JSON semua profil                        dropdown [L] lokal / [M] master
+                                          pilih [M] → apply → refreshgcode()
+                                          Save → tulis LOKAL (master aman)
+```
+
+### File & fungsi kunci
+| File | Fungsi |
+|------|--------|
+| `app.go` | `SetProfiles`, `profilesMutex`, route `/api/profiles` |
+| `wails-runtime.js` | case `set_profiles` → `App.SetProfiles` |
+| `karyacnc.js` | `masterProfiles`, `loadMasterProfiles()`, `profileSelected()`, `loadProfileIntoForm()`, `toggleProfileSource()`, `pushProfilesToMaster()`, `markMasterOnline()` |
+| `index.html` | input `masterip` + `btloadmaster` (Connection Settings); checkbox `chklocal`/`chkmaster`; `<span id=masterStrip>` |
+
+### Perilaku
+- **IP kosong** → mode lokal penuh (backward compatible).
+- **IP diisi** → dropdown gabungan lokal+master dgn penanda `[L]`/`[M]`.
+- pilih `[M]` → apply setting master + auto-process; otherwise read-only.
+- **Save** → selalu ke lokal (edit profil master jadi kopi lokal, master asli tetap).
+- **Master offline** → cache terakhir + strip merah "Master tidak terjangkau".
+- **No auto-fetch saat boot** — slave menarik hanya saat menekan "Load Profil".
+
+*Dokumen ini dibuat untuk membantu refactoring dan pemahaman sistem KaryaCNC*

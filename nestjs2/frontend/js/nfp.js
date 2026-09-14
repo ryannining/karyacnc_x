@@ -101,86 +101,112 @@ class NFP {
     }
 
     _checkPlacementConflicts(part, bx, by, bw, bh, placedParts, usePart = true, checkchild = true) {
-        // Build the list of candidates WITHOUT mutating the original array.
-        let baseList;
-        if (placedParts instanceof SpatialHash) {
-            // query() returns an internal reusable array — copy it so we don't mutate it.
-            baseList = placedParts.query(bx, by, bw, bh).slice();
-        } else {
-            baseList = placedParts;
-        }
+        // query() returns an internal reusable array — used read-only here, no copy needed.
+        // _initialPlacements are always seeded into the spatial hash, and overlapping bboxes
+        // provably share a grid cell, so no fallback loop is needed.
+        const baseList = (placedParts instanceof SpatialHash)
+            ? placedParts.query(bx, by, bw, bh)
+            : placedParts;
 
-        // Fallback: also check against initial placements explicitly
-        // (in case spatial hash query misses them due to cell boundaries).
-        // Collect extras into a separate array to avoid mutating baseList.
-        let extraPlacements = null;
-        if (this._initialPlacements && this._initialPlacements.length > 0) {
-            for (const init of this._initialPlacements) {
-                const ib = init.getBounds();
-                if (!(bx > ib.x + ib.width || bx + bw < ib.x || by > ib.y + ib.height || by + bh < ib.y)) {
-                    if (!extraPlacements) extraPlacements = [];
-                    extraPlacements.push(init);
-                }
-            }
-        }
-
-        // Helper: check a single candidate for collision
-        const checkOne = (placedPart) => {
-            const pb = placedPart.getBounds();
-            // Skip if bounding boxes don't overlap
-            if (bx > pb.x + pb.width || bx + bw < pb.x ||
-                by > pb.y + pb.height || by + bh < pb.y) {
-                return false;
-            }
-            // Geometric intersection check reached
-            if (this.performanceStats) this.performanceStats.collisionChecks++;
-            const isSheet = placedPart.lcolor === "#00ff00";
-            if (isSheet) {
-                return GeometryUtil.polyOutside(part, placedPart);
-            } else if (usePart) {
-                return part.polygonsIntersect(placedPart, checkchild);
-            } else {
-                return GeometryUtil.polygonsIntersect(part, placedPart);
-            }
-        };
-
+        const stats = this.performanceStats;
         const len = baseList.length;
         for (let i = 0; i < len; i++) {
-            if (checkOne(baseList[i])) return true;
-        }
-        if (extraPlacements) {
-            for (let i = 0; i < extraPlacements.length; i++) {
-                if (checkOne(extraPlacements[i])) return true;
+            const placedPart = baseList[i];
+            const pb = placedPart._cachedBounds || placedPart.getBounds();
+            if (bx > pb.x + pb.width || bx + bw < pb.x ||
+                by > pb.y + pb.height || by + bh < pb.y) {
+                continue;
+            }
+            if (stats) stats.collisionChecks++;
+            if (placedPart.lcolor === "#00ff00") {
+                if (GeometryUtil.polyOutside(part, placedPart)) return true;
+            } else if (usePart) {
+                if (part.polygonsIntersect(placedPart, checkchild)) return true;
+            } else {
+                if (GeometryUtil.polygonsIntersect(part, placedPart)) return true;
             }
         }
         return false;
     }
 
-    tryPlacement(part, placedParts, placedParts2, sheet, checkchild = true) {
-        part.insideBonus = 0;
-
-        // Get bounds once and store in local variables for faster access
-        const bounds = part.getBounds();
-        const bx = bounds.x;
-        const by = bounds.y;
-        const bw = bounds.width;
-        const bh = bounds.height;
+    // Tests `variant` at offset (px,py) WITHOUT cloning it, returning a score
+    // number, or null when the position is invalid/conflicts. The caller keeps
+    // only the best variant and clones it once after the cell loop, so the
+    // expensive clone never happens for discarded candidates.
+    tryPlacement(variant, px, py, placedParts, placedParts2, sheet, checkchild = true) {
+        // Bounds of the translated clone = cached variant bounds + offset.
+        const vb = variant.getBounds();
+        const bx = vb.x + px;
+        const by = vb.y + py;
+        const bw = vb.width;
+        const bh = vb.height;
         if (!this.hascustomsheet) {
-            // Single condition with local variables
             if (bx < 0 || by < 0 || bx + bw > sheet.width || by + bh > sheet.height) {
                 return null;
             }
         }
 
-        if (this._checkPlacementConflicts(part, bx, by, bw, bh, placedParts, true, checkchild)) return null;
-        if (this._checkPlacementConflicts(part, bx, by, bw, bh, placedParts2, false)) return null;
+        // Always reset so variant.insideBonus never holds a stale value from a
+        // previous candidate, even on the no-candidate fast path.
+        variant.insideBonus = 0;
+        let insideBonus = 0;
+        const cand1 = placedParts ? this._collectCandidates(bx, by, bw, bh, placedParts) : null;
+        const cand2 = this._collectCandidates(bx, by, bw, bh, placedParts2);
+        if (cand1 !== null || cand2 !== null) {
+            // NOTE: polygonsIntersectAt may raise variant.insideBonus as a side
+            // effect (variant fits inside a hole), so read it after the checks.
+            if (cand1 !== null && this._conflictsWithList(variant, px, py, cand1, true, checkchild)) return null;
+            if (cand2 !== null && this._conflictsWithList(variant, px, py, cand2, false, true)) return null;
+            insideBonus = variant.insideBonus;
+        }
 
-        // Calculate score prioritizing less height
-        let heightScore = by + bh * 2; // Higher y positions (more height) increase score
-        let complexityPenalty = part.paths.length > 1 ? 1000 * GEOM_SCALE : 0;
-        let score = (heightScore * 2 + complexityPenalty) - part.insideBonus;
+        const heightScore = by + bh * 2;
+        const complexityPenalty = variant.paths.length > 1 ? 1000 * GEOM_SCALE : 0;
+        return (heightScore * 2 + complexityPenalty) - insideBonus;
+    }
 
-        return { part, score };
+    // Collect candidates whose bounding boxes overlap (bx,by,bw,bh).
+    // Returns null when nothing overlaps (fast path: no array allocated).
+    _collectCandidates(bx, by, bw, bh, placedParts) {
+        if (!placedParts) return null;
+        const baseList = (placedParts instanceof SpatialHash)
+            ? placedParts.query(bx, by, bw, bh)
+            : placedParts;
+
+        let result = null;
+        const len = baseList.length;
+        for (let i = 0; i < len; i++) {
+            const placedPart = baseList[i];
+            // Placed parts in the hash always have cached bounds (they were
+            // getBounds()'d when added); read the cache directly to skip the
+            // method call in this very hot loop.
+            const pb = placedPart._cachedBounds || placedPart.getBounds();
+            if (bx > pb.x + pb.width || bx + bw < pb.x ||
+                by > pb.y + pb.height || by + bh < pb.y) {
+                continue;
+            }
+            if (result === null) result = [];
+            result.push(placedPart);
+        }
+        return result;
+    }
+
+    // Exact geometric collision test of `variant` (offset by px,py) against a
+    // bbox-prefiltered list. Points are translated on the fly — no clone.
+    _conflictsWithList(variant, px, py, list, usePart, checkchild) {
+        const stats = this.performanceStats;
+        for (let i = 0; i < list.length; i++) {
+            const placedPart = list[i];
+            if (stats) stats.collisionChecks++;
+            if (placedPart.lcolor === "#00ff00") {
+                if (GeometryUtil.polyOutsideAt(variant, px, py, placedPart)) return true;
+            } else if (usePart) {
+                if (variant.polygonsIntersectAt(px, py, placedPart, checkchild)) return true;
+            } else {
+                if (GeometryUtil.polygonsIntersectAt(variant, px, py, placedPart)) return true;
+            }
+        }
+        return false;
     }
 
     findBestPosition(parts, sheet, progressHandler, gridSize, initialPlacements = []) {
@@ -191,14 +217,11 @@ class NFP {
             width: sheet.width * GEOM_SCALE,
             height: sheet.height * GEOM_SCALE
         };
-        // Store for collision fallback checks
-        this._initialPlacements = initialPlacements;
+        // Store initial placements for explicit collision checking fallback
         let bestPlacementsAll = [...initialPlacements];
         const totalParts = parts.length;
         this.hascustomsheet = false;
 
-        // Store initial placements for explicit collision checking fallback
-        this._initialPlacements = initialPlacements || [];
         // Build a Set of originIndexes for O(1) lookup when filtering bestPlacements
         this._initialIndexSet = initialPlacements.length > 0
             ? new Set(initialPlacements.map(p => p.originIndex))
@@ -313,13 +336,16 @@ class NFP {
         });
 
         for (let pass = 0; pass < 4; pass++) {
-            const currentParts = passParts[pass];
+            let currentParts = passParts[pass];
             if (currentParts.length === 0) continue;
 
             const dynamicGridSize = Math.floor(Math.max(scaledGridSize, (scaledGridSize * Math.sqrt(minArea) / GEOM_SCALE) * 0.01) * (4 - pass));
 
+            // Track unplaced parts so we can stop early once everything fits.
+            let unplacedCount = currentParts.length;
+            let allPlaced = false;
+
             for (let y = 0; y < scaledSheet.height; y += dynamicGridSize) {
-                let bestPlacements = [];
                 const intersectionPoints = [];
                 let sheetleftright = [];
                 const rowParts = this.spatialHash.query(0, y, scaledSheet.width, Math.max(GEOM_SCALE, dynamicGridSize));
@@ -349,9 +375,16 @@ class NFP {
                     }
                     if (!isValidPosition) continue;
 
-                    let bestPartResult = null;
+                    let bestVariant = null;
                     let bestScore = Infinity;
                     let bestPart = null;
+
+                    // Compact the pass list once most of it is placed so the
+                    // per-cell scan doesn't keep skipping dead entries.
+                    if (unplacedCount < (currentParts.length >> 1)) {
+                        currentParts = currentParts.filter(p => !p.placed);
+                        passParts[pass] = currentParts;
+                    }
 
                     const currentPartsLength = currentParts.length;
                     const shuffleStart = Math.floor(Math.random() * currentPartsLength);
@@ -362,42 +395,41 @@ class NFP {
                         const variantStart = Math.floor(Math.random() * variantCount);
                         for (let i = 0; i < variantCount; i++) {
                             const variant = part.variants[(i + variantStart) % variantCount];
-                            const px = x;
-                            const py = y;
-                            const result = this.tryPlacement(
-                                variant.clone(px, py),
-                                bestPlacements, this.spatialHash,
+                            const score = this.tryPlacement(
+                                variant, x, y,
+                                null, this.spatialHash,
                                 scaledSheet, pass > 1
                             );
-                            if (result && result.score < bestScore) {
-                                result.part.x = px;
-                                result.part.y = py;
-                                bestScore = result.score;
-                                bestPartResult = result.part;
+                            if (score !== null && score < bestScore) {
+                                bestScore = score;
+                                bestVariant = variant;
                                 bestPart = part;
                             }
                         }
                     }
 
-                    if (bestPart && bestPartResult) {
-                        bestPartResult.childIndex = bestPart.childIndex;
-                        bestPlacements.push(bestPartResult);
+                    if (bestPart && bestVariant) {
+                        const placedVariant = bestVariant.clone(x, y);
+                        placedVariant.insideBonus = bestVariant.insideBonus || 0;
+                        placedVariant.x = x;
+                        placedVariant.y = y;
+                        placedVariant.childIndex = bestPart.childIndex;
                         bestPart.placed = true;
+                        // Add to the hash immediately so the very next cell's
+                        // candidate query sees it (and it can't overlap).
+                        const initIndexSet = this._initialIndexSet;
+                        if (!initIndexSet || !initIndexSet.has(placedVariant.originIndex)) {
+                            bestPlacementsAll.push(placedVariant);
+                            this.spatialHash.add(placedVariant);
+                        }
+                        if (--unplacedCount === 0) { allPlaced = true; break; }
                     }
                 }
                 if (progressHandler) {
                     const placedCount = bestPlacementsAll.length - (this.hascustomsheet ? 1 : 0);
                     progressHandler(placedCount, totalParts);
                 }
-                if (bestPlacements.length > 0) {
-                    const initIndexSet = this._initialIndexSet;
-                    for (const p of bestPlacements) {
-                        if (!initIndexSet || !initIndexSet.has(p.originIndex)) {
-                            bestPlacementsAll.push(p);
-                            this.spatialHash.add(p);
-                        }
-                    }
-                }
+                if (allPlaced) break;
             }
         }
     }

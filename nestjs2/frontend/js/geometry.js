@@ -428,6 +428,9 @@ class Path {
         const cos = Math.cos(rangle);
         const sin = Math.sin(rangle);
 
+        // Point coordinates change, so any cached bounds are now stale.
+        this.invalidateBounds();
+
         // Update transform matrix
         const matrix = [cos, sin, -sin, cos, 0, 0];
         this.transformMatrix = multiplyMatrices(this.transformMatrix, matrix);
@@ -448,7 +451,14 @@ class Path {
     }
 
     flip(centerY = null) {
-        centerY = centerY ?? (this.getBounds().y + this.getBounds().height / 2);
+        if (centerY === null) {
+            const b = this.getBounds();
+            centerY = b.y + b.height / 2;
+        }
+
+        // Point coordinates change (and pX/pY for align() changes), so any
+        // cached bounds are now stale.
+        this.invalidateBounds();
 
         // Update transform matrix
         const matrix = [1, 0, 0, -1, 0, 2 * centerY];
@@ -472,15 +482,24 @@ class Path {
         newPath.transformMatrix[4] += dx;
         newPath.transformMatrix[5] += dy;
         newPath.childIndex = this.childIndex;
-        // const b = this.getBounds();
-        // if (b) {
-        //     newPath._cachedBounds = {
-        //         x: b.x + dx,
-        //         y: b.y + dy,
-        //         width: b.width,
-        //         height: b.height
-        //     };
-        // }
+        // Copy the cached bounds so getBounds() on clones (hot path during
+        // nesting) is O(1) instead of rescanning every point. Must be a fresh
+        // object because translate() mutates the cached bounds in place.
+        if (this._cachedBounds) {
+            const b = this._cachedBounds;
+            newPath._cachedBounds = {
+                x: b.x + dx,
+                y: b.y + dy,
+                pX: b.pX + dx,
+                pY: b.pY + dy,
+                width: b.width,
+                height: b.height,
+                fX: b.fX + dx / GEOM_SCALE,
+                fY: b.fY + dy / GEOM_SCALE,
+                fWidth: b.fWidth,
+                fHeight: b.fHeight
+            };
+        }
         return newPath;
     }
 
@@ -817,60 +836,16 @@ class Path {
     }
 
     polygonsIntersect(other, checkchild = true) {
-        // Add a small buffer to prevent touching edges
-        const BUFFER = 0.1 * GEOM_SCALE;
+        return GeometryUtil.polygonsIntersectAt(this, 0, 0, other, checkchild);
+    }
 
-        // Check bounding boxes first with buffer
-        const bounds1 = this.getBounds();
-        const bounds2 = other.getBounds();
-
-        if (!(bounds1.x + bounds1.width + BUFFER > bounds2.x &&
-            bounds1.x - BUFFER < bounds2.x + bounds2.width &&
-            bounds1.y + bounds1.height + BUFFER > bounds2.y &&
-            bounds1.y - BUFFER < bounds2.y + bounds2.height)) {
-            return false;
-        }
-
-        // if have child, check if poly1 fully inside poly2 childs
-        if (other.paths.length > 1 && checkchild) {
-            for (let i = 1; i < other.paths.length; i++) {
-                if (!GeometryUtil.polyOutside(this, other, i)) {
-                    this.insideBonus = 10000 * GEOM_SCALE;
-                    return false;
-                }
-            }
-        }
-
-        // Use more accurate intersection test instead of SAT (which fails for concave shapes)
-        const path1 = this.paths[0];
-        const path2 = other.paths[0];
-        const len1 = path1.length;
-        const len2 = path2.length;
-
-        // 1. Check if any point from poly1 is inside poly2
-        for (let i = 0; i < len1; i++) {
-            if (GeometryUtil.pointInPolygon(path1[i], path2)) return true;
-        }
-
-        // 2. Check if any point from poly2 is inside poly1
-        for (let i = 0; i < len2; i++) {
-            if (GeometryUtil.pointInPolygon(path2[i], path1)) return true;
-        }
-
-        // 3. Check for line segment intersections
-        for (let i = 0; i < len1; i++) {
-            const p1 = path1[i];
-            const p2 = path1[(i + 1) % len1];
-            for (let j = 0; j < len2; j++) {
-                const p3 = path2[j];
-                const p4 = path2[(j + 1) % len2];
-                if (GeometryUtil.lineSegmentsIntersect(p1, p2, p3, p4)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+    /**
+     * Intersection test between `this` translated by (dx, dy) and `other`.
+     * Translating on the fly avoids allocating a translated clone, which is
+     * the hottest allocation during the nesting placement loop.
+     */
+    polygonsIntersectAt(dx, dy, other, checkchild = true) {
+        return GeometryUtil.polygonsIntersectAt(this, dx, dy, other, checkchild);
     }
 }
 
@@ -934,24 +909,35 @@ const GeometryUtil = {
     },
     //function to check if two poly1 intersect with poly2
     polygonsIntersect: function (poly1, poly2, checkchild = true) {
+        return this.polygonsIntersectAt(poly1, 0, 0, poly2, checkchild);
+    },
+
+    /**
+     * Intersection test between poly1 translated by (dx, dy) and poly2.
+     * The translation is applied on the fly so no clone/array is allocated.
+     * Sets poly1.insideBonus when poly1 fits fully inside a hole of poly2.
+     */
+    polygonsIntersectAt: function (poly1, dx, dy, poly2, checkchild = true) {
         // Add a small buffer to prevent touching edges
         const BUFFER = 0.1 * GEOM_SCALE;
 
         // Check bounding boxes first with buffer
         const bounds1 = poly1.getBounds();
         const bounds2 = poly2.getBounds();
+        const bx = bounds1.x + dx;
+        const by = bounds1.y + dy;
 
-        if (!(bounds1.x + bounds1.width + BUFFER > bounds2.x &&
-            bounds1.x - BUFFER < bounds2.x + bounds2.width &&
-            bounds1.y + bounds1.height + BUFFER > bounds2.y &&
-            bounds1.y - BUFFER < bounds2.y + bounds2.height)) {
+        if (!(bx + bounds1.width + BUFFER > bounds2.x &&
+            bx - BUFFER < bounds2.x + bounds2.width &&
+            by + bounds1.height + BUFFER > bounds2.y &&
+            by - BUFFER < bounds2.y + bounds2.height)) {
             return false;
         }
 
         // if have child, check if poly1 fully inside poly2 childs
         if (poly2.paths.length > 1 && checkchild) {
             for (let i = 1; i < poly2.paths.length; i++) {
-                if (!this.polyOutside(poly1, poly2, i)) {
+                if (!this.polyOutsideAt(poly1, dx, dy, poly2, i)) {
                     poly1.insideBonus = 10000 * GEOM_SCALE;
                     return false;
                 }
@@ -963,27 +949,56 @@ const GeometryUtil = {
         const path2 = poly2.paths[0];
         const len1 = path1.length;
         const len2 = path2.length;
+        const last1 = len1 - 1;
+        const last2 = len2 - 1;
+        const pointInPolygonOffset = this.pointInPolygonOffset;
+        const lineSegmentsIntersectXY = this.lineSegmentsIntersectXY;
 
-        // Check if any point from poly1 is inside poly2
+        // Check if any translated point from poly1 is inside poly2.
+        // Points outside poly2's bounding box are skipped — they can never be
+        // inside its polygon, so this is a pure fast-reject (no semantic change).
+        const b2x = bounds2.x, b2y = bounds2.y, b2w = bounds2.width, b2h = bounds2.height;
         for (let i = 0; i < len1; i++) {
-            if (this.pointInPolygon(path1[i], path2)) return true;
+            const pt = path1[i];
+            const px = pt.x + dx, py = pt.y + dy;
+            if (px < b2x || px > b2x + b2w || py < b2y || py > b2y + b2h) continue;
+            if (pointInPolygonOffset(px, py, path2, 0, 0)) return true;
         }
 
-        // Check if any point from poly2 is inside poly1
+        // Check if any point from poly2 is inside translated poly1.
+        const b1x = bx, b1y = by, b1w = bounds1.width, b1h = bounds1.height;
         for (let i = 0; i < len2; i++) {
-            if (this.pointInPolygon(path2[i], path1)) return true;
+            const pt = path2[i];
+            if (pt.x < b1x || pt.x > b1x + b1w || pt.y < b1y || pt.y > b1y + b1h) continue;
+            if (pointInPolygonOffset(pt.x, pt.y, path1, dx, dy)) return true;
         }
 
         // Check for line segment intersections (with buffer)
         for (let i = 0; i < len1; i++) {
             const p1 = path1[i];
-            const p2 = path1[(i + 1) % len1];
-
+            const p1x = p1.x + dx;
+            const p1y = p1.y + dy;
+            const p2 = path1[i === last1 ? 0 : i + 1];
+            const p2x = p2.x + dx;
+            const p2y = p2.y + dy;
+            const s1minX = p1x < p2x ? p1x : p2x;
+            const s1maxX = p1x > p2x ? p1x : p2x;
+            const s1minY = p1y < p2y ? p1y : p2y;
+            const s1maxY = p1y > p2y ? p1y : p2y;
             for (let j = 0; j < len2; j++) {
                 const p3 = path2[j];
-                const p4 = path2[(j + 1) % len2];
-
-                if (this.lineSegmentsIntersect(p1, p2, p3, p4)) {
+                const p4 = path2[j === last2 ? 0 : j + 1];
+                const p3x = p3.x, p3y = p3.y, p4x = p4.x, p4y = p4.y;
+                // Correct segment-AABB rejection: skip only when the two
+                // segments' ranges are actually separated. The two segments
+                // are symmetric here, so the result is order-independent.
+                const s2minX = p3x < p4x ? p3x : p4x;
+                const s2maxX = p3x > p4x ? p3x : p4x;
+                const s2minY = p3y < p4y ? p3y : p4y;
+                const s2maxY = p3y > p4y ? p3y : p4y;
+                if (s1maxX < s2minX || s2maxX < s1minX) continue;
+                if (s1maxY < s2minY || s2maxY < s1minY) continue;
+                if (lineSegmentsIntersectXY(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y)) {
                     return true;
                 }
             }
@@ -993,10 +1008,55 @@ const GeometryUtil = {
     },
 
     lineSegmentsIntersect: function (p1, p2, p3, p4) {
-        const ccw = (A, B, C) => {
-            return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x);
-        };
-        return ccw(p1, p3, p4) !== ccw(p2, p3, p4) && ccw(p1, p2, p3) !== ccw(p1, p2, p4);
+        return this.lineSegmentsIntersectXY(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y);
+    },
+
+    // Segment intersection using raw coordinates (no Point objects allocated).
+    lineSegmentsIntersectXY: function (x1, y1, x2, y2, x3, y3, x4, y4) {
+        // Inlined ccw orientation tests (avoid allocating a closure per call).
+        // ccw(A, B, C) == (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x)
+        const ccw1 = (y4 - y1) * (x3 - x1) > (y3 - y1) * (x4 - x1);
+        const ccw2 = (y4 - y2) * (x3 - x2) > (y3 - y2) * (x4 - x2);
+        if (ccw1 === ccw2) return false;
+        const ccw3 = (y3 - y1) * (x2 - x1) > (y2 - y1) * (x3 - x1);
+        const ccw4 = (y4 - y1) * (x2 - x1) > (y2 - y1) * (x4 - x1);
+        return ccw3 !== ccw4;
+    },
+
+    /**
+     * Ray-casting point-in-polygon test where the polygon's points are
+     * additionally offset by (offX, offY) — avoids materializing a translated
+     * polygon for intersection tests.
+     */
+    pointInPolygonOffset: function (px, py, polygon, offX, offY) {
+        const numVertices = polygon.length;
+        let isInside = false;
+        for (let i = 0, j = numVertices - 1; i < numVertices; j = i++) {
+            const vi = polygon[i];
+            const vj = polygon[j];
+            const viY = vi.y + offY;
+            const vjY = vj.y + offY;
+            if (((viY > py) !== (vjY > py)) &&
+                (px < (vj.x - vi.x) * (py - viY) / (vjY - viY) + vi.x + offX)) {
+                isInside = !isInside;
+            }
+        }
+        return isInside;
+    },
+
+    /**
+     * Check if poly1 (translated by dx, dy) has any point outside poly2's
+     * path idx. Used to detect "fully inside" relationships.
+     */
+    polyOutsideAt: function (poly1, dx, dy, poly2, idx = 0) {
+        const points = poly1.paths[0];
+        const target = poly2.paths[idx];
+        const len = points.length;
+        for (let i = 0; i < len; i++) {
+            const p = points[i];
+            if (!this.pointInPolygonOffset(p.x + dx, p.y + dy, target, 0, 0)) return true;
+        }
+        return false;
     },
 
     /**
@@ -1007,8 +1067,10 @@ const GeometryUtil = {
      */
     getHorizontalIntersections(part, y) {
         const intersections = [];
-        // const b=part.getBounds();
-        // if (b.y > y || b.y+b.height < y) return intersections;
+        // Cheap rejection: skip parts whose vertical span does not cover y.
+        // Uses the cached bounds, so this is O(1) for most parts.
+        const b = part.getBounds();
+        if (b.y > y || b.y + b.height < y) return intersections;
 
         // Check each path in the part
         for (const path of part.paths) {

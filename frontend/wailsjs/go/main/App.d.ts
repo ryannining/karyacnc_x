@@ -28,6 +28,8 @@ export function RajaOngkirKeyStatus():Promise<string>;
 
 export function RefreshSingleCost(arg1:string,arg2:string,arg3:number,arg4:string):Promise<string>;
 
+export function SetProfiles(arg1:string):Promise<void>;
+
 export function SetRajaOngkirKey(arg1:string):Promise<string>;
 
 export function StartReceiving():Promise<void>;

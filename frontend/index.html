@@ -824,8 +824,12 @@
 							<option value=set1>set1</option>
 						</select><br>
 						<b style="color:white">Profile</b><input class=saveit id=profilename size=11><button
-							id=btloadp>Load</button><button id=btsavep>Save</button><button id=btdelp>Del</button>
-					</td>
+												id=btloadp>Load</button><button id=btsavep>Save</button><button id=btdelp>Del</button>
+											<br><span id=masterStrip style="font-size:9px;"></span><br>
+											<b style="color:white">Tampil</b>
+											<label style="color:white"><input type=checkbox id=chklocal checked> Lokal</label>
+											<label style="color:white"><input type=checkbox id=chkmaster checked> Master</label>
+										</td>
 				</tr>
 				<tr style="" class="hdr1 notsimple">
 					<td colspan=3>Preset <select id=material class=saveit>
@@ -1067,10 +1071,15 @@
 				</tr>
 				<tr>
 					<td colspan=2>App WS PORT </td>
-					<td colspan=2><input id=wsport size=10 class=saveit value="8887"></td>
-				</tr>
-				<tr>
-					<td colspan=2>Window Color </td>
+										<td colspan=2><input id=wsport size=10 class=saveit value="8887"></td>
+									</tr>
+									<tr>
+										<td colspan=2>Master IP (opsional) </td>
+										<td colspan=2><input id=masterip size=13 class=saveit value=""> <button
+												id=btloadmaster>Load Profil</button></td>
+									</tr>
+									<tr>
+										<td colspan=2>Window Color </td>
 					<td colspan=2><input id=wcolor size=10 class=saveit value="lightgreen"></td>
 				</tr>
 				<tr>
