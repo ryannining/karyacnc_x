@@ -1786,6 +1786,9 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 		}
 	}
 
+	if (closed && lines.length > 1) {
+		ctx.lineTo(X1, Y1);
+	}
 	ctx.stroke();
 	if (lines.length == 1) {
 		ctx.strokeStyle = "#CC0088";
@@ -3587,6 +3590,217 @@ function gridQueryRing(gridObj, x, y, maxItems, maxR) {
 // SECTION: SVG Path Parsing - Part C (pathstoText1)
 // ============================================================================
 
+// ============================================================================
+// SECTION: Combine segment (enablejoin + minR) helpers
+// ============================================================================
+// Used only by the `if (join)` block of pathstoText1. `mind` is the UI "R"
+// field and is a SQUARED distance threshold, hence every linear tolerance
+// below is derived with sqrt(). Geometry is in document units (mm).
+
+// Number of segments at the END of the chain that the join guard inspects.
+// A wrong weld happens at the joint, so a window keeps very long chains
+// cheap; raise it if a crossing far from the joint ever has to be caught.
+var JOIN_GUARD_WINDOW = 400;
+
+// Polyline length.
+function jcPolyLen(pts) {
+	var l = 0;
+	for (var i = 1; i < pts.length; i++) {
+		var dx = pts[i][0] - pts[i - 1][0];
+		var dy = pts[i][1] - pts[i - 1][1];
+		l += Math.sqrt(dx * dx + dy * dy);
+	}
+	return l;
+}
+
+// Axis aligned bounding box of a polyline -> [x1, y1, x2, y2].
+function jcBounds(pts) {
+	var b = [1e18, 1e18, -1e18, -1e18];
+	for (var i = 0; i < pts.length; i++) {
+		if (pts[i][0] < b[0]) b[0] = pts[i][0];
+		if (pts[i][1] < b[1]) b[1] = pts[i][1];
+		if (pts[i][0] > b[2]) b[2] = pts[i][0];
+		if (pts[i][1] > b[3]) b[3] = pts[i][1];
+	}
+	return b;
+}
+
+// Bounding box overlap test, `g` = extra margin.
+function jcBoxHit(a, b, g) {
+	return !(a[0] - g > b[2] || b[0] - g > a[2] || a[1] - g > b[3] || b[1] - g > a[3]);
+}
+
+// Squared distance from point p to segment a-b.
+function jcPtSegD2(px, py, ax, ay, bx, by) {
+	var vx = bx - ax;
+	var vy = by - ay;
+	var wx = px - ax;
+	var wy = py - ay;
+	var vv = vx * vx + vy * vy;
+	var t = vv > 0 ? (wx * vx + wy * vy) / vv : 0;
+	if (t < 0) t = 0;
+	else if (t > 1) t = 1;
+	var dx = px - ax - t * vx;
+	var dy = py - ay - t * vy;
+	return dx * dx + dy * dy;
+}
+
+// True when polyline `q` lies on polyline `p` within sqrt(tol2), segment by
+// segment: for every segment of q the nearest segment of p must be within
+// tolerance, and both ends plus the quarter points of that q segment must stay
+// on that SAME p segment. Testing vertices only is not enough: a diagonal whose
+// two ends touch two different parts of p would otherwise be deleted.
+function jcLiesOn(q, p, tol2) {
+	if (p.length < 2 || q.length < 2) return false;
+	for (var i = 0; i + 1 < q.length; i++) {
+		var x0 = q[i][0];
+		var y0 = q[i][1];
+		var x1 = q[i + 1][0];
+		var y1 = q[i + 1][1];
+		var mx = (x0 + x1) * 0.5;
+		var my = (y0 + y1) * 0.5;
+		var best = -1;
+		var bd = 1e18;
+		for (var j = 0; j + 1 < p.length; j++) {
+			var d = jcPtSegD2(mx, my, p[j][0], p[j][1], p[j + 1][0], p[j + 1][1]);
+			if (d < bd) {
+				bd = d;
+				best = j;
+			}
+		}
+		if (best < 0 || bd >= tol2) return false;
+		var ax = p[best][0];
+		var ay = p[best][1];
+		var bx = p[best + 1][0];
+		var by = p[best + 1][1];
+		if (jcPtSegD2(x0, y0, ax, ay, bx, by) >= tol2) return false;
+		if (jcPtSegD2(x1, y1, ax, ay, bx, by) >= tol2) return false;
+		if (jcPtSegD2(x0 + (x1 - x0) * 0.25, y0 + (y1 - y0) * 0.25, ax, ay, bx, by) >= tol2) return false;
+		if (jcPtSegD2(x0 + (x1 - x0) * 0.75, y0 + (y1 - y0) * 0.75, ax, ay, bx, by) >= tol2) return false;
+	}
+	return true;
+}
+
+// Duplicate test used by PASS 1.
+// Vertex by vertex match in either direction (this keeps the previous 2-point
+// semantics unchanged), or one polyline lying on top of the other, which is the
+// CAD case where an edge is drawn again, fully or partially. The vertex match
+// runs first so exact duplicates are never mis-classified.
+function jcIsDup(a, b, tol2) {
+	if (a.length < 2 || b.length < 2) return 0;
+	if (a.length == b.length) {
+		var fwd = 1;
+		var rev = 1;
+		for (var i = 0; i < a.length; i++) {
+			var j = a.length - 1 - i;
+			if (fwd && (sqr(a[i][0] - b[i][0]) + sqr(a[i][1] - b[i][1])) >= tol2) fwd = 0;
+			if (rev && (sqr(a[i][0] - b[j][0]) + sqr(a[i][1] - b[j][1])) >= tol2) rev = 0;
+			if (!fwd && !rev) break;
+		}
+		if (fwd || rev) return 1;
+	}
+	return (jcLiesOn(a, b, tol2) || jcLiesOn(b, a, tol2)) ? 1 : 0;
+}
+
+// First segment of `pts` in the orientation it would be appended with
+// (rev = 1 means the polyline gets reversed before the append).
+function jcFirstSeg(pts, rev) {
+	if (rev) return [pts[pts.length - 1], pts[pts.length - 2]];
+	return [pts[0], pts[1]];
+}
+
+// Overlap length of two segments that lie on the same line within `eps`
+// (0 when they are not collinear). Used to spot a line being cut twice.
+function jcOverlapLen(ax, ay, bx, by, cx, cy, dx, dy, eps) {
+	var ux = bx - ax;
+	var uy = by - ay;
+	var ul = Math.sqrt(ux * ux + uy * uy);
+	if (ul < 1e-12) return 0;
+	var vx = dx - cx;
+	var vy = dy - cy;
+	var vl = Math.sqrt(vx * vx + vy * vy);
+	if (vl < 1e-12) return 0;
+	ux /= ul;
+	uy /= ul;
+	vx /= vl;
+	vy /= vl;
+	if (Math.abs((cx - ax) * uy - (cy - ay) * ux) > eps) return 0;
+	if (Math.abs((dx - ax) * uy - (dy - ay) * ux) > eps) return 0;
+	if (Math.abs((ax - cx) * vy - (ay - cy) * vx) > eps) return 0;
+	if (Math.abs((bx - cx) * vy - (by - cy) * vx) > eps) return 0;
+	var tc = ((cx - ax) * ux + (cy - ay) * uy) / ul;
+	var td = ((dx - ax) * ux + (dy - ay) * uy) / ul;
+	var lo = tc < td ? tc : td;
+	var hi = tc < td ? td : tc;
+	if (lo < 0) lo = 0;
+	if (hi > 1) hi = 1;
+	return (hi - lo) * ul;
+}
+
+// Proper (transversal) crossing of segment a-b and c-d. Touching and
+// collinear cases return 0; jcOverlapLen() covers those.
+function jcCross(ax, ay, bx, by, cx, cy, dx, dy) {
+	var o1 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+	var o2 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+	var o3 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+	var o4 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+	if (((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) &&
+		((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0))) return 1;
+	return 0;
+}
+
+// Parameter t of the intersection point of the infinite lines a-b and c-d,
+// measured along a-b (NaN when the lines are parallel).
+function jcCrossT(ax, ay, bx, by, cx, cy, dx, dy) {
+	var ux = bx - ax;
+	var uy = by - ay;
+	var vx = dx - cx;
+	var vy = dy - cy;
+	var den = ux * vy - uy * vx;
+	if (den === 0) return NaN;
+	return ((cx - ax) * vy - (cy - ay) * vx) / den;
+}
+
+// Join guard: returns 0 when appending `cand` (already oriented the way it
+// would be appended) would cross or retrace a line that is already part of
+// `chain`. A crossing that lands within `eps` of the junction is the snap of
+// the joint itself and stays allowed; the retrace test always applies, that is
+// the join which doubles back and cuts the same line twice.
+function jcJoinAllowed(chain, cand, eps, window) {
+	var cN = cand.length - 1;
+	var pN = chain.length - 1;
+	if (cN < 1 || pN < 1) return 1;
+	var pxj = chain[pN][0];
+	var pyj = chain[pN][1];
+	var eps2 = eps * eps;
+	var pStart = 0;
+	if (window > 0 && pN > window) pStart = pN - window;
+	for (var ci = 0; ci < cN; ci++) {
+		var ax = cand[ci][0];
+		var ay = cand[ci][1];
+		var bx = cand[ci + 1][0];
+		var by = cand[ci + 1][1];
+		if (ax == bx && ay == by) continue;
+		for (var pi = pStart; pi < pN; pi++) {
+			var cx = chain[pi][0];
+			var cy = chain[pi][1];
+			var dx = chain[pi + 1][0];
+			var dy = chain[pi + 1][1];
+			if (cx == dx && cy == dy) continue;
+			if (jcOverlapLen(ax, ay, bx, by, cx, cy, dx, dy, eps) > eps) return 0;
+			if (!jcCross(ax, ay, bx, by, cx, cy, dx, dy)) continue;
+			var t = jcCrossT(ax, ay, bx, by, cx, cy, dx, dy);
+			if (isFinite(t)) {
+				var ix = ax + t * (bx - ax) - pxj;
+				var iy = ay + t * (by - ay) - pyj;
+				if (ix * ix + iy * iy <= eps2) continue;
+			}
+			return 0;
+		}
+	}
+	return 1;
+}
+
 function pathstoText1(gx) {
 	cache_ink_img = [];
 	mind = getnumber("minR");
@@ -3759,83 +3973,134 @@ function pathstoText1(gx) {
 	}
 
 	if (join) {
-		for (var i in paths) {
-			var pa = paths[i];
-			if (pa[0].length != 2) continue;
-			if (!pa[8]) {
-
-				for (var ii in paths) {
-					if (i == ii) continue;
-					var p = paths[ii];
-					if (p[0].length != 2) continue;
-					if (p[9].stroke != pa[9].stroke) continue;
-					if (p[8]) continue;
-
-					var ox, oy, fx, fy;
-					fx = pa[0][0][0];
-					fy = pa[0][0][1];
-					ox = pa[0][1][0];
-					oy = pa[0][1][1];
-
-					var p1 = p[0][0];
-					var p2 = p[0][1];
-					if (sqr(p1[0] - fx) + sqr(p1[1] - fy) < mind && sqr(p2[0] - ox) + sqr(p2[1] - oy) < mind) {
-
-						p[0] = [];
-					}
-					else if (sqr(p1[0] - ox) + sqr(p1[1] - oy) < mind && sqr(p2[0] - fx) + sqr(p2[1] - fy) < mind) {
-
-						p[0] = [];
-					}
-				}
+		// ------------------------------------------------------------------
+		// PASS 1 - duplicate prune.
+		// CAD exports routinely draw the same edge twice. A path counts as a
+		// duplicate of another one when its vertices match one by one (forward
+		// or reversed) within the join tolerance, or when it lies on top of the
+		// other one. The LONGER path always survives, the shorter is emptied.
+		// Closed paths are left untouched (dedupe only here, no chaining).
+		// ------------------------------------------------------------------
+		var dupTol = mind;
+		var dupLin = Math.sqrt(dupTol);
+		if (!isFinite(dupLin) || dupLin < 0) dupLin = 0;
+		var np = paths.length;
+		var pBox = new Array(np);
+		var pLen = new Array(np);
+		for (var bi = 0; bi < np; bi++) {
+			var bp = paths[bi][0];
+			if (bp.length >= 2) {
+				pBox[bi] = jcBounds(bp);
+				pLen[bi] = jcPolyLen(bp);
 			}
 		}
+		for (var i in paths) {
+			var pa = paths[i];
+			if (pa[0].length < 2) continue;
+			if (pa[8]) continue;
+			for (var ii in paths) {
+				if (i == ii) continue;
+				var p = paths[ii];
+				if (p[0].length < 2) continue;
+				if (p[8]) continue;
+				if (p[9].stroke != pa[9].stroke) continue;
+				if (!jcBoxHit(pBox[i], pBox[ii], dupLin)) continue;
+				if (!jcIsDup(pa[0], p[0], dupTol)) continue;
+				if (pLen[ii] > pLen[i]) {
+					pa[0] = [];
+					break;
+				}
+				p[0] = [];
+			}
+		}
+
+		// ------------------------------------------------------------------
+		// PASS 2 - chaining.
+		// Acceptance tolerance is unchanged from the original code
+		// (squared distance < mind + 0.1). joinEps is the linear joint /
+		// degeneracy epsilon used by the two guards below: 1.2x the linear
+		// join tolerance, so a joint snap and a redrawn edge are both caught
+		// while normal joins are left alone.
+		// ------------------------------------------------------------------
+		var joinTol = mind + 0.1;
+		var joinEps = Math.sqrt(joinTol);
+		if (!isFinite(joinEps) || joinEps <= 0) joinEps = 0.5;
+		joinEps *= 1.2;
 		var joined = 1;
 		while (joined) {
 			joined = 0;
 			for (var i in paths) {
 				var pa = paths[i];
 				if (pa[0].length <= 1) continue;
-				if (!pa[8]) {
-
-					while (1) {
-						var revers = 0;
-						var mindis = mind + 0.1;
-						var cekdis;
-						var idp = -1;
-						for (var ii in paths) {
-							if (i == ii) continue;
-							var p = paths[ii];
-							if (p[0].length == 0) continue;
-							if (p[9].stroke != pa[9].stroke) continue;
-							if (p[8]) continue;
-
-							var ox, oy, fx, fy;
-							fx = pa[0][0][0];
-							fy = pa[0][0][1];
-							ox = pa[0][pa[0].length - 1][0];
-							oy = pa[0][pa[0].length - 1][1];
-
-							var p1 = p[0][0];
-							var p2 = p[0][p[0].length - 1];
-							if ((cekdis = sqr(p1[0] - ox) + sqr(p1[1] - oy)) < mindis) {
-								idp = ii;
-								mindis = cekdis;
-								revers = 0;
-							}
-							else if ((cekdis = sqr(p2[0] - ox) + sqr(p2[1] - oy)) < mindis) {
-								idp = ii;
-								mindis = cekdis;
-								revers = 1;
-							}
-						}
-						if (idp >= 0) {
-							var p = paths[idp];
-							pa[0] = revers ? pa[0].concat(p[0].reverse()) : pa[0].concat(p[0]);
-							p[0] = [];
-							joined++;
-						} else break;
+				if (pa[8]) continue;
+				while (1) {
+					var idp = -1;
+					var ox = pa[0][pa[0].length - 1][0];
+					var oy = pa[0][pa[0].length - 1][1];
+					var cands = [];
+					for (var ii in paths) {
+						if (i == ii) continue;
+						var p = paths[ii];
+						if (p[0].length == 0) continue;
+						if (p[9].stroke != pa[9].stroke) continue;
+						if (p[8]) continue;
+						var p1 = p[0][0];
+						var p2 = p[0][p[0].length - 1];
+						var d1 = sqr(p1[0] - ox) + sqr(p1[1] - oy);
+						var d2 = sqr(p2[0] - ox) + sqr(p2[1] - oy);
+						if (d1 < joinTol) cands.push([d1, ii, 0]);
+						if (d2 < joinTol) cands.push([d2, ii, 1]);
 					}
+					// P2 - two candidates at the same joint that are equally close
+					// and overlap each other: keep the longer, delete the shorter.
+					for (var ca = 0; ca < cands.length; ca++) {
+						if (cands[ca][1] < 0) continue;
+						var pa1 = paths[cands[ca][1]][0];
+						if (pa1.length < 2) {
+							cands[ca][1] = -1;
+							continue;
+						}
+						for (var cb = ca + 1; cb < cands.length; cb++) {
+							if (cands[cb][1] < 0) continue;
+							if (cands[cb][1] == cands[ca][1]) continue;
+							var pb1 = paths[cands[cb][1]][0];
+							if (pb1.length < 2) continue;
+							var dA = Math.sqrt(cands[ca][0]);
+							var dB = Math.sqrt(cands[cb][0]);
+							if (Math.abs(dA - dB) > joinEps) continue;
+							var segA = jcFirstSeg(pa1, cands[ca][2]);
+							var segB = jcFirstSeg(pb1, cands[cb][2]);
+							if (jcOverlapLen(segA[0][0], segA[0][1], segA[1][0], segA[1][1],
+								segB[0][0], segB[0][1], segB[1][0], segB[1][1], joinEps) <= joinEps) continue;
+							var del = (jcPolyLen(pb1) > jcPolyLen(pa1)) ? ca : cb;
+							var keep = (del == ca) ? pb1 : pa1;
+							var drop = (del == ca) ? pa1 : pb1;
+							// only drop the shorter one when the kept one really covers it,
+							// otherwise unique geometry would disappear with it
+							if (!jcLiesOn(drop, keep, dupTol)) continue;
+							paths[cands[del][1]][0] = [];
+							cands[del][1] = -1;
+							if (del == ca) break;
+						}
+					}
+					// P3 - try the nearest candidate first. A candidate that would
+					// cross or retrace a line already joined into this chain is
+					// skipped, the next candidate gets a chance.
+					cands.sort(function (x, y) { return x[0] - y[0]; });
+					for (var cc = 0; cc < cands.length; cc++) {
+						var idc = cands[cc][1];
+						if (idc < 0) continue;
+						var pc = paths[idc];
+						if (pc[0].length == 0) continue;
+						var app = cands[cc][2] ? pc[0].slice().reverse() : pc[0];
+						if (!jcJoinAllowed(pa[0], app, joinEps, JOIN_GUARD_WINDOW)) continue;
+						pa[0] = pa[0].concat(app);
+						pc[0] = [];
+						idp = idc;
+						joined++;
+						break;
+					}
+					if (idp < 0) break;
 				}
 			}
 		}
