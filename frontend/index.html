@@ -444,7 +444,14 @@
 							</tr>
 							<tr class="notlaser">
 								<td>DogBone </td>
-								<td><input id=overcut type=checkbox size=2 class=saveit></td>
+								<td>
+									<select id="overcutmode" class="saveit">
+										<option value="none">None</option>
+										<option value="line">Line</option>
+										<option value="bezier">Bezier</option>
+									</select>
+									<input id="overcut" type="checkbox" class="saveit hideit">
+								</td>
 								<td class=notsimple>+overcut <input id=ovcmore value=0.2 size=3 class=saveit></td>
 								<td class=notsimple>Angle &lt; <input id=sharp value="110" size=3 class=saveit>
 									<input id=segment type=checkbox class="saveit hideit">
@@ -465,7 +472,14 @@
 							</tr>
 							<tr class=notsimple>
 								<td colspan=2>Size<input id=szsort class=saveit size=5 value="0"></td>
-								<td colspan=2></td>
+								<td colspan=2>Center<input id=centersort class=saveit size=5 value="0"
+										title="Center-out: potong lubang/child dari tengah parent keluar. 0=mati, >0=makin ke tengah makin dulu."></td>
+							</tr>
+							<tr class=notsimple>
+								<td colspan=2>Y slow x<input id=yslow class=saveit size=5 value="1"
+										title="Rasio lambat Y vs X (Vx/Vy). 1=sama cepat, 2=Y separuh X. Travel Y dibobot lebih mahal."></td>
+								<td colspan=2>Green<input id=greensort class=saveit size=5 value="0"
+										title="Green hub: tarik cutting ke titik hijau dulu. 0=mati, >0=makin dekat hijau makin dulu. Closed hijau=hub (travel ke tengah), open hijau=jalur travel."></td>
 							</tr>
 							<tr class=notsimple>
 								<td colspan=2>Safe cut<input type=checkbox id=safesort class=saveit checked></td>

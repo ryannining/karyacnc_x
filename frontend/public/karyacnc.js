@@ -273,6 +273,12 @@ function getinteger(el) {
     return parseInt(getvalue(el));
 }
 
+function getDogboneMode() {
+    var el = document.getElementById("overcutmode");
+    if (el) return el.value;
+    return getchecked("overcut") ? "line" : "none";
+}
+
 function setvalue(el, val) {
     if (el == "gcode") {
         const ed = document.getElementById('gcodeEditor');
@@ -282,7 +288,13 @@ function setvalue(el, val) {
         const ed = document.getElementById('engcodeEditor');
         if (ed) { ed.value = val; ed.dispatchEvent(new Event('input')); }
     }
-    else $(el).value = val;
+    else {
+        $(el).value = val;
+        if (el == "overcutmode") {
+            var chk = document.getElementById("overcut");
+            if (chk) chk.checked = (val !== "none");
+        }
+    }
 }
 
 function mround(x) {
@@ -558,6 +570,9 @@ function modechange(f = 0) {
 }
 
 function updateweb(sett, nm) {
+    if (typeof sett["overcutmode"] === 'undefined' && typeof sett["overcut"] !== 'undefined') {
+        sett["overcutmode"] = sett["overcut"] ? "line" : "none";
+    }
     var kl = document.getElementsByClassName("saveit");
     for (var i = 0; i < kl.length; i++) {
         var a = kl[i];
@@ -1827,6 +1842,7 @@ var defaultProfile = {
         "spindleoff": false,
         "addz": "0",
         "overcutmin": "14",
+        "overcutmode": "bezier",
         "overcut": true,
         "ovcmore": "0.2",
         "sharp": "110",
@@ -1835,6 +1851,9 @@ var defaultProfile = {
         "xsort": "0",
         "ysort": "0",
         "szsort": "0",
+        "centersort": "0",
+        "yslow": "1",
+        "greensort": "0",
         "safesort": true,
         "acpstep": "0.5",
         "acpmode": false,

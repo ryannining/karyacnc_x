@@ -312,7 +312,7 @@ const CncPlanner = (function () {
             }
             if (CPUTIME >= SEGMENTTIME) startmove();
             CPUTIME += Math.max(TICK_MICROS, SEGMENTTIME / 5);
-            if (totalTimeUs > 3600e6) break;
+            if (totalTimeUs > 43200e6) break;
         }
 
         return {

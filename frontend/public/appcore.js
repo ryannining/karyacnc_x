@@ -385,6 +385,66 @@ function sharp(poly, px = 1, py = 2, idx = 0, num = 2, dotcross = 0) {
 	return (dot);
 }
 
+/**
+ * Menghasilkan titik-titik interpolasi Bézier Teardrop Loop untuk sudut dalam.
+ * Parameter konsisten dengan dogbone lama: ro (radius), ovmore, vec1, vec2.
+ */
+function generateBezierDogboneLoop(curPoint, vec1, vec2, ro, ovmore, steps = 8) {
+	// vec1 = prev - cur (arah ke titik sebelumnya, ternormalisasi)
+	// vec2 = next - cur (arah ke titik berikutnya, ternormalisasi)
+	// Arah datang adalah u_in = -vec1
+	// Arah keluar adalah u_out = vec2
+	var u_in = [-vec1[0], -vec1[1]];
+	var u_out = [vec2[0], vec2[1]];
+
+	// Arah puncak loop adalah u_in - u_out
+	var bisectX = u_in[0] - u_out[0];
+	var bisectY = u_in[1] - u_out[1];
+	var bisectLen = Math.sqrt(bisectX * bisectX + bisectY * bisectY);
+	if (bisectLen < 0.0001) return [];
+
+	// Kedalaman clearance yang dibutuhkan
+	var reqDepth = (Math.sqrt(2 * ro * ro) - ro) + ovmore;
+	if (reqDepth <= 0) reqDepth = 0.01;
+
+	// Puncak cubic Bezier t=0.5 berjarak (3/8)*L*bisectLen dari titik sudut C
+	var L = (8.0 * reqDepth) / (3.0 * bisectLen);
+
+	var cx = curPoint[1];
+	var cy = curPoint[2];
+
+	var p0 = [cx, cy];
+	var p1 = [cx + L * u_in[0], cy + L * u_in[1]];
+	var p2 = [cx - L * u_out[0], cy - L * u_out[1]];
+	var p3 = [cx, cy];
+
+	var loopPoints = [];
+	var feed = curPoint[0];
+	var tl = curPoint[3];
+
+	var lastX = cx;
+	var lastY = cy;
+
+	for (var k = 1; k <= steps; k++) {
+		var t = k / steps;
+		var mt = 1.0 - t;
+		var b0 = mt * mt * mt;
+		var b1 = 3.0 * mt * mt * t;
+		var b2 = 3.0 * mt * t * t;
+		var b3 = t * t * t;
+
+		var bx = b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0];
+		var by = b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1];
+
+		var segLen = Math.sqrt((bx - lastX) * (bx - lastX) + (by - lastY) * (by - lastY));
+		loopPoints.push([feed, bx, by, tl, segLen]);
+		lastX = bx;
+		lastY = by;
+	}
+
+	return loopPoints;
+}
+
 function xarea() {
 	dx = xmax2 - xmin2;
 	dy = ymax2 - ymin2;
@@ -1034,12 +1094,14 @@ function prepare_line2(lenmm, lines, ofs1) {
 		if ((disable_ovc.indexOf(shapectr + "") >= 0) || (lenmm < noprocess)) return [glines, clk];
 		sharpv = getnumber("sharp");
 		ov = 0.01;
-		var dogbone = getchecked("overcut");
+		var dogboneMode = typeof getDogboneMode === "function" ? getDogboneMode() : (getchecked("overcut") ? "line" : "none");
+		var dogbone = dogboneMode !== "none";
 		var isnotcutting = (sty.greenskip || sty.doEngrave || sty.dovcarve || sty.dopocket || sty.domarking) ||
 			(!sty.isblack);
 		if (getchecked("overcut2") && sty.domarking) isnotcutting = false;
+		var ro = 0;
 		if ((cmd == CMD_CNC) && dogbone && !isnotcutting) {
-			var ro = $("offset").value / 2;
+			ro = $("offset").value / 2;
 			ov += (sqrt(2 * sqr(ro)) - ro) + ovmore;
 		}
 		cxt = 0;
@@ -1060,24 +1122,35 @@ function prepare_line2(lenmm, lines, ofs1) {
 				cyt += y;
 				cnt += 1.0;
 
-				if (dogbone) {
+				// Lewatkan i == 0 agar tidak menyisipkan dogbone prematur pada titik plunge awal.
+				// Sudut penutup diproses saat kontur kembali menutup di i == gline.length - 1.
+				if (dogbone && i > 0) {
 					sr = sharp(gline, 1, 2, i);
-					if ((sr > sharpv)) {
+					if ((sr > sharpv) && (cross < 0)) {
 						newline.push(gline[i]);
-						ox = overcut[0] * ov;
-						oy = overcut[1] * ov;
-						if ((OVC_MODE == 0) && ((ox != 0) || (oy != 0))) {
-							newline.push([gline[i][0], x - ox, y - oy, tl, 0]);
-							newline.push([gline[i][0], x, y, tl, 0]);
+						if (dogboneMode === "bezier") {
+							var loopPts = generateBezierDogboneLoop(gline[i], vec1, vec2, ro, ovmore, 8);
+							for (var lp = 0; lp < loopPts.length; lp++) {
+								newline.push(loopPts[lp]);
+							}
+							var midPt = loopPts.length ? loopPts[Math.floor(loopPts.length / 2)] : gline[i];
+							srl.push([x, y, sr, tl, i, [midPt[1], midPt[2]], cross, cxt / cnt, cyt / cnt]);
+						} else {
+							ox = overcut[0] * ov;
+							oy = overcut[1] * ov;
+							if ((OVC_MODE == 0) && ((ox != 0) || (oy != 0))) {
+								newline.push([gline[i][0], x - ox, y - oy, tl, 0]);
+								newline.push([gline[i][0], x, y, tl, 0]);
+							}
+							srl.push([x, y, sr, tl, i, [x - ox, y - oy], cross, cxt / cnt, cyt / cnt]);
 						}
-						srl.push([x, y, sr, tl, i, [x - ox, y - oy], cross, cxt / cnt, cyt / cnt]);
 						cxt = 0;
 						cyt = 0;
 						cnt = 0;
 						lx = x;
 						ly = y;
 					} else newline.push(gline[i]);
-				} else newline.push(gline[i])
+				} else newline.push(gline[i]);
 			}
 			newlines.push(newline);
 		}
@@ -1605,7 +1678,8 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 	sharpv = getnumber("sharp");
 
 	ov = 0;
-	if ((cmd == CMD_CNC) && getchecked("overcut") && !isnotcutting) {
+	var dogboneMode = typeof getDogboneMode === "function" ? getDogboneMode() : (getchecked("overcut") ? "line" : "none");
+	if ((cmd == CMD_CNC) && (dogboneMode !== "none") && !isnotcutting) {
 		var rr = $("offset").value / 2;
 		ov = sqrt(2 * sqr(rr)) - rr;
 	}
@@ -2351,12 +2425,19 @@ function sortedgcode() {
 	xs = getnumber('xsort');
 	ys = getnumber('ysort');
 	szs = getnumber('szsort');
+	var csort = getnumber('centersort');
+	if (!(csort > 0)) csort = 0;
+	var yslowR = getnumber('yslow');
+	if (!(yslowR >= 1)) yslowR = 1;
+	var gsort = getnumber('greensort');
+	if (!(gsort >= 0)) gsort = 0;
 	var ufinish = getchecked("usefinish");
 	var sepcut = getchecked("separatecut") && !ufinish;
 
 	if (cmd == 4) setvalue("repeat", Math.ceil(getvalue("zdown") / layerheight));
 	var re = getvalue("repeat");
-	var ov = getchecked("overcut");
+	var dogboneMode = typeof getDogboneMode === "function" ? getDogboneMode() : (getchecked("overcut") ? "line" : "none");
+	var ov = (dogboneMode !== "none");
 
 	var mustF = 0;
 	// function findnearest(closed, lx, ly, pts, sty) {
@@ -2407,6 +2488,10 @@ function sortedgcode() {
 		var shift = 0;
 		var flip = 0;
 		var dis = 100000000;
+		var yslowF = (typeof yslowR !== "undefined" && yslowR >= 1) ? yslowR : 1;
+
+		// Closed hijau = blackhole: tidak pernah dinilai di sini.
+		// Sudah di-skip di loop kandidat + ditandai done sebelum sortir.
 
 		if (closed && virtualStartPoints[shapeIndex] && virtualStartPoints[shapeIndex].points.length > 0) {
 			var vdata = virtualStartPoints[shapeIndex];
@@ -2436,7 +2521,7 @@ function sortedgcode() {
 			var bestVpDist = 100000000;
 			for (var v = 0; v < vdata.points.length; v++) {
 				var dx = vdata.points[v][0] - lx;
-				var dy = vdata.points[v][1] - ly;
+				var dy = (vdata.points[v][1] - ly) * yslowF;
 				var d2 = dx * dx + dy * dy;
 				if (d2 < bestVpDist) {
 					bestVpDist = d2;
@@ -2451,7 +2536,7 @@ function sortedgcode() {
 				newx = pts[rpi][1];
 				newy = pts[rpi][2];
 				var dx = newx - lx;
-				var dy = newy - ly;
+				var dy = (newy - ly) * yslowF;
 				dis = dx * dx + dy * dy;
 			}
 		}
@@ -2461,7 +2546,7 @@ function sortedgcode() {
 			if (closed) {
 				for (var p = 0; p < pts.length; p += pstep) {
 					var dx = pts[p][1] - lx;
-					var dy = pts[p][2] - ly;
+					var dy = (pts[p][2] - ly) * yslowF;
 					var dis2 = (dx * dx + dy * dy);
 					if (dis2 < dis) {
 						shift = p;
@@ -2472,10 +2557,10 @@ function sortedgcode() {
 				}
 			} else {
 				var dx = pts[0][1] - lx;
-				var dy = pts[0][2] - ly;
+				var dy = (pts[0][2] - ly) * yslowF;
 				dis = (dx * dx + dy * dy);
 				dx = pts[pts.length - 1][1] - lx;
-				dy = pts[pts.length - 1][2] - ly;
+				dy = (pts[pts.length - 1][2] - ly) * yslowF;
 				var dis2 = (dx * dx + dy * dy);
 				flip = 0;
 				if (dis2 < dis) {
@@ -2488,7 +2573,6 @@ function sortedgcode() {
 		}
 
 		dis = sqrt(dis);
-		if (sty.greentravel) dis -= 10000;
 		if (sty.sortadd) dis += sty.sortadd;
 		return [newx, newy, dis, shift, flip];
 	}
@@ -2617,6 +2701,30 @@ function sortedgcode() {
 
 		var sparent = -1;
 		var usefinishpart = getchecked("finishpart");
+		var parentCx = null;
+		var greenHoles = null;
+		if (csort > 0 || gsort > 0) {
+			parentCx = new Array(gcstyle.length);
+			for (var _pi2 = 0; _pi2 < gcstyle.length; _pi2++) parentCx[_pi2] = null;
+			for (var _gi4 = 0; _gi4 < gcodes.length; _gi4++) {
+				var _si = gcodes[_gi4][8];
+				var _c = gcodes[_gi4][11];
+				if (!_c) continue;
+				if (csort > 0 && parentCx[_si] === null) parentCx[_si] = [_c[0], _c[1]];
+			}
+			if (gsort > 0) {
+				greenHoles = [];
+				for (var _gi5 = 0; _gi5 < gcodes.length; _gi5++) {
+					var _gs = gcstyle[gcodes[_gi5][8]];
+					// Blackhole hanya dari green CLOSED. Open green tetap
+					// jalur travel biasa, bukan titik tarik.
+					if (_gs && _gs.greentravel && gcodes[_gi5][7] && gcodes[_gi5][11]) {
+						greenHoles.push({ x: gcodes[_gi5][11][0], y: gcodes[_gi5][11][1], top: _gs.topparent, idp: _gs.idp });
+					}
+				}
+				if (greenHoles.length === 0) greenHoles = null;
+			}
+		}
 		for (var j = 0; j < gcodes.length; j++) {
 			if (sortit) {
 				cs = -1;
@@ -2671,9 +2779,34 @@ function sortedgcode() {
 					var ays = ys;
 					if (sty.sortadd > 0) { axs = 0; ays = 0; }
 
-					dis += (gcodes[i][11][0] - lx) * (axs) + (gcodes[i][11][1] - ly) * (ays);
+					var _cdx = (gcodes[i][11][0] - lx);
+					var _cdy = (gcodes[i][11][1] - ly) * yslowR;
+					dis += _cdx * (axs) + _cdy * (ays);
 
 					dis += newx * axs + newy * ays;
+
+					if (csort > 0 && parentCx && sty.topparent >= 0 && parentCx[sty.topparent]) {
+						var _pc = parentCx[sty.topparent];
+						var _rdx = gcodes[i][11][0] - _pc[0];
+						var _rdy = (gcodes[i][11][1] - _pc[1]) * yslowR;
+						dis += sqrt(_rdx * _rdx + _rdy * _rdy) * csort;
+					}
+
+					// Blackhole: hanya blackhole TERDEKAT yang satu grup
+					// (topparent/idp sama) dengan kandidat yang dihitung.
+					// Beda compound = tidak saling menarik.
+					if (gsort > 0 && greenHoles && !sty.greentravel) {
+						var _gd = 100000000;
+						for (var _gh = 0; _gh < greenHoles.length; _gh++) {
+							var _hb = greenHoles[_gh];
+							if (!(_hb.top === sty.topparent || _hb.top === sty.idp || _hb.idp === sty.topparent || _hb.idp === sty.idp)) continue;
+							var _hdx = gcodes[i][11][0] - _hb.x;
+							var _hdy = (gcodes[i][11][1] - _hb.y) * yslowR;
+							var _hd = sqrt(_hdx * _hdx + _hdy * _hdy);
+							if (_hd < _gd) _gd = _hd;
+						}
+						if (_gd < 100000000) dis += _gd * gsort;
+					}
 
 					if (gcodes[i][1] == "F") dis += (mustF ? -1000 : 1000);
 
@@ -2921,6 +3054,10 @@ function sortedgcode() {
 				cncz = zdown;
 				_re = 1;
 				iscut = 1;
+				if (gsort > 0 && sty.closed) {
+					_re = 0;
+					iscut = 0;
+				}
 			}
 			if (_re > 0) {
 				empty = 0;
