@@ -4137,6 +4137,12 @@ function jcJoinAllowed(chain, cand, eps, window) {
 var lastParsedSnapshot = null;
 
 function pathstoText1(gx, parsedInput) {
+	var t0 = Date.now();
+	if (parsedInput && parsedInput.paths) {
+		console.log("[JOB] memakai CACHE (parsedInput) — skip parse & join (" + parsedInput.paths.length + " path)");
+	} else {
+		console.log("[JOB] parse data BARU dari teks");
+	}
 	cache_ink_img = [];
 	mind = getnumber("minR");
 
@@ -4845,6 +4851,7 @@ function pathstoText1(gx, parsedInput) {
 	gcstyle.push(sty);
 	gcstyle.push(sty);
 	gcstyle.push(sty);
+	console.log("[JOB] selesai: " + (Date.now() - t0) + "ms | " + (parsedGeometryData ? parsedGeometryData.length : 0) + " kontur | text1 len " + t1.length);
 	console.log("path1totext done.");
 	return t1;
 
