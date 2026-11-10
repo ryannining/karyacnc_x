@@ -32,6 +32,8 @@ class Canvas {
         
         this.attachEventListeners();
         this.setupResizeObserver();
+        // Redraw saat tema diganti dari shell KaryaCNC
+        window.addEventListener('karyacnc-theme-changed', () => this.draw());
         // Delay initial resize to ensure iframe layout is ready
         setTimeout(() => this.resize(), 50);
     }
@@ -320,9 +322,14 @@ class Canvas {
         const top = -this.y / this.zoom;
         const bottom = top + this.canvas.height / (this.baseScale * this.zoom);
 
+        // Warna grid diseragamkan dengan MiniSketch (major lebih terang dari minor)
+        const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+        const majorColor = dark ? '#242c36' : '#e4e8ee';
+        const minorColor = dark ? '#1b222a' : '#eef1f5';
+
         // Major grid lines every 100mm
         this.context.beginPath();
-        this.context.strokeStyle = '#b0b0b0';
+        this.context.strokeStyle = majorColor;
         this.context.lineWidth = 1 / (this.baseScale * this.zoom);
         const majorGrid = 100;
         for (let x = Math.floor(left / majorGrid) * majorGrid; x < right; x += majorGrid) {
@@ -337,7 +344,7 @@ class Canvas {
 
         // Minor grid lines every 20mm
         this.context.beginPath();
-        this.context.strokeStyle = '#d8d8d8';
+        this.context.strokeStyle = minorColor;
         this.context.lineWidth = 0.5 / (this.baseScale * this.zoom);
         const minorGrid = 20;
         for (let x = Math.floor(left / minorGrid) * minorGrid; x < right; x += minorGrid) {

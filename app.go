@@ -18,8 +18,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +41,9 @@ var inkscapeFiles embed.FS
 
 //go:embed all:nestjs2/frontend
 var nestjs2WebFiles embed.FS
+
+//go:embed all:minisketch
+var minisketchWebFiles embed.FS
 
 //go:embed all:tools_invoice
 var invoiceFiles embed.FS
@@ -460,7 +465,7 @@ func (a *App) StartWSServer(port uint16) {
 		if SHOWDEBUG {
 			fmt.Printf("[WS] WebSocket server listening on %s\n", addr)
 		}
-		runtime.EventsEmit(a.ctx, "WS_SERVER_STARTED", addr)
+		a.emit("WS_SERVER_STARTED", addr)
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			if SHOWDEBUG {
@@ -490,7 +495,7 @@ func (a *App) handleTelegramRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit event to frontend with the parameters
-	runtime.EventsEmit(a.ctx, "TELEGRAM_REQUEST", map[string]string{
+	a.emit("TELEGRAM_REQUEST", map[string]string{
 		"bot":  bot,
 		"id":   id,
 		"text": text,
@@ -523,7 +528,7 @@ func (a *App) handleConnection(peer string, conn *websocket.Conn) {
 				if SHOWDEBUG {
 					fmt.Printf("[WS] Received full message from %s. Processing...\n", peer)
 				}
-				runtime.EventsEmit(a.ctx, "WS_MESSAGE_RECEIVED", buff.String())
+				a.emit("WS_MESSAGE_RECEIVED", buff.String())
 
 				// Acknowledge receipt to the client
 				if err := conn.WriteMessage(websocket.TextMessage, []byte("ACK")); err != nil {
@@ -555,7 +560,7 @@ func (a *App) handleConnection(peer string, conn *websocket.Conn) {
 	if SHOWDEBUG {
 		fmt.Printf("[WS] Client %s disconnected.\n", peer)
 	}
-	runtime.EventsEmit(a.ctx, "WS_CLIENT_DISCONNECTED", peer)
+	a.emit("WS_CLIENT_DISCONNECTED", peer)
 }
 
 // OpenDevtools opens the developer tools
@@ -638,7 +643,7 @@ func (a *App) StartReceiving() error {
 						Velocity: Float32frombytes(payload[12:16]),
 						MoveID:   payload[16],
 					}
-					runtime.EventsEmit(a.ctx, "machine-position", pos)
+					a.emit("machine-position", pos)
 				}
 			case 2: // Machine Job
 				if len(payload) >= 66 {
@@ -651,7 +656,7 @@ func (a *App) StartReceiving() error {
 						Status:   status,
 						Progress: progress,
 					}
-					runtime.EventsEmit(a.ctx, "machine-job", job)
+					a.emit("machine-job", job)
 				}
 			default:
 				// Unknown message type
@@ -881,6 +886,9 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 		a.storedSvgMutex.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"timestamp": %d}`, ts)
+	case "/save-sketch", "/save_sketch":
+		a.handleSaveSketch(w, r)
+		return
 	case "/upload-svg", "/upload_svg":
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", 405)
@@ -916,9 +924,7 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 			// Clear any previous nesting result - it's invalidated by the new upload
 			a.storedresultSvgData = ""
 			a.storedSvgMutex.Unlock()
-			if a.ctx != nil {
-				runtime.EventsEmit(a.ctx, "NESTING_UPLOAD_RECEIVED", a.storedSvgTimestamp)
-			}
+			a.emit("NESTING_UPLOAD_RECEIVED", a.storedSvgTimestamp)
 		} else if inkscape == "n" {
 			a.storedSvgMutex.Lock()
 			a.storedresultSvgData = svgStr
@@ -954,12 +960,172 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// Handle /sketcher prefix for minisketch
+		if r.URL.Path == "/sketcher" {
+			http.Redirect(w, r, "/sketcher/", http.StatusMovedPermanently)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/sketcher/") {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/sketcher")
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
+			devPath := "minisketch"
+			if _, err := os.Stat(devPath); err == nil {
+				if SHOWDEBUG {
+					log.Printf("Serving minisketch from development folder: %s", devPath)
+				}
+				fileServer := http.FileServer(http.Dir(devPath))
+				fileServer.ServeHTTP(w, r)
+			} else {
+				if SHOWDEBUG {
+					log.Printf("Serving minisketch from embedded files")
+				}
+				subFS, _ := fs.Sub(minisketchWebFiles, "minisketch")
+				fileServer := http.FileServer(http.FS(subFS))
+				fileServer.ServeHTTP(w, r)
+			}
+			return
+		}
 		// Try to serve from tools_invoice first (invoice generator static assets)
 		if a.serveInvoiceFile(w, r) {
 			return
 		}
 		http.NotFound(w, r)
 	}
+}
+
+// saveFileDialog asks the user where to write a file.
+//
+// Two worlds, one call:
+//   - Wails webview: a.ctx exists, so the Wails runtime owns the dialog.
+//   - Linux browser mode (see linux-patch/bridge.go): wails.Run never runs, so
+//     a.ctx is nil and runtime.SaveFileDialog panics/errors. There the dialog
+//     must come from the desktop itself — zenity, kdialog or yad.
+//
+// Returns ("", nil) when the user cancels.
+func (a *App) saveFileDialog(opts runtime.SaveDialogOptions, fallbackName string) (string, error) {
+	if a.ctx != nil {
+		return runtime.SaveFileDialog(a.ctx, opts)
+	}
+	return nativeSaveDialog(opts.Title, fallbackName)
+}
+
+// nativeSaveDialog shows a GTK/Qt save dialog through whatever helper the
+// desktop already ships. Empty string + nil error means "cancelled".
+func nativeSaveDialog(title, name string) (string, error) {
+	if goruntime.GOOS != "linux" {
+		return "", fmt.Errorf("no dialog backend outside Linux without a Wails context")
+	}
+	if name == "" {
+		name = "sketch.sketch"
+	}
+	// The directory is not pre-filled: letting the dialog remember its own last
+	// folder is better than forcing one, and the user picks anyway.
+	type attempt struct {
+		bin  string
+		args []string
+	}
+	tries := []attempt{
+		{"zenity", []string{"--file-selection", "--save", "--confirm-overwrite",
+			"--title=" + title, "--filename=" + name,
+			"--file-filter=MiniSketch (*.sketch) | *.sketch"}},
+		{"kdialog", []string{"--getsavefilename", name, "*.sketch", "--title", title}},
+		{"yad", []string{"--file", "--save", "--confirm-overwrite",
+			"--title=" + title, "--filename=" + name,
+			"--file-filter=*.sketch"}},
+	}
+	for _, t := range tries {
+		bin, err := exec.LookPath(t.bin)
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(bin, t.args...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = io.Discard
+		err = cmd.Run()
+		if err != nil {
+			// exit 1 is the dialog's own "Cancel", not a failure worth reporting
+			if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+				return "", nil
+			}
+			return "", err
+		}
+		chosen := strings.TrimSpace(out.String())
+		if chosen == "" {
+			return "", nil
+		}
+		return chosen, nil
+	}
+	return "", fmt.Errorf("no save dialog available (install zenity, kdialog or yad)")
+}
+
+// handleSaveSketch writes a MiniSketch document through the desktop's own Save
+// dialog.
+//
+// Why it lives here: MiniSketch runs in an iframe, and browsers refuse the File
+// System Access API in a cross-origin frame, so the in-page "Save" could only
+// ever drop another copy in Downloads. The host process has a REAL save dialog
+// (Wails runtime), and the frame is served same-origin from :3000, so a plain
+// POST reaches it with no CORS work.
+//
+// Body: {"name":"kursi.sketch","text":"..."} — `text` is the .sketch JSON.
+// Reply: {"status":"saved"|"cancelled"|"error","path":"..."}
+func (a *App) handleSaveSketch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		io.WriteString(w, `{"status":"error","message":"POST only"}`)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"status":"error","message":"bad json"}`)
+		return
+	}
+	if req.Text == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"status":"error","message":"empty text"}`)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = "sketch.sketch"
+	}
+	// the extension belongs to the file type, never to the user's typing
+	if !strings.HasSuffix(strings.ToLower(name), ".sketch") {
+		name += ".sketch"
+	}
+	path, err := a.saveFileDialog(runtime.SaveDialogOptions{
+		Title:           "Simpan sketsa MiniSketch",
+		DefaultFilename: name,
+		Filters: []runtime.FileFilter{
+			{DisplayName: "MiniSketch (*.sketch)", Pattern: "*.sketch"},
+		},
+	}, name)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"status":"error","message":%q}`, err.Error())
+		return
+	}
+	if path == "" {
+		io.WriteString(w, `{"status":"cancelled"}`)
+		return
+	}
+	if err := os.WriteFile(path, []byte(req.Text), 0644); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"status":"error","message":%q}`, err.Error())
+		return
+	}
+	if SHOWDEBUG {
+		log.Printf("Saved sketch: %s (%d bytes)", path, len(req.Text))
+	}
+	fmt.Fprintf(w, `{"status":"saved","path":%q}`, path)
 }
 
 // serveInvoiceFile attempts to serve the request from the tools_invoice

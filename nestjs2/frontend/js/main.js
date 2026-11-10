@@ -22,6 +22,8 @@ class NestingApp {
         this.isNesting = false;     // Whether a nesting run is currently in progress
         this.nestingStopRequested = false; // Set when Stop is pressed; breaks infinite loop
         this.abortController = null; // Controller for the current running run (cancellation)
+        // GA hyper-parameters (defaults: kecil biar 1 iterasi terasa ringan).
+        this.gaParams = { popSize: 6, generations: 5, mutationRate: 0.1 };
         // Cache for parsed rotation angle lists (keyed by rotation input string)
         this._rotationAnglesCache = new Map();
         // Map of originIndex -> source part (rebuilt whenever this.parts changes)
@@ -53,6 +55,10 @@ class NestingApp {
         this.startButton = document.getElementById('startNest');
         this.stopButton = document.getElementById('stopNest');
         this.useNFP2Checkbox = document.getElementById('algorithm');
+        this.gaParamsBox = document.getElementById('gaParams');
+        this.gaPopSize = document.getElementById('gaPopSize');
+        this.gaGenerations = document.getElementById('gaGenerations');
+        this.gaMutation = document.getElementById('gaMutation');
         this.selectAsBestButton = document.getElementById('selectAsBest');
         this.downloadBestButton = document.getElementById('downloadBest');
         this.loadBestButton = document.getElementById('loadBestToCurrent');
@@ -103,6 +109,13 @@ class NestingApp {
         this.downloadBestButton.addEventListener('click', this.downloadBestSolution.bind(this));
         this.loadBestButton.addEventListener('click', this.loadBestToCurrent.bind(this));
         this.useNFP2Checkbox.addEventListener('change', this.toggleNFPAlgorithm.bind(this));
+        this.updateGAParamsVisibility();
+        for (const el of [this.gaPopSize, this.gaGenerations, this.gaMutation]) {
+            if (el) el.addEventListener('change', () => {
+                this.readGAParams();
+                this.saveLastUsedSettings();
+            });
+        }
         this.recompactCurrentButton.addEventListener('click', this.recompactCurrentSolution.bind(this));
         this.renestOutsideButton.addEventListener('click', this.startRenestingWeb.bind(this));
         this.enableDragDrop.addEventListener('change', this.toggleDragDrop.bind(this));
@@ -143,7 +156,8 @@ class NestingApp {
             const inputsToTrack = [
                 this.sheetWidth, this.sheetHeight, this.rotation,
                 this.spacing, this.gridSpacing, this.allowFlip,
-                this.multiCPU, this.useNFP2Checkbox
+                this.multiCPU, this.useNFP2Checkbox,
+                this.gaPopSize, this.gaGenerations, this.gaMutation
             ];
             inputsToTrack.forEach(input => {
                 if (input) {
@@ -308,6 +322,22 @@ class NestingApp {
         return nextVariant;
     }
 
+    readGAParams() {
+        const pop = parseInt(this.gaPopSize && this.gaPopSize.value, 10);
+        const gen = parseInt(this.gaGenerations && this.gaGenerations.value, 10);
+        const mut = parseFloat(this.gaMutation && this.gaMutation.value);
+        this.gaParams = {
+            popSize: Math.min(50, Math.max(2, pop || 6)),
+            generations: Math.min(200, Math.max(1, gen || 5)),
+            mutationRate: Math.min(1, Math.max(0, isNaN(mut) ? 0.1 : mut))
+        };
+    }
+
+    updateGAParamsVisibility() {
+        if (!this.gaParamsBox || !this.useNFP2Checkbox) return;
+        this.gaParamsBox.style.display = this.useNFP2Checkbox.value === 'ga' ? '' : 'none';
+    }
+
     getSettingsData() {
         return {
             sheetWidth: parseFloat(this.sheetWidth.value) || 1000,
@@ -317,7 +347,10 @@ class NestingApp {
             gridSpacing: parseFloat(this.gridSpacing.value) || 4,
             allowFlip: this.allowFlip.checked,
             multiCPU: this.multiCPU.checked,
-            algorithm: this.useNFP2Checkbox.value || "optimized"
+            algorithm: this.useNFP2Checkbox.value || "optimized",
+            gaPopSize: parseInt(this.gaPopSize && this.gaPopSize.value, 10) || 6,
+            gaGenerations: parseInt(this.gaGenerations && this.gaGenerations.value, 10) || 5,
+            gaMutation: parseFloat(this.gaMutation && this.gaMutation.value) || 0.1
         };
     }
 
@@ -331,12 +364,17 @@ class NestingApp {
         if (data.allowFlip !== undefined) this.allowFlip.checked = data.allowFlip;
         if (data.multiCPU !== undefined) this.multiCPU.checked = data.multiCPU;
         if (data.algorithm !== undefined) this.useNFP2Checkbox.value = data.algorithm;
+        if (data.gaPopSize !== undefined && this.gaPopSize) this.gaPopSize.value = data.gaPopSize;
+        if (data.gaGenerations !== undefined && this.gaGenerations) this.gaGenerations.value = data.gaGenerations;
+        if (data.gaMutation !== undefined && this.gaMutation) this.gaMutation.value = data.gaMutation;
 
         // Trigger updates in nesting classes & canvas
         this.updateSheet();
         this.initializeNFP();
         this.nfp.setSpacing(parseFloat(this.spacing.value));
         this.nfp.setAllowFlip(this.allowFlip.checked);
+        this.updateGAParamsVisibility();
+        this.readGAParams();
         this.partsVariants = null; // Cache needs to be reset
     }
 
@@ -492,19 +530,40 @@ class NestingApp {
         }
     }
 
+    /**
+     * Material utilization of a solution: total part outline area divided by
+     * the bounding-box area. Pure read of existing data (shoelace via
+     * getSignedArea + calculateTotalBounds) — no geometry is modified.
+     * Returns 0 when there is nothing to measure.
+     */
+    calculateUtilization(solution) {
+        if (!solution || solution.length === 0) return 0;
+        const bounds = this.nfp.calculateTotalBounds(solution);
+        const boxArea = (bounds.width * bounds.height) / (GEOM_SCALE * GEOM_SCALE);
+        if (!(boxArea > 0)) return 0;
+        let partArea = 0;
+        for (const p of solution) {
+            if (p.lcolor === "#00ff00") continue;
+            if (!p.paths || p.paths.length === 0) continue;
+            partArea += Math.abs(Path.getSignedArea(p.paths[0])) / (GEOM_SCALE * GEOM_SCALE);
+        }
+        return partArea / boxArea;
+    }
+
     updateCurrentSolutionArea() {
         if (!this.placedParts || this.placedParts.length === 0) return;
 
         const bounds = this.nfp.calculateTotalBounds(this.placedParts);
         const area = (bounds.width * bounds.height) / (GEOM_SCALE * GEOM_SCALE);
-        this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm²`;
+        const util = this.calculateUtilization(this.placedParts);
+        this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm² (${(util * 100).toFixed(1)}%)`;
 
         // Update best if better (considering both area and object count)
         const newCount = this.placedParts.filter(p => p.lcolor !== "#00ff00").length;
         const bestCount = this.bestPlacedParts ? this.bestPlacedParts.filter(p => p.lcolor !== "#00ff00").length : 0;
         if (!this.bestPlacedParts || this.isBetterSolution(area, newCount, this.bestArea, bestCount)) {
             this.bestArea = area;
-            this.bestAreaDisplay.textContent = `${area.toFixed(2)} mm²`;
+            this.bestAreaDisplay.textContent = `${area.toFixed(2)} mm² (${(util * 100).toFixed(1)}%)`;
             this.bestPlacedParts = this.placedParts.map(p => p.clone());
             this.bestSolutionCanvas.setParts(this.bestPlacedParts);
         }
@@ -523,6 +582,9 @@ class NestingApp {
         } else if (algorithm === 'optimized') {
             this.nfp = new NFPOptimized();
             console.log('Using Optimized Algorithm (Bottom-Left Fill + SAT)');
+        } else if (algorithm === 'ga') {
+            this.nfp = new NFPGA();
+            console.log('Using GA + NFP2 Algorithm');
         } else {
             this.nfp = new NFP();
             console.log('Using Original Grid Algorithm');
@@ -536,6 +598,10 @@ class NestingApp {
         this.initializeNFP();
         // Reset parts variants cache when algorithm changes
         this.partsVariants = null;
+        this.gaSeedOrder = null;
+        this.updateGAParamsVisibility();
+        this.readGAParams();
+        this.saveLastUsedSettings();
         console.log(`Algorithm switched to: ${this.algorithm}`);
     }
 
@@ -546,7 +612,13 @@ class NestingApp {
         const stats = this.nfp.getPerformanceStats();
         if (!stats) return;
 
-        if (this.nfp instanceof NFP2) {
+        if (this.nfp instanceof NFPGA) {
+            console.log('GA Statistics:', {
+                'Generations': stats.generations,
+                'Evaluations': stats.evaluations,
+                'Collision Checks': stats.collisionChecks
+            });
+        } else if (this.nfp instanceof NFP2) {
             console.log('NFP2 Performance Statistics:', {
                 'Boundary Points Tested': stats.boundaryPointsTested,
                 'Collisions Avoided': stats.collisionAvoided,
@@ -687,6 +759,7 @@ class NestingApp {
             this.drawParts();
         }
         this.partsVariants = null;
+        this.gaSeedOrder = null;
     }
 
     collectPathsWithTransforms(element, paths, parentTransform = '') {
@@ -864,6 +937,7 @@ class NestingApp {
 
     async runNesting(multiCPU = false, initialPlacements = []) {
         this.nfp.setAllowFlip(this.lastFlipValue || false);
+        if (this.algorithm === 'ga') this.readGAParams();
 
         this.currentProgress = 0;
         this.drawProgress();
@@ -894,6 +968,8 @@ class NestingApp {
             sheet: this.sheet,
             gridSize: this.nfp.gridSize,
             algorithm: this.algorithm,
+            gaParams: this.algorithm === 'ga' ? this.gaParams : undefined,
+            seedOrder: this.algorithm === 'ga' ? (this.gaSeedOrder || null) : undefined,
             initialPlacements: transferableInitial
         };
 
@@ -929,6 +1005,7 @@ class NestingApp {
                         controller.latestPartial = data.placements;
                     } else if (data.type === 'result') {
                         settled = true;
+                        if (data.bestOrder) this.gaSeedOrder = data.bestOrder;
                         resolve({ placements: rehydrate(data.placements), stats: data.stats });
                     }
                 };
@@ -979,7 +1056,9 @@ class NestingApp {
         const totalStats = {
             boundaryPointsTested: 0,
             collisionAvoided: 0,
-            collisionChecks: 0
+            collisionChecks: 0,
+            generations: 0,
+            evaluations: 0
         };
         let bestPlacement = null;
         let bestArea = Infinity;
@@ -989,6 +1068,13 @@ class NestingApp {
                 totalStats.boundaryPointsTested += (res.stats.boundaryPointsTested || 0);
                 totalStats.collisionAvoided += (res.stats.collisionAvoided || 0);
                 totalStats.collisionChecks += (res.stats.collisionChecks || 0);
+                totalStats.generations += (res.stats.generations || 0);
+                totalStats.evaluations += (res.stats.evaluations || 0);
+                if (res.stats.bestFitness !== undefined && res.stats.bestFitness !== Infinity) {
+                    if (totalStats.bestFitness === undefined || res.stats.bestFitness < totalStats.bestFitness) {
+                        totalStats.bestFitness = res.stats.bestFitness;
+                    }
+                }
             }
             const bounds = this.nfp.calculateTotalBounds(res.placements);
             const area = bounds.width * bounds.height;
@@ -1063,14 +1149,14 @@ class NestingApp {
                 // Display performance statistics for NFP2
                 this.displayPerformanceStats();
                 if (this.hasui) {
-                    this.currentAreaDisplay.textContent = `${bestResult.area.toFixed(2)} mm² (${timeTaken}ms)`;
+                    this.currentAreaDisplay.textContent = `${bestResult.area.toFixed(2)} mm² (${timeTaken}ms, ${(this.calculateUtilization(bestResult.placements) * 100).toFixed(1)}%)`;
 
                     // Update best solution if current is better (considering area + object count)
                     const newCount = bestResult.placements.filter(p => p.lcolor !== "#00ff00").length;
                     const bestCount = this.bestPlacedParts ? this.bestPlacedParts.filter(p => p.lcolor !== "#00ff00").length : 0;
                     if (!this.bestPlacedParts || this.isBetterSolution(bestResult.area, newCount, this.bestArea, bestCount)) {
                         this.bestArea = bestResult.area;
-                        this.bestAreaDisplay.textContent = bestResult.area.toFixed(2) + " mm²";
+                        this.bestAreaDisplay.textContent = bestResult.area.toFixed(2) + " mm² (" + (this.calculateUtilization(bestResult.placements) * 100).toFixed(1) + "%)";
                         this.bestPlacedParts = bestResult.placements;
                     }
                 }
@@ -1105,14 +1191,14 @@ class NestingApp {
         const area = (bounds.width * bounds.height) / (GEOM_SCALE * GEOM_SCALE);
         const timeTaken = (performance.now() - startTime).toFixed(2);
 
-        this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm² (Compacted in ${timeTaken}ms)`;
+        this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm² (Compacted in ${timeTaken}ms, ${(this.calculateUtilization(this.placedParts) * 100).toFixed(1)}%)`;
 
         // Update best if this compaction made it better (considering area + object count)
         const newCount = this.placedParts.filter(p => p.lcolor !== "#00ff00").length;
         const bestCount = this.bestPlacedParts ? this.bestPlacedParts.filter(p => p.lcolor !== "#00ff00").length : 0;
         if (!this.bestPlacedParts || this.isBetterSolution(area, newCount, this.bestArea, bestCount)) {
             this.bestArea = area;
-            this.bestAreaDisplay.textContent = area.toFixed(2);
+            this.bestAreaDisplay.textContent = area.toFixed(2) + " mm² (" + (this.calculateUtilization(this.placedParts) * 100).toFixed(1) + "%)";
             this.bestPlacedParts = this.placedParts.map(part => part.clone());
         }
 
@@ -1230,7 +1316,7 @@ class NestingApp {
             }
 
             if (this.hasui) {
-                this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm² (Renested in ${timeTaken}ms)`;
+                this.currentAreaDisplay.textContent = `${area.toFixed(2)} mm² (Renested in ${timeTaken}ms, ${(this.calculateUtilization(result) * 100).toFixed(1)}%)`;
             }
             this.drawResult();
         } finally {
@@ -1264,6 +1350,9 @@ class NestingApp {
 
             // Generate variants with the new parameters
             this.partsVariants = this.parts.map(part => this.generatePartVariants(part));
+
+            // Variant set changed -> old GA chromosome no longer valid
+            this.gaSeedOrder = null;
         }
 
         // Run nesting
@@ -1361,15 +1450,17 @@ class NestingApp {
 
     drawParts() {
         if (!this.hasui) return;
+        const t0 = performance.now();
 
-        // Use nesting algorithm for preview layout without rotation, flip, or offset
-        const previewSheet = {
-            width: this.sheet.width,
-            height: this.sheet.height
-        };
+        // Preview pakai shelf-packing bounding-box (O(n), tanpa cek tabrakan):
+        // cuma buat nampilin isi file dengan cepat, bukan hasil nesting.
+        // Jadi preview tidak pernah kena lambatnya GA/NFP2 yang sedang dipilih.
+        const packW = this.sheet.width * GEOM_SCALE;
+        const GAP = 2 * GEOM_SCALE;
 
-        // Generate part variants without rotation or flip
-        const partsVariants = this.parts.map(part => {
+        const sheetEntries = [];
+        const normalEntries = [];
+        for (const pv of this.parts.map(part => {
             const variant = part.clone();
             return {
                 placed: false,
@@ -1379,14 +1470,46 @@ class NestingApp {
                 childIndex: part.childIndex,
                 variants: [variant]
             };
+        })) {
+            if (pv.lcolor === "#00ff00") sheetEntries.push(pv);
+            else normalEntries.push(pv);
+        }
+
+        const nestedResult = [];
+        let sheetW = packW;
+        if (sheetEntries.length > 0) {
+            const sv = sheetEntries[0].variants[0].clone();
+            const sb = sv.getBounds();
+            sv.translate(-sb.x, -sb.y);
+            sv.childIndex = sheetEntries[0].childIndex;
+            nestedResult.push(sv);
+            sheetW = sb.width;
+        }
+
+        normalEntries.sort((a, b) => {
+            const ba = a.variants[0].getBounds();
+            const bb = b.variants[0].getBounds();
+            return (bb.height - ba.height) || (bb.width - ba.width);
         });
 
-        const nestedResult = this.nfp.findBestPosition(
-            partsVariants,
-            previewSheet,
-            () => { },
-            25 * GEOM_SCALE
-        );
+        let cx = 0, cy = 0, rowH = 0;
+        for (const entry of normalEntries) {
+            const v = entry.variants[0].clone();
+            const b = v.getBounds();
+            v.translate(-b.x, -b.y);
+            if (cx > 0 && cx + b.width > sheetW) {
+                cx = 0;
+                cy += rowH + GAP;
+                rowH = 0;
+            }
+            v.translate(cx, cy);
+            v.childIndex = entry.childIndex;
+            nestedResult.push(v);
+            cx += b.width + GAP;
+            if (b.height > rowH) rowH = b.height;
+        }
+
+        console.log(`[preview] shelf layout ${normalEntries.length} part dalam ${(performance.now() - t0).toFixed(1)}ms (fast mode, tanpa nesting)`);
 
         this.previewCanvas.setSheet(this.sheet.width, this.sheet.height);
         this.previewCanvas.setParts(nestedResult);
@@ -1431,7 +1554,7 @@ class NestingApp {
         const area = (bounds.width * bounds.height) / (GEOM_SCALE * GEOM_SCALE);
 
         this.bestArea = area;
-        this.bestAreaDisplay.textContent = area.toFixed(2) + " mm²";
+        this.bestAreaDisplay.textContent = area.toFixed(2) + " mm² (" + (this.calculateUtilization(this.placedParts) * 100).toFixed(1) + "%)";
         this.bestPlacedParts = this.placedParts.map(part => part.clone());
 
         if (redraw) this.drawResult();
@@ -1447,12 +1570,51 @@ class NestingApp {
         this.updatePathCounts();
     }
 
-    svgFromSolution(solution = this.bestPlacedParts) {
+    getUnplacedParts(solution = this.bestPlacedParts) {
+        if (!this.parts || this.parts.length === 0) return [];
+        const placed = new Set(
+            (solution || []).filter(p => p.lcolor !== "#00ff00").map(p => p.originIndex)
+        );
+        return this.parts.filter(p =>
+            p.lcolor !== "#00ff00" && p.paths.length > 0 && !placed.has(p.originIndex)
+        );
+    }
+
+    layoutUnplacedToRight(solution, unplaced) {
+        if (!unplaced || unplaced.length === 0) return [];
         const bounds = this.nfp.calculateTotalBounds(solution);
+        const GAP = 10 * GEOM_SCALE;
+        const hasNested = solution && solution.some(p => p.lcolor !== "#00ff00");
+        let cursorX = hasNested ? (bounds.x + bounds.width + GAP) : 0;
+        let cursorY = hasNested ? bounds.y : 0;
+        const sorted = [...unplaced].sort((a, b) => {
+            const ba = a.getBounds();
+            const bb = b.getBounds();
+            return (bb.height - ba.height) || (bb.width - ba.width);
+        });
+        const extras = [];
+        for (const src of sorted) {
+            const clone = src.clone();
+            const b = clone.getBounds();
+            clone.translate(cursorX - b.x, cursorY - b.y);
+            extras.push(clone);
+            cursorY += b.height + GAP;
+        }
+        return extras;
+    }
+
+    svgFromSolution(solution = this.bestPlacedParts) {
+        const unplaced = this.getUnplacedParts(solution);
+        const extras = this.layoutUnplacedToRight(solution, unplaced);
+        if (unplaced.length > 0) {
+            console.log(`[download] ${unplaced.length} part tidak ternesting, diletakkan di kanan:`, unplaced.map(p => p.originIndex));
+        }
+        const combined = [...(solution || []), ...extras];
+        const bounds = this.nfp.calculateTotalBounds(combined.length > 0 ? combined : solution);
         let svgContent = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}mm" height="${bounds.height}mm" viewBox="0 0 ${bounds.width} ${bounds.height}">`;
 
-        solution.forEach((part) => {
+        combined.forEach((part) => {
             svgContent += part.toSVGPath();
         });
 
@@ -1462,6 +1624,11 @@ class NestingApp {
 
     downloadBestSolution() {
         if (!this.bestPlacedParts || this.bestPlacedParts.length === 0) return;
+
+        const unplaced = this.getUnplacedParts(this.bestPlacedParts);
+        if (unplaced.length > 0) {
+            alert(`Peringatan: ${unplaced.length} dari ${this.parts.length} part tidak muat di hasil nesting!\nPart tersebut tetap disertakan di sebelah kanan file SVG agar tidak hilang.`);
+        }
 
         const svgtxt = this.svgFromSolution();
         const svgContent = new Blob([svgtxt], { type: 'image/svg+xml' });

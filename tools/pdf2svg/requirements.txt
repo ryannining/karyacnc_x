@@ -1,0 +1,2 @@
+pymupdf>=1.23
+ezdxf>=1.2

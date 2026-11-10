@@ -6,6 +6,40 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>KaryaCNC</title>
 	<style>
+		:root {
+			--bg: #0f1319;
+			--panel: #151a21;
+			--panel2: #1e242d;
+			--ink: #e6ebf2;
+			--muted: #9aa4b2;
+			--border: #2a313b;
+			--accent: #3498db;
+			--accent-ink: #ffffff;
+			--gc-comment: #4ec94e;
+			--gc-g: #6ea8ff;
+			--gc-m: #c77dff;
+			--gc-axis: #4ecdc4;
+			--gc-feed: #ff7b72;
+			--gc-num: #7ee787;
+		}
+
+		:root[data-theme="light"] {
+			--bg: #f3f4f6;
+			--panel: #ffffff;
+			--panel2: #e9ecef;
+			--ink: #1f2937;
+			--muted: #6b7280;
+			--border: #d1d5db;
+			--accent: #2563eb;
+			--accent-ink: #ffffff;
+			--gc-comment: #228b22;
+			--gc-g: #0000ff;
+			--gc-m: #8b008b;
+			--gc-axis: #008b8b;
+			--gc-feed: #910000;
+			--gc-num: #006400;
+		}
+
 		.blink_me {
 			animation: blinker 300ms linear infinite;
 		}
@@ -20,7 +54,7 @@
 
 		.editor-container {
 			position: relative;
-			background: #ffffff;
+			background: var(--panel);
 			font-size: 10px;
 			width: 100%;
 		}
@@ -80,32 +114,32 @@
 		}
 
 		.gcode-comment {
-			color: #228b22;
+			color: var(--gc-comment);
 			font-weight: bold;
 		}
 
 		.gcode-g {
-			color: #0000ff;
+			color: var(--gc-g);
 			font-weight: bold;
 		}
 
 		.gcode-m {
-			color: #8b008b;
+			color: var(--gc-m);
 			font-weight: bold;
 		}
 
 		.gcode-axis {
-			color: #008b8b;
+			color: var(--gc-axis);
 			font-weight: bold;
 		}
 
 		.gcode-feed {
-			color: #910000;
+			color: var(--gc-feed);
 			font-weight: bold;
 		}
 
 		.gcode-num {
-			color: #006400;
+			color: var(--gc-num);
 			font-weight: bold;
 		}
 
@@ -130,6 +164,8 @@
 
 		body {
 			font-family: sans-serif;
+			background: var(--bg);
+			color: var(--ink);
 		}
 
 		.arrow-up {
@@ -236,6 +272,81 @@
 			align-items: center;
 		}
 
+		#appTabs {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: 0;
+			height: 36px;
+			background: var(--panel2);
+			display: flex;
+			align-items: flex-end;
+			gap: 2px;
+			padding: 0 8px;
+			z-index: 5000;
+			font-family: sans-serif;
+			border-bottom: 1px solid var(--border);
+		}
+
+		.apptab {
+			background: var(--panel);
+			color: var(--muted);
+			border: none;
+			padding: 7px 18px;
+			cursor: pointer;
+			border-radius: 5px 5px 0 0;
+			font-size: 12px;
+			height: 30px;
+		}
+
+		.apptab:hover {
+			background: var(--border);
+			color: var(--ink);
+		}
+
+		.apptab.active {
+			background: var(--accent);
+			color: var(--accent-ink);
+		}
+
+		#btnAppTheme {
+			margin-left: auto;
+			align-self: center;
+			background: var(--panel);
+			color: var(--ink);
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			padding: 5px 12px;
+			cursor: pointer;
+			font-size: 12px;
+			height: 26px;
+		}
+
+		#btnAppTheme:hover {
+			background: var(--border);
+		}
+
+		.tabpanel {
+			display: none;
+			position: fixed;
+			top: 36px;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			background: var(--bg);
+			z-index: 4500;
+		}
+
+		.tabpanel.active {
+			display: block;
+		}
+
+		.tabpanel iframe {
+			width: 100%;
+			height: 100%;
+			border: none;
+		}
+
 		.popup {
 			position: absolute;
 			width: 50%;
@@ -243,7 +354,9 @@
 			top: 25%;
 			left: 25%;
 			text-align: center;
-			background: lightgray;
+			background: var(--panel2);
+			color: var(--ink);
+			border: 1px solid var(--border);
 			border-radius: 10px;
 		}
 
@@ -251,7 +364,7 @@
 			font-size: 20px;
 			height: 50px;
 			line-height: 50px;
-			color: black;
+			color: var(--ink);
 		}
 
 		.CloseIcon {
@@ -288,7 +401,14 @@
 	</style>
 </head>
 
-<body style="font-family:sans-serif;margin:0;overflow:hidden">
+<body style="font-family:sans-serif;margin:0;overflow:hidden;height:100%;box-sizing:border-box;padding-top:36px">
+	<div id="appTabs">
+		<button class="apptab active" data-tab="karyacnc">KaryaCNC</button>
+		<button class="apptab" data-tab="sketcher">Sketcher</button>
+		<button class="apptab" data-tab="nesting">Nesting</button>
+		<button class="apptab" data-tab="invoice">Invoice</button>
+		<button id="btnAppTheme" title="Switch dark / light theme">Dark</button>
+	</div>
 	<div class="overlay" id="overlay">
 		<div class="popup">
 			<h3 id=wxtitle>Popup Content</h3>
@@ -301,18 +421,17 @@
 
 		</div>
 	</div>
-	<div class="overlay_nestjs" id="overlayNestJS">
-		<div class="popup_nestjs">
-			<div class="popup_nestjs_header">
-				<span>Nesting Frame</span>
-				<button id="btCloseNestJS"
-					style="background: red; color: white; border: none; padding: 5px 10px; cursor: pointer;">Close</button>
-			</div>
-			<iframe id="nestjsFrame" src="about:blank"></iframe>
-		</div>
+	<div class="tabpanel" id="panelSketcher">
+		<iframe id="sketcherFrame" src="about:blank"></iframe>
+	</div>
+	<div class="tabpanel" id="panelNesting">
+		<iframe id="nestjsFrame" src="about:blank"></iframe>
+	</div>
+	<div class="tabpanel" id="panelInvoice">
+		<iframe id="invoiceFrame" src="about:blank"></iframe>
 	</div>
 
-	<table class=hideit width=100% id=title1 style="background:lightgray;font-weight:600">
+	<table class=hideit width=100% id=title1 style="background:var(--panel2);color:var(--ink);font-weight:600">
 		<tr>
 			<td>
 				<center>
@@ -735,7 +854,7 @@
 								<td>Output Image
 									<hr>
 									<canvas id=dithercanv
-										style="border:1px solid #000; min-width:200px; min-height:200px; background:#fff;"></canvas>
+										style="border:1px solid var(--border); min-width:200px; min-height:200px; background:var(--panel);"></canvas>
 								</td>
 							</tr>
 						</table>
@@ -834,15 +953,15 @@
 					</td>
 				</tr>
 				<tr class=hdr2>
-					<td colspan=3 align=left><b style="color:white">Select</b><select id=profile>
+					<td colspan=3 align=left><b style="color:var(--ink)">Select</b><select id=profile>
 							<option value=set1>set1</option>
 						</select><br>
-						<b style="color:white">Profile</b><input class=saveit id=profilename size=11><button
+						<b style="color:var(--ink)">Profile</b><input class=saveit id=profilename size=11><button
 												id=btloadp>Load</button><button id=btsavep>Save</button><button id=btdelp>Del</button>
 											<br><span id=masterStrip style="font-size:9px;"></span><br>
-											<b style="color:white">Tampil</b>
-											<label style="color:white"><input type=checkbox id=chklocal checked> Lokal</label>
-											<label style="color:white"><input type=checkbox id=chkmaster checked> Master</label>
+											<b style="color:var(--ink)">Tampil</b>
+											<label style="color:var(--ink)"><input type=checkbox id=chklocal checked> Lokal</label>
+											<label style="color:var(--ink)"><input type=checkbox id=chkmaster checked> Master</label>
 										</td>
 				</tr>
 				<tr style="" class="hdr1 notsimple">
@@ -917,12 +1036,12 @@
 							Pow <input id=cutpw size=2 value=100 class=saveit>%</span>
 				</tr>
 				<tr valign=center>
-					<td colspan=2><span class="notsimple notlaser">Climb mill <input id=cutclimb type=checkbox
-								class=saveit></span>
-						<span class="notsimple notcnc notplasma">pre Burn </span> <input id=burn1 type=checkbox
+					<td colspan=2><span class="notsimple">Climb<input id=cutclimb type=checkbox
+								class=saveit></span>|
+						<span class="notsimple notcnc notplasma">preCut</span> <input id=burn1 type=checkbox
 							class="saveit notsimple notcnc notplasma">
 					</td>
-					<td><button id=btrecode>Process</button></td>
+					<td align="left"><button id=btrecode>Process</button></td>
 				</tr>
 				<hr>
 				</tr>
@@ -951,7 +1070,7 @@
 								<button onclick="clearFinishLog()" style="font-size:9px;padding:1px 4px">Clear</button>
 							</div>
 							<div id=finishLog
-								style="max-height:120px;overflow-y:auto;font-size:11px;background:#f5f5f5;padding:2px 4px;border:1px solid #ccc">
+								style="max-height:120px;overflow-y:auto;font-size:11px;background:var(--panel2);padding:2px 4px;border:1px solid var(--border)">
 							</div>
 						</span>
 
@@ -984,7 +1103,7 @@
 			</div>
 		</div>
 		<div id="myCanvas1td" class="grid-column"
-			style="background:white;padding:5px;border:solid 1px;display:flex;flex-direction:column;min-height:500px;">
+			style="background:var(--panel);padding:5px;border:solid 1px var(--border);display:flex;flex-direction:column;min-height:500px;">
 			<div style="display: flex; justify-content: space-between;">
 				<div style="font-size: 13px;background:rgba(255,255,100,0.5);color:black" id="area_dimension">
 
@@ -998,12 +1117,12 @@
 			</div>
 			<!-- <iframe src="graf.html" style="width:750;height:500;position:absolute;background:lightgray"></iframe>-->
 
-			<div style="display:flex;border-bottom:1px solid #ccc;background:#f5f5f5;align-items:center;">
+			<div style="display:flex;border-bottom:1px solid var(--border);background:var(--panel2);align-items:center;">
 				<button id="tabOriginalPath" class="view-tab active"
-					style="flex:1;padding:8px;border:none;background:#3498db;color:white;cursor:pointer;font-weight:bold;"
+					style="flex:1;padding:8px;border:none;background:var(--accent);color:var(--accent-ink);cursor:pointer;font-weight:bold;"
 					onclick="switchViewTab('original')">Original Path</button>
 				<button id="tabSimulator" class="view-tab"
-					style="flex:1;padding:8px;border:none;background:#e0e0e0;color:#333;cursor:pointer;"
+					style="flex:1;padding:8px;border:none;background:var(--panel2);color:var(--ink);cursor:pointer;"
 					onclick="switchViewTab('simulator')">Simulator</button>
 				<div id="gcodeViewControls" style="padding:0 10px;display:none;align-items:center;gap:8px;">
 					<select id="gcodeViewMode" onchange="changeGCodeViewMode(this.value)"
@@ -1012,10 +1131,10 @@
 						<option value="isometric">Isometric View</option>
 					</select>
 					<div id="simControls" style="display:none;align-items:center;gap:6px;margin-left:4px;">
-						<button id="btnSimPlay" onclick="simToggle()" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#3498db;color:white;">▶ Play</button>
+						<button id="btnSimPlay" onclick="simToggle()" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:var(--accent);color:var(--accent-ink);">▶ Play</button>
 						<button onclick="simReset()" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#6c757d;color:white;">⏹</button>
 						<input type="range" id="simProgress" min="0" max="1000" value="0" oninput="simSeek(this.value/1000)" style="width:100px;cursor:pointer;accent-color:#3498db;">
-						<span id="simTimeDisplay" style="font-size:11px;font-family:Consolas;color:#555;min-width:85px">0:00 / 0:00</span>
+						<span id="simTimeDisplay" style="font-size:11px;font-family:Consolas;color:var(--muted);min-width:85px">0:00 / 0:00</span>
 						<select id="simSpeedSelect" onchange="simUpdateSpeed()" style="padding:3px 4px;border:1px solid #ccc;border-radius:3px;font-size:11px;">
 							<option value="1">1x</option>
 							<option value="2">2x</option>
@@ -1028,7 +1147,7 @@
 			</div>
 
 			<div id="myCanvas1div"
-				style="flex:1;min-height:400px;height:calc(100vh - 200px);overflow:hidden;position:relative;background:#f0f0f0;border:1px solid #ccc;">
+				style="flex:1;min-height:400px;height:calc(100vh - 200px);overflow:hidden;position:relative;background:var(--panel2);border:1px solid var(--border);">
 				<canvas id="myCanvas1x" width="1400" height="1200" style="cursor:grab;"></canvas>
 				<canvas id="simCanvas" width="1400" height="1200" style="display:none;cursor:grab;touch-action:none;"></canvas>
 				<!-- Bounding Box Info Panel -->
@@ -1056,7 +1175,7 @@
 			</div>
 			<br><button id=btsaveset class=hideit>Save Config</button>
 		</div>
-		<div id=title2_b class="grid-column" bgcolor=lightblue style="padding:5px">
+		<div id=title2_b class="grid-column" style="padding:5px;background:var(--panel2)">
 			<b>Machine Control <span id=portnum></span></b>&nbsp;|<b id=alert1 style='color:red'
 				class=blink_me>...</b><br>
 			<button id=bthidden2>Connection Settings</button>
@@ -1093,19 +1212,11 @@
 												id=btloadmaster>Load Profil</button></td>
 									</tr>
 									<tr>
-										<td colspan=2>Window Color </td>
-					<td colspan=2><input id=wcolor size=10 class=saveit value="lightgreen"></td>
-				</tr>
-				<tr>
-					<td colspan=2>Render Theme </td>
-					<td colspan=2><input type=checkbox id=isdarktheme class=saveit> Dark Mode</td>
-				</tr>
-				<tr>
-					<td colspan=2>Stroke Width </td>
-					<td colspan=2><input id=strokewidth size=5 class=saveit value="1"> px</td>
-				</tr>
-				<tr>
-					<td colspan=2>Window Title </td>
+										<td colspan=2>Stroke Width </td>
+										<td colspan=2><input id=strokewidth size=5 class=saveit value="1"> px</td>
+									</tr>
+									<tr>
+										<td colspan=2>Window Title </td>
 					<td colspan=2><input id=wtitle size=10 class=saveit value="KARYACNC"></td>
 				</tr>
 				<tr class=hideit>
@@ -1140,15 +1251,11 @@
 				</tr>
 				<tr>
 					<td colspan="4" align="left"><button id=btEditMaterials>Edit Materials</button>
-						<button id="btOpenNestJSV2">Nesting V2</button><button id="btInstallInkscapeExt">Install
+						<button id="btInstallInkscapeExt">Install
 							Extension</button>
 					</td>
 				</tr>
-				<tr>
-					<td colspan="4" align="center">
-						<button id="btOpenInvoice">Invoice Generator</button>
-					</td>
-				</tr>
+
 				<tr>
 					<td colspan="4" align="left">
 					</td>

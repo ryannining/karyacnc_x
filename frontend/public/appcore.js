@@ -103,6 +103,7 @@ var oshapenum = -1;
 var cuttab_manual = [];
 var starttab_manual = [];
 var centerpath = [];
+var parsedGeometryData = null;
 
 // ------------------------------------------------------------------------
 // Cutting Tab Configuration
@@ -445,6 +446,27 @@ function generateBezierDogboneLoop(curPoint, vec1, vec2, ro, ovmore, steps = 8) 
 	return loopPoints;
 }
 
+/**
+ * Geser posisi tab manual dari panjang busur path offset (sebelum dogbone)
+ * ke panjang busur path yang sudah disisipi loop dogbone bezier.
+ * cuttab_manual diukur memakai gline[i][3]; addBefore[i] adalah total
+ * panjang loop dogbone yang sudah dilewati sebelum titik asli ke-i.
+ */
+function remapTabLengths(cuts, gline, addBefore) {
+	if (!cuts || !cuts.length) return;
+	for (var c = 0; c < cuts.length; c++) {
+		var pos = cuts[c];
+		var bi = gline.length - 1;
+		for (var q = 0; q < gline.length; q++) {
+			if (gline[q][3] >= pos) {
+				bi = q;
+				break;
+			}
+		}
+		cuts[c] = pos + addBefore[bi];
+	}
+}
+
 function xarea() {
 	dx = xmax2 - xmin2;
 	dy = ymax2 - ymin2;
@@ -749,6 +771,9 @@ function gcodepush(lenmm, X1, Y1, lenmm1, line, closed) {
 		}
 		gcodes.push([lenmm, "", X1, Y1, line, srl, area, closed, shapenum, [], 0, [xct / line.length, yct / line.length]]);
 	}
+	// Capture the pristine per-shape child count so that a repeated sort-only
+	// refresh can restore the decrements made by the sorting scan.
+	sty.osubchilds = sty.subchilds;
 	shapenum++;
 }
 
@@ -854,7 +879,12 @@ function getcutpos(index, shift, flip) {
 			if ((i <= shift)) lshift += pdis;
 
 			var cksharp = sharp(lines, 1, 2, i);
-			if (Math.abs(1 + cksharp) > cosd) sharps.push(len);
+			// Titik loop dogbone bezier bukan sudut asli. Abaikan saat menyusun
+			// daftar "hindari tab" supaya aturan slc = sharps[i] + 15 tidak
+			// menggeser auto tab berkali-kali mengikuti titik-titik loop.
+			// Sudut aslinya tetap ditandai _dogboneCorner di prepare_line2.
+			if (!lines[i]._dogboneLoop &&
+				(lines[i]._dogboneCorner || Math.abs(1 + cksharp) > cosd)) sharps.push(len);
 
 		}
 
@@ -1111,7 +1141,11 @@ function prepare_line2(lenmm, lines, ofs1) {
 		for (var j = 0; j < glines.length; j++) {
 			var gline = glines[j];
 			var newline = [];
+			var addBefore = [];
+			var dogboneAdd = 0;
 			for (var i = 0; i < gline.length; i++) {
+
+				addBefore[i] = dogboneAdd;
 
 				tl2 = gline[i][4];
 				if (i < gline.length - 1)
@@ -1129,9 +1163,15 @@ function prepare_line2(lenmm, lines, ofs1) {
 					if ((sr > sharpv) && (cross < 0)) {
 						newline.push(gline[i]);
 						if (dogboneMode === "bezier") {
+							// Tandai sudut asli agar getcutpos tetap menganggapnya
+							// "sharp" walaupun geometri gabungan (loop kembali ke
+							// sudut) terlihat lurus.
+							gline[i]._dogboneCorner = true;
 							var loopPts = generateBezierDogboneLoop(gline[i], vec1, vec2, ro, ovmore, 8);
 							for (var lp = 0; lp < loopPts.length; lp++) {
+								loopPts[lp]._dogboneLoop = true;
 								newline.push(loopPts[lp]);
+								dogboneAdd += loopPts[lp][4];
 							}
 							var midPt = loopPts.length ? loopPts[Math.floor(loopPts.length / 2)] : gline[i];
 							srl.push([x, y, sr, tl, i, [midPt[1], midPt[2]], cross, cxt / cnt, cyt / cnt]);
@@ -1151,6 +1191,13 @@ function prepare_line2(lenmm, lines, ofs1) {
 						ly = y;
 					} else newline.push(gline[i]);
 				} else newline.push(gline[i]);
+			}
+			// Tab manual diukur pada path offset sebelum dogbone. Geser ke
+			// panjang busur path setelah dogbone supaya penempatannya tidak
+			// mundur sebesar panjang loop bezier yang sudah dilewati.
+			if (dogboneAdd > 0) {
+				remapTabLengths(cuttab_manual[j], gline, addBefore);
+				remapTabLengths(starttab_manual[j], gline, addBefore);
 			}
 			newlines.push(newline);
 		}
@@ -1544,8 +1591,12 @@ function newengraveline(x1, y1, x2, y2, half) {
 	var dx = x2 - x1;
 	var ratio = engraveDPI / 25.41;
 	var ratiox = ratio * 8;
+	// Half-open [y1, y2): vertex yang jatuh tepat di baris scanline hanya
+	// dihitung oleh edge yang MULAI dari vertex itu (ceil y1), tidak oleh
+	// edge yang SELESAI di vertex (lama: floor y2 -> vertex silang dihitung
+	// 2x -> jumlah crossing ganjil -> pairing raster geser / off jadi on).
 	var sy1 = Math.ceil(y1 * ratio);
-	var sy2 = Math.floor(y2 * ratio);
+	var sy2 = Math.ceil(y2 * ratio) - 1;
 	var ts = (sy2 - sy1) + 1;
 	if (ts > 0) {
 		cy = sy1;
@@ -1776,7 +1827,11 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 		pdis = ci > 0 ? lines[pi][4] : 0;
 
 		lenctr += pdis;
-		if (ci > 0 && closed && sty.doEngrave) {
+		// ci==0 & shift==0: segmen penutup traversal (titik terakhir -> titik
+		// awal) tidak pernah terkompensasi oleh `if (shift) ll++`, sehingga
+		// tepi itu hilang -> jumlah crossing per baris jadi ganjil -> pairing
+		// raster bergeser (off jadi on). Wajib ikut diraster.
+		if ((ci > 0 || shift == 0) && closed && sty.doEngrave) {
 			engraveline(lx2, ly2, x, y, sty.halfDPI);
 		}
 		xmax = Math.max(xmax, x);
@@ -2396,20 +2451,48 @@ function lines2gcode(num, data, z, z2, cuttabz, srl, lastlayer = 0, firstlayer =
 // SECTION: Main Processing Functions - Part B (sortedgcode)
 // ============================================================================
 
+// Full Stage B + Stage C pass: sort (gcodes -> sgcodes) then emit G-code text.
+// Kept as the single entry point used by all existing callers.
 function sortedgcode() {
+	sortGcodes();
+	emitGcodeOnly("full rebuild Stage A+B");
+}
+
+// ------------------------------------------------------------------------
+// Stage B: Sorting only (gcodes -> sgcodes).
+// Consumes the already-offset geometry in `gcodes` / `gcstyle` and never
+// touches ClipperLib. Safe to re-run (see IDEMPOTENCY below), which is what
+// makes a sort-only refresh possible.
+// ------------------------------------------------------------------------
+function sortGcodes() {
 	cachedcutpos = [];
 	totaltime = 0;
 	carvetime = 0;
 	gcodecarve = "";
 	sgcodes = [];
-	sxmax = xmax;
-	symax = ymax;
-	sxmin = xmin;
-	symin = ymin;
+	// PENTING: sxmax/symax/sxmin/symin TIDAK di-assign di sini. Batas geometri
+	// dikunci sekali di Stage A (myFunction, tepat sebelum gcodepushcombined())
+	// supaya nilainya identik untuk semua tier. Kalau dihitung ulang di sini,
+	// Tier B akan menurunkan sxmax dari sisa nilai xmax milik draw_line (batas
+	// jalur offset), berbeda dari full rebuild.
 	xmax = -10000;
 	ymax = -10000;
 	xmin = 100000;
 	ymin = 100000;
+
+	// IDEMPOTENCY: the nearest-neighbour scan below destructively marks every
+	// consumed shape by negating gcodes[*][6] (its area) and by decrementing
+	// sty.subchilds. On a repeated sort-only refresh those marks must be undone
+	// first, otherwise the eligibility test `gcodes[i][6] > 0` would reject
+	// almost everything and the parent/child guard would cut holes before their
+	// outlines. `osubchilds` is captured once per shape in gcodepush().
+	for (var _ri = 0; _ri < gcodes.length; _ri++) {
+		if (gcodes[_ri][6] < 0) gcodes[_ri][6] = -gcodes[_ri][6];
+	}
+	for (var _rs = 0; _rs < gcstyle.length; _rs++) {
+		var _rsty = gcstyle[_rs];
+		if (_rsty && typeof _rsty.osubchilds !== "undefined") _rsty.subchilds = _rsty.osubchilds;
+	}
 	var sm = -1;
 	var lx = 0;
 	var ly = 0;
@@ -2856,7 +2939,11 @@ function sortedgcode() {
 
 					var _rz = (getnumber("carvedp"));
 					if (sty.domarking) {
-						zdown = getnumber("carved")
+						// 'var' agar tetap lokal di sortGcodes(): di kode asli nama ini
+						// ter-hoist dari blok emit (satu fungsi sortedgcode) sehingga
+						// tidak pernah menulis global. Tanpa 'var', assignment ini
+						// mencemari global zdown.
+						var zdown = getnumber("carved")
 						rep = Math.ceil(zdown / _rz);
 						rep = Math.max(rep, zdown / getnumber("firstd"));
 					} else
@@ -2877,8 +2964,48 @@ function sortedgcode() {
 			}
 		}
 	}
+}
+
+// ------------------------------------------------------------------------
+// Stage C: Emit G-code text from sgcodes (re-evaluates feed, plunge and pass
+// depths). Never runs ClipperLib; whether sorting ran is decided by the caller,
+// so `source` is only used for the log line.
+// ------------------------------------------------------------------------
+function emitGcodeOnly(source) {
+	if (!sgcodes || sgcodes.length === 0) return;
+	// Reset akumulator waktu potong di sini, bukan hanya di sortGcodes().
+	// Tier C (refreshgcodeFast) tidak memanggil sortGcodes(), sementara
+	// lines2gcode() di bawah tetap menambah totaltime tiap kali dipanggil —
+	// tanpa reset di titik ini harga jasa (CNC Cost) naik terus tiap klik Process.
+	totaltime = 0;
+	console.log("[Stage C: Emit] " + (source ? source + " — " : "") +
+		"menulis teks G-code dari " + sgcodes.length + " cached paths (Clipper tidak dijalankan)");
+
+	// PENTING: pup1/cutpw/s/se sengaja TANPA 'var'. Di kode asli (sortedgcode
+	// sebelum dipecah menjadi sortGcodes + emitGcodeOnly) keempatnya adalah
+	// variabel GLOBAL, dan getspindleon() membaca global `cutpw` (dideklarasikan
+	// di baris 238). Memberi 'var' di sini membuatnya lokal sehingga
+	// getspindleon() mengembalikan "M3 Sundefined" di awal kedua editor G-code.
 	pup1 = getvalue("pup");
 	cutpw = getnumber('cutpw') * 255 * 0.01;
+	s = "";
+	se = "";
+
+	// Tier B (refreshgcodeSort) dan Tier C (refreshgcodeFast) TIDAK menjalankan
+	// myFunction(), padahal myFunction yang mengisi skalar global berikut dari
+	// input. Tanpa refresh di sini, lines2gcode() dan gcode_verify() — yang
+	// membaca global ini — akan memakai nilai basi saat `trav`/`pup` diubah.
+	// Nilainya identik dengan yang di-set myFunction, jadi jalur full rebuild
+	// tidak berubah.
+	speedtravel = getnumber("trav");
+	speedfeed = getnumber("feed");
+	speedplunge = getvalue('pdn');
+	if (speedplunge.indexOf("F") > 0) speedplunge = speedplunge.split(" F")[1].split(" ")[0];
+	speedretract = getvalue("pup");
+	if (speedretract.indexOf("F") > 0) {
+		zretract = speedretract.split(" Z")[1].split(" ")[0];
+		speedretract = speedretract.split(" F")[1].split(" ")[0];
+	}
 
 	if (cmd == CMD_LASER) {
 		pup1 = "";
@@ -2915,6 +3042,16 @@ function sortedgcode() {
 	var slsmall = getnumber("slowsmall");
 	var slsmallv = getnumber("slowsmallval");
 	var usesl = getchecked("useslowsmall");
+	var dogboneMode = typeof getDogboneMode === "function" ? getDogboneMode() : (getchecked("overcut") ? "line" : "none");
+	var ov = (dogboneMode !== "none");
+	var ufinish = getchecked("usefinish");
+	var sepcut = getchecked("separatecut") && !ufinish;
+	var gsort = getnumber('greensort');
+	if (!(gsort >= 0)) gsort = 0;
+	var re = getvalue("repeat");
+	if (cmd == 4) re = Math.ceil(getvalue("zdown") / layerheight);
+	// speedtravel TIDAK di-'var' di sini: nilai global-nya sudah di-refresh di
+	// awal fungsi supaya lines2gcode() dan gcode_verify() ikut melihat nilai baru.
 
 	cuttabinside = 0;
 	for (var j = 0; j < sgcodes.length; j++) {
@@ -2931,11 +3068,11 @@ function sortedgcode() {
 			hasfnl = sgcodes[j][0][1] == "D";
 			fnl = sgcodes[j][0][1] == "F";
 			lenmm = sgcodes[j][0][0];
-			sty = gcstyle[snum];
+			var sty = gcstyle[snum];
+			if (sty == undefined) sty = defaultsty;
 			if (!sty.closed) vcuttab = cncdeep;
 			var f2 = getvalue('feed') * 60;
 
-			if (sty == undefined) sty = defaultsty;
 			if ((ov > 0) && (cmd == CMD_CNC)) {
 				if (OVC_MODE == 1) {
 					for (i = 0; i < srl.length - 1; i++) {
@@ -2967,6 +3104,7 @@ function sortedgcode() {
 
 			var _rz = getnumber("firstd");
 
+			// --- MERAH (DOMARKING) ---
 			if (sty.domarking) {
 				f2 = getvalue('pltfeed') * 60;
 				pw = getvalue('pltpw') * 255 * 0.01;
@@ -3068,8 +3206,6 @@ function sortedgcode() {
 				}
 			}
 
-			if ((_re * iscut > 0) && (cmd == CMD_CNC) && getchecked("burn1")) {
-			}
 			if (!sty.closed && ((cmd == CMD_CNC && getchecked("burn1")) || getchecked("flipx"))) {
 				climb = climb ? 0 : 1;
 			}
@@ -3118,8 +3254,11 @@ function sortedgcode() {
 	sc = 1;
 	if (getchecked("flipx")) sc = -1;
 	if (cmd == CMD_3D) {
-		s = "g28\ng0 z0 f350\nm109 s" + filamentTemp + "\nG92 X" + mround(-sc * xmax / 2) + " Y" + mround(ymax / 2) + " E-5\n" + s;
-		s += "G92 X" + mround(sc * xmax / 2) + " Y" + mround(-ymax / 2) + "\ng28";
+		// Pakai sxmax/symax (batas geometri stabil dari Stage B) dan bukan
+		// xmax/ymax, karena xmax/ymax di-reset ke sentinel oleh sortGcodes()
+		// sebelum emit. Dengan cara ini hasil Tier C identik dengan full rebuild.
+		s = "g28\ng0 z0 f350\nm109 s" + filamentTemp + "\nG92 X" + mround(-sc * sxmax / 2) + " Y" + mround(symax / 2) + " E-5\n" + s;
+		s += "G92 X" + mround(sc * sxmax / 2) + " Y" + mround(-symax / 2) + "\ng28";
 	}
 	if (isgrbl) s += machinezero;
 
@@ -3185,11 +3324,15 @@ function gcode_verify(en = 0) {
 	}
 	var sfinal = 0;
 	$("segm").value = "";
-	var theme = typeof window.theme !== 'undefined' ? window.theme : (getchecked("isdarktheme") ? 1 : 0);
+	var theme = typeof window.theme !== 'undefined' ? window.theme : ((typeof appTheme !== 'undefined' && appTheme === 'dark') ? 1 : 0);
 	ctx.fillStyle = theme == 0 ? "#ffffff" : "#000000";
 	$("myCanvas1div").style.background = ctx.fillStyle;
 	ctx.fillRect(-10, -10, c.width + 10, c.height + 10);
 	engravetime = 0;
+	// carvetime diproduksi DI DALAM fungsi ini (dobtvcarve() -> vcarve(), cnc.js:584).
+	// Reset-nya harus di sini; reset di sortGcodes() saja tidak cukup karena
+	// Tier C (refreshgcodeFast) melewati sortGcodes().
+	carvetime = 0;
 	bitmaptime = 0;
 	if (en) {
 		if (ENGRAVE == 0) engrave = {};
@@ -3376,7 +3519,9 @@ function svgPathToCommands(svg) {
 
 function myFunction(scale1) {
 	if (text1 == undefined) return;
-	svgdata = svgPathToCommands(text1);
+	// Diingat agar strictPipelineVerify() bisa membandingkan fast path dengan
+	// full rebuild memakai mode skala yang sama (myFunction(0) vs myFunction(1)).
+	lastPipelineScale1 = scale1 ? 1 : 0;
 	mind = getnumber("minR");
 	var join = getchecked("enablejoin");
 	if (!join) mind = 0.1;
@@ -3423,7 +3568,7 @@ function myFunction(scale1) {
 	scalex = scale * scales[0];
 	scaley = scale * scales[1];
 
-	theme = getchecked("isdarktheme") ? 1 : 0;
+	theme = (typeof appTheme !== 'undefined' && appTheme === 'dark') ? 1 : 0;
 	cuttablen = getnumber("tablen") + getnumber("offset");
 	cutevery = getnumber("tabevery");
 	cutmax = getnumber("tabmax");
@@ -3465,87 +3610,135 @@ function myFunction(scale1) {
 	}
 	warningpath = 0;
 
-	for (var isvg = 0; isvg < svgdata.length; isvg++) {
-		var el = svgdata[isvg];
-		var cr = el.marker;
-		if (cr == 'M') {
-			cnts = cnts + 1;
-			if (cnts > 1) {
-				var closed = mind < 0.1 ? false : (sqr(xincep - X1) + sqr(yincep - Y1)) < mind;
-				gcodepush(lenmm, X1, Y1, lenmm, line, closed);
-			}
+	// FAST PATH: Direct Geometry Pipeline (bypasses SVG string regex parsing)
+	if (parsedGeometryData && parsedGeometryData.length > 0) {
+		console.log("[Geometry Pipeline] Memakai direct cached geometry (" + parsedGeometryData.length + " kontur) - BYPASS regex SVG parsing");
+		var userScaleX = scales[0] * 1;
+		var userScaleY = scales[1] * 1;
+		lastf = f2;
+
+		for (var shp = 0; shp < parsedGeometryData.length; shp++) {
+			var shapeObj = parsedGeometryData[shp];
+			var pts = shapeObj.points;
+			if (!pts || pts.length === 0) continue;
+
+			cnts++;
 			line = [];
 			div = "";
 
-			xincep = el.values[0] * scalex;
-			yincep = el.values[1] * scaley;
+			xincep = pts[0][0] * userScaleX;
+			yincep = pts[0][1] * userScaleY;
 			X1 = xincep;
 			Y1 = yincep;
 			linepush(f1, X1, Y1, 1);
 			lenmm = 0;
 			lenn = 0;
 
-			lastf = f2;
-		} else if (cr == 'H') {
-			var n2 = el.values[0] * scalex;
-			var xy = el.values[1] * scaley;
-			p1x = xy * scale;
-			linepush(f2, p1x, y1);
-		} else if (cr == 'V') {
-			var n2 = el.values[0] * scalex;
-			var xy = el.values[1] * scaley;
-			p1y = xy * scale;
-			linepush(f2, y1, p1y);
-		} else if (cr == 'C') {
-			p1x = el.values[0] * scalex;
-			p1y = el.values[1] * scaley;
-			p2x = el.values[2] * scalex;
-			p2y = el.values[3] * scaley;
-
-			xsfar = el.values[4] * scalex;
-			ysfar = el.values[5] * scaley;
-
-			var a = p1x - xincep;
-			var b = p1y - yincep;
-			var a = sqrt(a * a + b * b);
-
-			var b = p2x - p1x;
-			var c = p2y - p1y;
-			var b = sqrt(b * b + c * c);
-
-			var c = xsfar - p2x;
-			var d = ysfar - p2y;
-			var c = sqrt(c * c + d * d);
-
-			g = det / (a + b + c);
-			a = a + b + c;
-
-			for (i = 0; i < 1; i += g) {
-
-				var x = bezierx(i, xincep, p1x, p2x, xsfar);
-				var y = beziery(i, yincep, p1y, p2y, ysfar);
-				linepush(lastf, x, y);
-			}
-
-			xincep = xsfar;
-			yincep = ysfar;
-		} else if (cr == 'L') {
-			for (var k = 0; k < el.values.length / 2; k++) {
-				p2x = el.values[0 + k * 2] * scalex;
-				p2y = el.values[1 + k * 2] * scaley;
+			for (var k = 1; k < pts.length; k++) {
+				var p2x = pts[k][0] * userScaleX;
+				var p2y = pts[k][1] * userScaleY;
 				linepush(lastf, p2x, p2y);
 				xincep = p2x;
 				yincep = p2y;
 			}
 
+			var isClosed = mind < 0.1 ? false : (shapeObj.closed || (sqr(xincep - X1) + sqr(yincep - Y1) < mind));
+			gcodepush(lenmm, X1, Y1, lenmm, line, isClosed);
+		}
+	} else {
+		// FALLBACK PATH: Parse from raw SVG string
+		console.log("[Geometry Pipeline] Memakai fallback SVG parser (svgPathToCommands) untuk raw SVG text");
+		svgdata = svgPathToCommands(text1);
+
+		for (var isvg = 0; isvg < svgdata.length; isvg++) {
+			var el = svgdata[isvg];
+			var cr = el.marker;
+			if (cr == 'M') {
+				cnts = cnts + 1;
+				if (cnts > 1) {
+					var closed = mind < 0.1 ? false : (sqr(xincep - X1) + sqr(yincep - Y1)) < mind;
+					gcodepush(lenmm, X1, Y1, lenmm, line, closed);
+				}
+				line = [];
+				div = "";
+
+				xincep = el.values[0] * scalex;
+				yincep = el.values[1] * scaley;
+				X1 = xincep;
+				Y1 = yincep;
+				linepush(f1, X1, Y1, 1);
+				lenmm = 0;
+				lenn = 0;
+
+				lastf = f2;
+			} else if (cr == 'H') {
+				var n2 = el.values[0] * scalex;
+				var xy = el.values[1] * scaley;
+				p1x = xy * scale;
+				linepush(f2, p1x, y1);
+			} else if (cr == 'V') {
+				var n2 = el.values[0] * scalex;
+				var xy = el.values[1] * scaley;
+				p1y = xy * scale;
+				linepush(f2, y1, p1y);
+			} else if (cr == 'C') {
+				p1x = el.values[0] * scalex;
+				p1y = el.values[1] * scaley;
+				p2x = el.values[2] * scalex;
+				p2y = el.values[3] * scaley;
+
+				xsfar = el.values[4] * scalex;
+				ysfar = el.values[5] * scaley;
+
+				var a = p1x - xincep;
+				var b = p1y - yincep;
+				var a = sqrt(a * a + b * b);
+
+				var b = p2x - p1x;
+				var c = p2y - p1y;
+				var b = sqrt(b * b + c * c);
+
+				var c = xsfar - p2x;
+				var d = ysfar - p2y;
+				var c = sqrt(c * c + d * d);
+
+				g = det / (a + b + c);
+				a = a + b + c;
+
+				for (i = 0; i < 1; i += g) {
+					var x = bezierx(i, xincep, p1x, p2x, xsfar);
+					var y = beziery(i, yincep, p1y, p2y, ysfar);
+					linepush(lastf, x, y);
+				}
+
+				xincep = xsfar;
+				yincep = ysfar;
+			} else if (cr == 'L') {
+				for (var k = 0; k < el.values.length / 2; k++) {
+					p2x = el.values[0 + k * 2] * scalex;
+					p2y = el.values[1 + k * 2] * scaley;
+					linepush(lastf, p2x, p2y);
+					xincep = p2x;
+					yincep = p2y;
+				}
+			}
 		}
 
+		if (cnts > 0) {
+			var closed = mind < 0.1 ? false : (sqr(xincep - X1) + sqr(yincep - Y1)) < mind;
+			gcodepush(lenmm, X1, Y1, lenmm, line, closed);
+		}
 	}
 
-	if (cnts > 0) {
-		var closed = mind < 0.1 ? false : (sqr(xincep - X1) + sqr(yincep - Y1)) < mind;
-		gcodepush(lenmm, X1, Y1, lenmm, line, closed);
-	}
+	// Kunci batas geometri DI SINI (Stage A), bukan di sortGcodes(), supaya
+	// Tier B (refreshgcodeSort) dan Tier C (refreshgcodeFast) mewarisi nilai yang
+	// persis sama dengan full rebuild terakhir. Nilai xmax/xmin/ymax/ymin di titik
+	// ini identik dengan yang dulu dibaca sortGcodes(), karena gcodepushcombined()
+	// tidak menyentuhnya.
+	sxmax = xmax;
+	symax = ymax;
+	sxmin = xmin;
+	symin = ymin;
 
 	gcodepushcombined();
 	sortedgcode();
@@ -3553,7 +3746,10 @@ function myFunction(scale1) {
 	var gc = getvalue("engcode") + cut_eng;
 	setvalue("engcode", gc);
 
-
+	// Full rebuild selesai: cache geometri (gcodes) dan cache urutan (sgcodes)
+	// sekarang konsisten dengan parameter UI saat ini. Dipakai oleh smartProcess()
+	// untuk memilih tier termurah pada klik "Process" berikutnya.
+	if (typeof markPipelineSnapshots === "function") markPipelineSnapshots();
 }
 // ============================================================================
 // SECTION: Spatial-Hash Helpers
@@ -4321,7 +4517,7 @@ function pathstoText1(gx) {
 				by1 = Math.min(y, by1);
 				by2 = Math.max(y, by2);
 			}
-			if (sqr(bx2 - bx1) + sqr(by2 - by1) > 0.1) npaths.push(paths[i]);
+			if (sqr(bx2 - bx1) + sqr(by2 - by1) > mind*0.8) npaths.push(paths[i]);
 		}
 	}
 	paths = npaths;
@@ -4563,6 +4759,7 @@ function pathstoText1(gx) {
 	ms = etime.getTime() - ms;
 	console.log("Process time " + ms);
 	gcstyle = [];
+	parsedGeometryData = [];
 	var pi = 1;
 	for (i in paths) {
 		var path = paths[i][0];
@@ -4584,6 +4781,15 @@ function pathstoText1(gx) {
 		sty.num = gcstyle.length;
 		gcstyle.push(sty);
 		if (paths[i][1]) path = path.reverse();
+
+		// Cache direct geometry data for fast CAM processing
+		parsedGeometryData.push({
+			points: path.map(function (pt) { return [pt[0], pt[1]]; }),
+			closed: paths[i][8],
+			flip: paths[i][1],
+			sty: sty
+		});
+
 		sc++;
 		if (sc > 1) {
 			t1 += " ";

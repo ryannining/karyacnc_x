@@ -277,14 +277,22 @@ class laser_gcode(inkex.Effect):
             x, y = position
             group.set('transform', f'translate({x},{y})')
 
-        # Import each path from the nested SVG
-        for element in nested_svg:
-            if element.tag.endswith('}path') or element.tag == 'path':
-                # Create a new path element
-                path = etree.SubElement(group, inkex.addNS('path', 'svg'))
-                # Copy attributes
-                for attr, value in element.items():
+        # Import elements from the nested SVG preserving groups and paths
+        def import_element(elem, parent_group):
+            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+            if tag == 'g':
+                sub_g = etree.SubElement(parent_group, inkex.addNS('g', 'svg'))
+                for attr, value in elem.items():
+                    sub_g.set(attr, value)
+                for child in elem:
+                    import_element(child, sub_g)
+            elif tag == 'path':
+                path = etree.SubElement(parent_group, inkex.addNS('path', 'svg'))
+                for attr, value in elem.items():
                     path.set(attr, value)
+
+        for element in nested_svg:
+            import_element(element, group)
 
     def find_text_marker(self, keyword):
         """Find a selected text element whose content exactly matches `keyword`
@@ -402,7 +410,7 @@ class laser_gcode(inkex.Effect):
         self.arg_parser.add_argument("--karyaws",type=str,default=";",help="KaryaCNC WS Server IP last number")
         self.arg_parser.add_argument("--nesting_port",type=int,default=3000,help="Nesting port")
         self.arg_parser.add_argument("--flatten",type=float,default="0.1",help="Flatten resolution")
-        self.arg_parser.add_argument("--port",type=str,default="8888",help="Karyacnc port")
+        self.arg_parser.add_argument("--port",type=str,default="8887",help="Karyacnc port")
         # self.arg_parser.add_argument("--quiet_mode",type=str,default="false",help="Enable quiet mode (no success messages)")
 
 
@@ -576,7 +584,7 @@ class laser_gcode(inkex.Effect):
                         xmin=min(xmin,csp[1][0])
                         ymin=min(ymin,csp[1][1])
                         
-                    kpaths.append((pstyle,kpath))
+                    kpaths.append((dict(pstyle), kpath))
 
         self.export_path(kpaths, xmin, ymin)
 

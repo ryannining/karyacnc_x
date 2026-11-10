@@ -425,56 +425,42 @@ function wxClick2(e) {
 }
 
 // ============================================================
-// COLOR & THEME
+// COLOR & THEME (satu tema global Dark/Light, ikut ke semua tab)
 // ============================================================
 
-function getFontColor(el, el2, el3) {
-    var f1 = bestFontColor(el);
-    var fh2 = mixColor(f1[2], (f1[0] > 0.5) ? [1, 1, 1] : [0, 0, 0], 0.6);
-    var f2 = bestFontColor(fh2);
+var appTheme = 'dark';
 
-    var fh3 = mixColor(f1[2], [0.7, 0.4, 0.2], 0.3);
-    var f3 = bestFontColor(fh3);
+function applyAppTheme(name) {
+    name = (name === 'light') ? 'light' : 'dark';
+    appTheme = name;
+    document.documentElement.setAttribute('data-theme', name);
+    try { storage.setItem('apptheme', name); } catch (e) { }
+    var btn = $("btnAppTheme");
+    if (btn) {
+        btn.textContent = (name === 'dark') ? 'Dark' : 'Light';
+        btn.title = 'Theme saat ini: ' + name + ' — klik untuk ganti';
+    }
+    var frames = ['sketcherFrame', 'nestjsFrame', 'invoiceFrame'];
+    for (var i = 0; i < frames.length; i++) {
+        var f = $(frames[i]);
+        if (f && f.contentWindow && f.getAttribute('data-loaded'))
+            f.contentWindow.postMessage({ type: 'karyacnc-set-theme', theme: name }, '*');
+    }
+    if (typeof currentViewMode !== 'undefined' && currentViewMode === 'simulator' &&
+        typeof simState !== 'undefined' && simState.moves && simState.moves.length > 0) {
+        simDraw();
+    } else if (typeof refreshgcode === 'function' && typeof text1 !== 'undefined' && text1) {
+        refreshgcode();
+    }
+}
 
-    hdr1CSS.style.background = rgbToHex(fh2);
-    hdr1CSS.style.color = rgbToHex(f2[1]);
-    hdr2CSS.style.background = rgbToHex(fh3);
-    hdr2CSS.style.color = rgbToHex(f3[1]);
-    $(el2).style.color = rgbToHex(f1[1]);
-
-    $(el3).style.background = "lightblue";
-    f4 = bestFontColor(el3);
-    var f42 = mixColor(f4[2], [1, 0.8, 0.5], 0.6);
-    f4 = bestFontColor(f42);
-
-    smallWCSS.style.color = rgbToHex(f4[1]);
-    smallWCSS.style.background = rgbToHex(f42);
-
-    $(el3).style.color = rgbToHex(f1[1]);
-    $(el3).style.background = rgbToHex(f1[2]);
-    el3 = "title2_c";
-    $(el3).style.color = rgbToHex(f1[1]);
-    $(el3).style.background = rgbToHex(f1[2]);
-
-    document.bgColor = rgbToHex(fh2);
-
-    var fh5 = mixColor(fh2, (f2[0] > 0.5) ? [1, 1, 1] : [0, 0, 0], 0.5);
-    var f5 = bestFontColor(fh5);
-
-    buttonCSS.style.borderColor = rgbToHex(fh5);
-    buttonCSS.style.background = rgbToHex(fh5);
-    buttonCSS.style.color = rgbToHex(f5[1]);
+function initAppTheme() {
+    applyAppTheme('dark');
 }
 
 function updatestyle(k, va) {
     if (k == 'wtitle') {
         $("title0").innerHTML = va;
-    }
-    if (k == 'wcolor') {
-        $("title1").style.background = va;
-        $("title2").style.background = va;
-        color = getComputedStyle($("title1")).background;
-        getFontColor("title2", "title2_a", "title2_b");
     }
 }
 
@@ -824,7 +810,6 @@ function savesetting(name) {
         if (a[i].type == 'checkbox')
             sett[a[i].id] = a[i].checked;
     }
-    updatestyle("wcolor", getvalue("wcolor"));
     updatestyle("wtitle", getvalue("wtitle"));
     if (name) {
         jobsettings[name] = sett;
@@ -1008,6 +993,7 @@ async function setupEventListeners() {
 
     await window.listen('WS_SERVER_STARTED', (event) => {
         console.log('WS_SERVER_STARTED', event);
+        if (!wsServerStatusEl) return;
         wsServerStatusEl.textContent = `Listening on ${event.payload}`;
         wsServerStatusEl.style.color = 'green';
     });
@@ -1049,9 +1035,8 @@ async function setupEventListeners() {
 
     await window.listen('NESTING_UPLOAD_RECEIVED', (event) => {
         console.log('NESTING_UPLOAD_RECEIVED', event);
-        // Show nestjs V2 frame and reload it so the previous result is cleared
-        $('overlayNestJS').style.display = 'block';
-        $('nestjsFrame').src = 'http://localhost:3000/v2/?t=' + Date.now();
+        // Buka tab Nesting; app nesting polling timestamp sendiri, jadi cukup ganti tab
+        showTab('nesting');
     });
 }
 
@@ -1124,14 +1109,14 @@ i = sheet.insertRule('.isConnected {display:none  }', sheet.cssRules.length);
 var isConnectedCSS = sheet.cssRules[i];
 i = sheet.insertRule('.mustCOM {' + (hasCOM ? "" : "display:none") + '  }', sheet.cssRules.length);
 var ismustCOMCSS = sheet.cssRules[i];
-i = sheet.insertRule('.hdr1 { background:lime; }', sheet.cssRules.length);
+i = sheet.insertRule('.hdr1 { background:var(--panel2); color:var(--ink); }', sheet.cssRules.length);
 var hdr1CSS = sheet.cssRules[i];
-i = sheet.insertRule('.hdr2 { background:chocolate; }', sheet.cssRules.length);
+i = sheet.insertRule('.hdr2 { background:var(--panel2); color:var(--ink); }', sheet.cssRules.length);
 var hdr2CSS = sheet.cssRules[i];
-i = sheet.insertRule('button {border-radius:6px;margin:1px}', sheet.cssRules.length);
+i = sheet.insertRule('button {border-radius:6px;margin:1px;background:var(--panel2);color:var(--ink);border:1px solid var(--border)}', sheet.cssRules.length);
 var buttonCSS = sheet.cssRules[i];
 
-i = sheet.insertRule('.smallwindow {	text-align:  right;background: cyan;display:none;position:absolute;border:1px solid black;border-radius:5px;box-shadow: 2px 4px 10px rgba(0,0,0,0.5);padding:5px;z-index:1000;}', sheet.cssRules.length);
+i = sheet.insertRule('.smallwindow {	text-align:  right;background: var(--panel2);color:var(--ink);display:none;position:absolute;border:1px solid var(--border);border-radius:5px;box-shadow: 2px 4px 10px rgba(0,0,0,0.5);padding:5px;z-index:1000;}', sheet.cssRules.length);
 var smallWCSS = sheet.cssRules[i];
 
 // ============================================================
@@ -1164,15 +1149,123 @@ setclick("btloadmaster", loadMasterProfiles);
 setevent("change", "chklocal", toggleProfileSource);
 setevent("change", "chkmaster", toggleProfileSource);
 
+// ===========================================================================
+// SMART PROCESS — 3 tingkat cache
+// ---------------------------------------------------------------------------
+// Tier A (geometri): parameter bentuk/offset berubah -> refreshgcode() penuh
+//   (Clipper offset + dogbone + holding tab + sorting dihitung ulang).
+// Tier B (sorting): hanya urutan potong berubah -> refreshgcodeSort(). Menyusun
+//   ulang gcodes yang SUDAH ada menjadi sgcodes, Clipper tidak dijalankan.
+// Tier C (emit): hanya kecepatan/kedalaman berubah -> refreshgcodeFast().
+//   Menulis ulang teks G-code dari sgcodes, Clipper DAN sorting dilewati.
+//
+// Daftar Tier B dan Tier C sengaja eksplisit. Semua input .saveit lain OTOMATIS
+// masuk Tier A, sehingga parameter yang belum dipetakan (mis. V-carve, raster
+// feed) selalu aman memakai full rebuild dan tidak pernah diam-diam memakai
+// cache yang basi. Cakupan Tier C saat ini sengaja dibatasi pada jalur cutting
+// HITAM (main cut) dan MERAH (secondary/marking).
+// ===========================================================================
+
+// Tier B: mempengaruhi URUTAN potong, ATAU memerlukan pass sortGcodes() agar
+// cache posisi-potong (cachedcutpos) dibersihkan — itulah satu-satunya tempat
+// pembersihannya, sedangkan getcutpos() membaca cutclimb dan flipx.
+const TIER_B_PARAM_IDS = [
+    "xsort", "ysort", "szsort", "centersort", "yslow", "greensort", "safesort",
+    "separatecut", "finishpart", "usestart", "startat",
+    // Arah kerja & mirror X: TIDAK mengubah geometri offset (tidak dibaca di
+    // prepare_line2/gcodepush sama sekali), tetapi butuh sortGcodes() untuk
+    // membersihkan cachedcutpos. Jangan pindahkan ke Tier C tanpa menambahkan
+    // cachedcutpos = [] di refreshgcodeFast(). Lihat MISCLASS-1 di
+    // revisi/rangkuman_pipeline.md.
+    "cutclimb", "flipx"
+];
+
+// Tier C: hanya mempengaruhi TEKS G-code (dibaca di emitGcodeOnly()/lines2gcode()).
+const TIER_C_PARAM_IDS = [
+    // Hitam — main cutting
+    "feed", "feed1x", "zdown", "repeat", "firstd", "addz", "tabc",
+    "slowsmall", "slowsmallval", "useslowsmall", "burn1", "burnfeed",
+    "rampdown", "zdown0", "finalz",
+    // Merah — secondary cutting / marking
+    "pltfeed", "pltpw", "carved", "carvedp", "redrep",
+    // Kinematika & format bersama
+    "pup", "pdn", "trav", "dwelltime", "spindleoff", "spindleoffval",
+    "canresume", "pausecut", "cutpw", "acpmode", "acpstep", "tabinside",
+    // Raster outline (ikut jalur emit, bukan geometri offset)
+    "rasteroutline", "rasteroutfeed", "rasteroutpw",
+    // Lead-in plasma
+    "leadin", "useleadin"
+];
+
+var TIER_A_PARAM_IDS = [];
+var lastTierASnapshot = "";
+var lastTierBSnapshot = "";
+
+// Tier A = semua input .saveit yang bukan Tier B / Tier C.
+function buildTierLists() {
+    var setB = {}, setC = {};
+    var i;
+    for (i = 0; i < TIER_B_PARAM_IDS.length; i++) setB[TIER_B_PARAM_IDS[i]] = 1;
+    for (i = 0; i < TIER_C_PARAM_IDS.length; i++) setC[TIER_C_PARAM_IDS[i]] = 1;
+    var kl = document.getElementsByClassName("saveit");
+    var a = [];
+    for (i = 0; i < kl.length; i++) {
+        var id = kl[i].id;
+        if (!id || setB[id] || setC[id]) continue;
+        a.push(id);
+    }
+    TIER_A_PARAM_IDS = a;
+    console.log("[Smart Process] Pemetaan tier: A=" + TIER_A_PARAM_IDS.length +
+        " input (geometri/Clipper), B=" + TIER_B_PARAM_IDS.length + " (sorting), C=" +
+        TIER_C_PARAM_IDS.length + " (emit).");
+}
+
+function snapshotOf(ids) {
+    var snap = [];
+    for (var i = 0; i < ids.length; i++) {
+        var el = $(ids[i]);
+        if (!el) { snap.push("\u0000"); continue; }
+        snap.push(el.type === 'checkbox' ? (el.checked ? 1 : 0) : el.value);
+    }
+    return snap.join("|");
+}
+
+// Dipanggil setiap kali full rebuild (myFunction) selesai. Setelah ini, cache
+// geometri (gcodes) dan cache urutan (sgcodes) konsisten dengan snapshot.
+function markPipelineSnapshots() {
+    if (TIER_A_PARAM_IDS.length === 0) buildTierLists();
+    lastTierASnapshot = snapshotOf(TIER_A_PARAM_IDS);
+    lastTierBSnapshot = snapshotOf(TIER_B_PARAM_IDS);
+}
+
+function smartProcess() {
+    if (TIER_A_PARAM_IDS.length === 0) buildTierLists();
+    var a = snapshotOf(TIER_A_PARAM_IDS);
+    var b = snapshotOf(TIER_B_PARAM_IDS);
+    var hasGeom = (typeof gcodes !== "undefined" && gcodes && gcodes.length > 0);
+    var hasSg = (typeof sgcodes !== "undefined" && sgcodes && sgcodes.length > 0);
+
+    if (!hasGeom || !hasSg || a !== lastTierASnapshot) {
+        console.log("[Smart Process] TIER A (geometri) -> refreshgcode() penuh: Clipper offset + tab + dogbone + sorting dihitung ulang." +
+            ((hasGeom && hasSg) ? "" : " [cache geometri belum ada]"));
+        refreshgcode();
+    } else if (b !== lastTierBSnapshot) {
+        console.log("[Smart Process] TIER B (sorting) -> refreshgcodeSort(): urutan potong disusun ulang, Clipper DILEWATI.");
+        refreshgcodeSort();
+    } else {
+        console.log("[Smart Process] TIER C (emit) -> refreshgcodeFast(): hanya teks G-code ditulis ulang, Clipper & sorting DILEWATI.");
+        refreshgcodeFast();
+    }
+    saveProcessToHistory();
+}
+
 setclick("btrecode", function () {
     console.log("btrecode clicked");
-    refreshgcode();
-    saveProcessToHistory();
+    smartProcess();
 });
 setclick("btrecode2", function () {
     console.log("btrecode2 clicked");
-    refreshgcode();
-    saveProcessToHistory();
+    smartProcess();
 });
 
 setclick("btsaveset", savesetting);
@@ -1311,12 +1404,6 @@ setevent("change", "strokewidth", function () {
     }
 });
 
-setevent("change", "isdarktheme", function () {
-    if (currentViewMode === 'simulator' && simState.moves.length > 0) {
-        simDraw();
-    }
-});
-
 document.getElementById('btInstallInkscapeExt').addEventListener('click', async () => {
     try {
         await window.go.main.App.InstallInkscapeExtension();
@@ -1363,8 +1450,8 @@ function switchViewTab(mode) {
     var viewCtrls = document.getElementById('gcodeViewControls');
     var bbox = document.getElementById('gcodeBoundingBox');
 
-    function reset(el) { if (el) { el.style.background = '#e0e0e0'; el.style.color = '#333'; el.style.fontWeight = 'normal'; } }
-    function active(el) { if (el) { el.style.background = '#3498db'; el.style.color = 'white'; el.style.fontWeight = 'bold'; } }
+    function reset(el) { if (el) { el.style.background = 'var(--panel2)'; el.style.color = 'var(--ink)'; el.style.fontWeight = 'normal'; } }
+    function active(el) { if (el) { el.style.background = 'var(--accent)'; el.style.color = 'var(--accent-ink)'; el.style.fontWeight = 'bold'; } }
 
     reset(tabOrig); reset(tabSim);
 
@@ -1696,7 +1783,7 @@ function drawIsometricGrid(ctx, moves, scale, offsetX, offsetY, centerX, centerY
     var startY = Math.floor(minY / gridSize) * gridSize;
     var endY = Math.ceil(maxY / gridSize) * gridSize;
 
-    var isDarkMode = getchecked("isdarktheme");
+    var isDarkMode = (appTheme === 'dark');
     var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
     var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
 
@@ -1765,7 +1852,7 @@ function drawGrid(ctx, minX, maxX, minY, maxY, scale, offsetX, offsetY) {
     var startY = Math.floor(minY / gridSize) * gridSize;
     var endY = Math.ceil(maxY / gridSize) * gridSize;
 
-    var isDarkMode = getchecked("isdarktheme");
+    var isDarkMode = (appTheme === 'dark');
     var majorLineColor = isDarkMode ? 'rgba(80, 80, 80, 0.5)' : 'rgba(200, 200, 200, 0.6)';
     var minorLineColor = isDarkMode ? 'rgba(60, 60, 60, 0.3)' : 'rgba(230, 230, 230, 0.4)';
     var majorLineWidth = 0.5;
@@ -1942,12 +2029,10 @@ var defaultProfile = {
         "burn1": false,
         "totaltime": "1770.726",
         "zoom1": "1",
-        "isdarktheme": false,
         "baudrate": "230400",
         "wsip": "1.11",
         "wsdirect": false,
         "wsport": "8888",
-        "wcolor": "orange",
         "wtitle": "KARYACNC",
         "cflipx": true,
         "cflipy": false,
@@ -1981,12 +2066,20 @@ setTimeout(function () {
 modechange(1);
 
 document.addEventListener('DOMContentLoaded', function () {
+    // Peta tier untuk tombol Process (Tier A = geometri, B = sorting, C = emit).
+    buildTierLists();
+
     // Saat user mengedit setting (class saveit), simpan ke history yang sedang aktif
     // (bukan history terbaru, tapi yang diklik user).
     (function bindSaveItHistory() {
+        // PENTING: tidak ada auto-refresh di sini. Mengubah input apa pun HANYA
+        // menyimpan setting ke history. Regenerasi G-code sepenuhnya manual lewat
+        // tombol Process (smartProcess()), yang memilih tier cache termurah.
         var kl = document.getElementsByClassName("saveit");
         for (var i = 0; i < kl.length; i++) {
-            kl[i].addEventListener('change', function () { saveProcessToHistory(); });
+            kl[i].addEventListener('change', function () {
+                saveProcessToHistory();
+            });
         }
     })();
 
@@ -2297,7 +2390,10 @@ window.addEventListener('drop', function (e) {
 
                 if (reader.tipe.indexOf("svg") !== -1) {
                     text1 = event.target.result;
-                    myFunction(1);
+                    parsedGeometryData = null;
+                    // refreshgcode(1) = full rebuild dengan geometri sudah dalam mm,
+                    // sekaligus finalisasi download/simulator + penandaan snapshot tier.
+                    refreshgcode(1);
                 } else { }
             };
             if (file.type.indexOf("svg") !== -1) {
@@ -2308,6 +2404,7 @@ window.addEventListener('drop', function (e) {
                 Potrace.loadImageFromFile(file);
                 Potrace.process(function () {
                     text1 = Potrace.getSVG(1);
+                    parsedGeometryData = null;
                     preparestyle();
 
                     refreshgcode();
@@ -2348,6 +2445,7 @@ function createImage(source, blob) {
         Potrace.info.alphamax = getnumber("smooth");
         Potrace.process(function () {
             text1 = Potrace.getSVG(1);
+            parsedGeometryData = null;
             preparestyle();
             refreshgcode();
 
@@ -2358,11 +2456,14 @@ function createImage(source, blob) {
 
 function createSVG(source, blob) {
     text1 = blob;
+    parsedGeometryData = null;
 
     refreshgcode();
 }
 
-function refreshgcode() {
+// scale1: 0/undefined = jalur normal (96 DPI -> mm), 1 = geometri sudah dalam mm
+// (dipakai saat user men-drop file SVG eksternal).
+function refreshgcode(scale1) {
     console.log("refreshgcode called, text1 length:", text1 ? text1.length : 0, "ink_images count:", ink_images.length);
     if (text1 == '') {
         savesetting();
@@ -2375,7 +2476,7 @@ function refreshgcode() {
         d = 'block';
 
     $("segm").style.display = d;
-    myFunction(0);
+    myFunction(scale1 ? 1 : 0);
 
     // Save original operations setelah myFunction selesai menggambar
     if (window.myCanvas1 && window.myCanvas1._drawOperations) {
@@ -2388,6 +2489,97 @@ function refreshgcode() {
     if (currentViewMode === 'simulator') {
         simActivate();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tier C: hanya menulis ulang teks G-code dari sgcodes yang sudah ada.
+// Clipper offset TIDAK dijalankan, sorting TIDAK dijalankan.
+// ---------------------------------------------------------------------------
+function refreshgcodeFast() {
+    console.log("[refreshgcodeFast] TIER C: sgcodes -> teks G-code (Clipper & sorting dilewati)");
+    if (typeof sgcodes === "undefined" || !sgcodes || sgcodes.length === 0 ||
+        typeof emitGcodeOnly !== "function") {
+        console.log("[refreshgcodeFast] sgcodes belum ada -> fallback ke refreshgcode()");
+        refreshgcode();
+        return;
+    }
+    emitGcodeOnly("Tier C (emit-only)");
+    // Urutan ini penting dan harus sama dengan myFunction():
+    // sortedgcode() -> gcode_verify(1) -> finalisasi engcode.
+    if (typeof gcode_verify === "function") gcode_verify(1);
+    var gc = getvalue("engcode") + (typeof cut_eng !== "undefined" ? cut_eng : "");
+    setvalue("engcode", gc);
+    savesetting();
+    updatedownload2();
+
+    if (currentViewMode === 'simulator') {
+        simActivate();
+    }
+
+    if (window.STRICT_PIPELINE_VERIFY) strictPipelineVerify("Tier C (emit-only)");
+}
+
+// ---------------------------------------------------------------------------
+// Tier B: menyusun ulang urutan potong dari geometri offset yang sudah ada.
+// Clipper offset TIDAK dijalankan; hanya gcodes -> sgcodes yang dihitung ulang.
+// ---------------------------------------------------------------------------
+function refreshgcodeSort() {
+    console.log("[refreshgcodeSort] TIER B: gcodes -> sgcodes (Clipper dilewati)");
+    if (typeof sortGcodes !== "function" || typeof gcodes === "undefined" ||
+        !gcodes || gcodes.length === 0) {
+        console.log("[refreshgcodeSort] cache geometri belum ada -> fallback ke refreshgcode()");
+        refreshgcode();
+        return;
+    }
+    sortGcodes();
+    emitGcodeOnly("Tier B (sort-only; sgcodes baru saja disusun ulang)");
+    if (typeof gcode_verify === "function") gcode_verify(1);
+    var gc = getvalue("engcode") + (typeof cut_eng !== "undefined" ? cut_eng : "");
+    setvalue("engcode", gc);
+    // sgcodes sekarang cocok dengan parameter sorting saat ini. Tanpa ini, klik
+    // Process berikutnya akan mengulang sorting yang sama tanpa perlu.
+    lastTierBSnapshot = snapshotOf(TIER_B_PARAM_IDS);
+    savesetting();
+    updatedownload2();
+
+    if (currentViewMode === 'simulator') {
+        simActivate();
+    }
+
+    if (window.STRICT_PIPELINE_VERIFY) strictPipelineVerify("Tier B (sort-only)");
+}
+
+// ---------------------------------------------------------------------------
+// Alat uji: jalankan FULL rebuild lalu bandingkan byte-per-byte dengan hasil
+// fast path yang baru saja dihasilkan. Aktifkan dari console browser:
+//     window.STRICT_PIPELINE_VERIFY = true
+// Hasil full rebuild yang menggantikan hasil fast path, jadi aman dipakai
+// sebagai mode verifikasi (bukan produksi).
+// ---------------------------------------------------------------------------
+function strictPipelineVerify(label) {
+    function snapText() {
+        return getvalue("gcode") + "\u0001ENG\u0001" + getvalue("engcode") +
+            "\u0001FIN\u0001" + (typeof finishgcode !== "undefined" ? finishgcode : "");
+    }
+    var fast = snapText();
+    // Full Stage A + B + C memakai mode skala yang sama seperti rebuild terakhir,
+    // supaya perbandingan tetap valid untuk dokumen yang di-drop sebagai SVG luar
+    // (scale 1) maupun jalur normal Inkscape/WebSocket (scale 0).
+    refreshgcode(typeof lastPipelineScale1 !== "undefined" ? lastPipelineScale1 : 0);
+    var full = snapText();
+    if (fast === full) {
+        console.log("[StrictVerify] OK — " + label + " identik dengan full rebuild (" + full.length + " karakter).");
+        return;
+    }
+    var n = Math.min(fast.length, full.length), at = -1;
+    for (var i = 0; i < n; i++) {
+        if (fast.charAt(i) !== full.charAt(i)) { at = i; break; }
+    }
+    if (at < 0) at = n;
+    console.warn("[StrictVerify] BEDA — " + label + " TIDAK identik dengan full rebuild. " +
+        "fast=" + fast.length + " char, full=" + full.length + " char, beda pertama di offset " + at);
+    console.warn("[StrictVerify] fast: " + JSON.stringify(fast.substr(Math.max(0, at - 80), 200)));
+    console.warn("[StrictVerify] full: " + JSON.stringify(full.substr(Math.max(0, at - 80), 200)));
 }
 
 function copyStringToClipboard(str) {
@@ -2553,19 +2745,19 @@ function gcodetoText1(gx) {
 // ============================================================
 
 function isInside(x, y, path, idx = 0) {
-    inside = 0;
-    j = path.length - 1;
-    for (i in path) {
-        xi = path[i][0 + idx];
-        yi = path[i][1 + idx];
-        xj = path[j][0 + idx];
-        yj = path[j][1 + idx];
+    if (!path || path.length < 3) return false;
+    let inside = false;
+    const len = path.length;
+    for (let i = 0, j = len - 1; i < len; j = i++) {
+        const xi = path[i][0 + idx];
+        const yi = path[i][1 + idx];
+        const xj = path[j][0 + idx];
+        const yj = path[j][1 + idx];
 
-        intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
         if (intersect) inside = !inside;
-        j = i;
     }
-    return inside
+    return inside;
 }
 
 function computeH(a, b, c, d) {
@@ -2694,27 +2886,93 @@ setclick('btOpenDevTools', async function () {
     hidd2 = !hidd2;
 });
 
-setclick('btOpenNestJSV2', function () {
-    $('overlayNestJS').style.display = 'block';
-    $('nestjsFrame').src = 'http://localhost:3000/v2/';
-    $('vars2').style.display = 'none';
-    hidd2 = !hidd2;
-});
+// ============================================================
+// APP TABS (KaryaCnc / Sketcher / Nesting / Invoice)
+// ============================================================
 
-setclick('btOpenInvoice', async function () {
+var APP_TAB_URLS = {
+    sketcher: 'http://localhost:3000/sketcher/',
+    nesting: 'http://localhost:3000/v2/',
+    invoice: 'http://localhost:3000/invoice.html'
+};
+var APP_TAB_FRAMES = {
+    sketcher: ['panelSketcher', 'sketcherFrame'],
+    nesting: ['panelNesting', 'nestjsFrame'],
+    invoice: ['panelInvoice', 'invoiceFrame']
+};
+
+function focusActivePanelFrame() {
+    var panel = document.querySelector('.tabpanel.active');
+    if (!panel) return false;
+    var f = panel.querySelector('iframe');
+    if (!f) return false;
     try {
-        await window.invoke('open_invoice');
-    } catch (e) {
-        console.error('Failed to open invoice generator', e);
+        f.focus();
+        if (f.contentWindow) f.contentWindow.focus();
+    } catch (err) { /* ignore */ }
+    return true;
+}
+
+function showTab(name) {
+    Object.keys(APP_TAB_FRAMES).forEach(function (t) {
+        var panel = $(APP_TAB_FRAMES[t][0]);
+        if (panel) panel.classList.toggle('active', t === name);
+    });
+    document.querySelectorAll('.apptab').forEach(function (b) {
+        b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    });
+    if (APP_TAB_FRAMES[name]) {
+        // iframe di-load sekali lalu dibiarkan hidup — state sketsa/nesting tidak hilang saat ganti tab
+        var frame = $(APP_TAB_FRAMES[name][1]);
+        if (!frame.getAttribute('data-loaded')) {
+            frame.src = APP_TAB_URLS[name] + (APP_TAB_URLS[name].indexOf('?') >= 0 ? '&' : '?') + 'theme=' + appTheme;
+            frame.setAttribute('data-loaded', '1');
+            // Fokuskan lagi begitu dokumen iframe selesai dimuat (klik cepat saat masih loading)
+            frame.addEventListener('load', function () {
+                if (frame.parentElement.classList.contains('active')) focusActivePanelFrame();
+            });
+        }
+        focusActivePanelFrame();
+        setTimeout(function () {
+            if (frame.parentElement.classList.contains('active')) focusActivePanelFrame();
+        }, 80);
+        setTimeout(function () {
+            if (frame.parentElement.classList.contains('active')) focusActivePanelFrame();
+        }, 400);
+    } else {
+        // Tab KaryaCNC: lepas fokus dari tombol tab supaya Ctrl+A tidak menyeleksi UI shell
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
     }
-    $('vars2').style.display = 'none';
-    hidd2 = !hidd2;
+}
+
+// Tombol tab tidak boleh mengambil fokus (kalau tidak, Ctrl+A menyeleksi teks shell)
+document.addEventListener('mousedown', function (e) {
+    if (e.target && e.target.classList && e.target.classList.contains('apptab')) e.preventDefault();
 });
 
-setclick('btCloseNestJS', function () {
-    $('overlayNestJS').style.display = 'none';
-    $('nestjsFrame').src = 'about:blank';
+document.addEventListener('click', function (e) {
+    var t = e.target && e.target.getAttribute ? e.target.getAttribute('data-tab') : null;
+    if (t) showTab(t);
 });
+
+// Saat panel iframe aktif, Ctrl+A diteruskan ke dalam iframe (bukan menyeleksi teks shell)
+document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'a' || e.key === 'A')) {
+        if (focusActivePanelFrame()) e.preventDefault();
+    }
+});
+
+setclick('btnAppTheme', function () {
+    applyAppTheme(appTheme === 'dark' ? 'light' : 'dark');
+});
+
+window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (d && d.type === 'karyacnc-set-theme' && (d.theme === 'dark' || d.theme === 'light') && d.theme !== appTheme)
+        applyAppTheme(d.theme);
+});
+
+initAppTheme();
 
 // Screenshot functionality with keyboard shortcut Ctrl+Alt+P
 document.addEventListener('keydown', async function (e) {
@@ -2722,6 +2980,43 @@ document.addEventListener('keydown', async function (e) {
     if (e.ctrlKey && e.altKey && e.key === 'p') {
         e.preventDefault();
         await captureScreenshot();
+    }
+});
+
+// Tab navigation with Ctrl+Tab / Ctrl+Shift+Tab
+var TAB_ORDER = ['karyacnc', 'sketcher', 'nesting', 'invoice'];
+
+function addTabKeyHandler(win) {
+    win.addEventListener('keydown', function (e) {
+        if (!e.ctrlKey || e.altKey || e.key !== 'Tab') return;
+        e.preventDefault();
+        var cur = document.querySelector('.apptab.active');
+        if (!cur) return;
+        var curTab = cur.getAttribute('data-tab');
+        var idx = TAB_ORDER.indexOf(curTab);
+        if (idx < 0) return;
+        var next = e.shiftKey
+            ? TAB_ORDER[(idx - 1 + TAB_ORDER.length) % TAB_ORDER.length]
+            : TAB_ORDER[(idx + 1) % TAB_ORDER.length];
+        showTab(next);
+    }, true); // useCapture
+}
+
+// Listener ke window utama (untuk tab karyacnc)
+addTabKeyHandler(window);
+
+// Frame (sketcher/nesting/invoice) di-host di :3000 beda origin, jadi keydown
+// tidak pernah sampai ke window ini. Frame mengirim postMessage, kita pindah tab.
+window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'karyacnc-next-tab' || d.type === 'karyacnc-prev-tab') {
+        var cur = document.querySelector('.apptab.active');
+        if (!cur) return;
+        var idx = TAB_ORDER.indexOf(cur.getAttribute('data-tab'));
+        if (idx < 0) return;
+        var step = (d.type === 'karyacnc-next-tab') ? 1 : -1;
+        showTab(TAB_ORDER[(idx + step + TAB_ORDER.length) % TAB_ORDER.length]);
     }
 });
 
@@ -2864,7 +3159,7 @@ function simCenter(moves) {
 function simDraw() {
     if (!simCtx || simState.moves.length === 0) return;
     var ctx = simCtx;
-    var isDark = getchecked("isdarktheme");
+    var isDark = (appTheme === 'dark');
     var bg = isDark ? '#0a0a0a' : '#f5f5f5';
     var grid1 = isDark ? '#1a1a1a' : '#ddd';
     var grid5 = isDark ? '#3a3a3a' : '#ccc';

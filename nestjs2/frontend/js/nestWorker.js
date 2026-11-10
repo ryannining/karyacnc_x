@@ -1,8 +1,8 @@
-importScripts('geometry.js', 'nfp.js', 'nfp2.js', 'nfp_optimized.js');
+importScripts('geometry.js', 'nfp.js', 'nfp2.js', 'nfp_optimized.js', 'nfp_ga.js');
 
 // Handle messages from main thread
 self.onmessage = function (e) {
-    const { parts, sheet, gridSize, algorithm, initialPlacements } = e.data;
+    const { parts, sheet, gridSize, algorithm, initialPlacements, gaParams, seedOrder } = e.data;
 
     // Create NFP instance based on algorithm
     let nfp;
@@ -10,6 +10,9 @@ self.onmessage = function (e) {
         nfp = new NFP2();
     } else if (algorithm === 'optimized') {
         nfp = new NFPOptimized();
+    } else if (algorithm === 'ga') {
+        nfp = new NFPGA();
+        if (gaParams) nfp.setGAParams(gaParams.popSize, gaParams.generations, gaParams.mutationRate);
     } else {
         nfp = new NFP();
     }
@@ -46,7 +49,9 @@ self.onmessage = function (e) {
         });
     };
 
-    const bestPlacements = nfp.findBestPosition(parts, sheet, progressHandler, gridSize, rehydratedInitial);
+    const bestPlacements = (algorithm === 'ga')
+        ? nfp.findBestPosition(parts, sheet, progressHandler, gridSize, rehydratedInitial, seedOrder || null)
+        : nfp.findBestPosition(parts, sheet, progressHandler, gridSize, rehydratedInitial);
 
     // Calculate total area for this solution
     const bounds = nfp.calculateTotalBounds(bestPlacements);
@@ -70,6 +75,7 @@ self.onmessage = function (e) {
         type: 'result',
         placements: transferablePlacements,
         area: area / (GEOM_SCALE * GEOM_SCALE),
-        stats: nfp.getPerformanceStats()
+        stats: nfp.getPerformanceStats(),
+        bestOrder: nfp.bestOrder || null
     });
 };

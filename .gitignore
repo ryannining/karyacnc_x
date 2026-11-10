@@ -2,3 +2,22 @@ build/bin
 node_modules
 frontend/dist
 backup
+.commandcode
+
+# SMB/Samba, macOS and editor leftovers (never project assets)
+.__smb*
+._*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build/toolchain/junk artifacts (never commit)
+*.tar.gz
+karyacnc.exe
+*.zip
+frontend/done.mp3
+frontend/inkscape_ex/__pycache__/
+nul
+temp_canvas.txt
+tools/pdf2svg/*.pdf
+tools/pdf2svg/*.svg

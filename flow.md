@@ -171,6 +171,12 @@ Ready for processing
 | Purple | `#800080` | Pocket | Saku/Area clearing |
 | Red | `#FF0000` | Drilling | Bor titik |
 | Green | `#00FF00` | Marking | Tanda saja |
+| Maroon | `#800000` | cutting tab | cutting tab |
+| Teal | `#008080` | Starting position | Starting position |
+
+Flip offset:
+- Black/red closed path kalau ada fill Yellow #FFFF00 maka operasinya offset nya dibalik (misal inside jadi outside)
+- Green Closed path bisa dianggap sebagai bantuan bentuk bahan, apabila ada fill gray nya, maka semua operasi didalamnya offsetnya dibalik.
 
 **Parameter tambahan dari style:**
 - `stroke-width` → Tool diameter

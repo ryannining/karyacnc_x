@@ -536,12 +536,29 @@ class Path {
     }
 
     toSVGPath() {
-        let origin = this.getSVGPathData();
-
         const transformStr = `matrix(${this.transformMatrix[0]},${this.transformMatrix[1]},${this.transformMatrix[2]},${this.transformMatrix[3]},${this.transformMatrix[4] / GEOM_SCALE},${this.transformMatrix[5] / GEOM_SCALE})`;
+        const strokeAttr = this.lcolor ? `stroke="${this.lcolor}"` : '';
 
-        origin = `<path d="${origin}" transform="${transformStr}" fill="none" ${this.lcolor ? `stroke="${this.lcolor}"` : ''} style="-inkscape-stroke: hairline;"/>`;
-        return origin;
+        const outerD = originalPathCache[this.originIndex] || '';
+
+        // If part has no holes/children, export as single path
+        if (!this.childIndex || this.childIndex.length === 0) {
+            return `<path d="${outerD}" transform="${transformStr}" fill="none" ${strokeAttr} style="-inkscape-stroke: hairline;"/>`;
+        }
+
+        // When part has inner holes, export outer and inner paths as separate <path> elements
+        // grouped together in a <g> with the transform applied to the group.
+        // This preserves separate geometry nodes so CAM can cut inner holes before outer outlines.
+        let groupContent = `<g transform="${transformStr}">\n`;
+        groupContent += `  <path d="${outerD}" fill="none" ${strokeAttr} style="-inkscape-stroke: hairline;"/>\n`;
+        for (const i of this.childIndex) {
+            const childD = originalPathCache[i];
+            if (childD) {
+                groupContent += `  <path d="${childD}" fill="none" ${strokeAttr} style="-inkscape-stroke: hairline;"/>\n`;
+            }
+        }
+        groupContent += `</g>`;
+        return groupContent;
     }
 
 

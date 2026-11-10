@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape-extension">
+    <name>Merge Connected Paths by Color</name>
+    <id>org.inkscape.merge_connected_paths</id>
+    <param name="tolerance" type="float" min="0.001" max="1000.0" 
+           precision="3" gui-text="Toleransi Jarak (px):">1.0</param>
+    <effect>
+        <object-type>path</object-type>
+        <effects-menu>
+            <submenu name="Path">
+                <submenu name="Kimi Tools"/>
+            </submenu>
+        </effects-menu>
+    </effect>
+    <script>
+        <command location="inx" interpreter="python">merge_connected_paths.py</command>
+    </script>
+</inkscape-extension>
