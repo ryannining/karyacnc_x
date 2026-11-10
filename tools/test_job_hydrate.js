@@ -50,19 +50,28 @@ try {
   console.log('snapshot paths:', lastParsedSnapshot ? lastParsedSnapshot.paths.length : 'NULL');
   console.log('fresh parsedGeometryData:', ctx.parsedGeometryData ? ctx.parsedGeometryData.length : 'NULL');
 
-  const snap = JSON.parse(JSON.stringify(lastParsedSnapshot)); // simulate storage round-trip
-  ctx.parsedGeometryData = [];
-  const t2 = pathstoText1(null, snap);
-  console.log('hydrate text1 length:', (t2||'').length);
-  console.log('hydrate parsedGeometryData:', ctx.parsedGeometryData ? ctx.parsedGeometryData.length : 'NULL');
+  // SAME object (simulates stored history entry being reused across restores)
+  const snap = ctx.lastParsedSnapshot;
+  const beforeSnap = JSON.parse(JSON.stringify(snap));
 
-  const a = ctx.parsedGeometryData;
-  if (a && a.length === 1) {
-    console.log('hydrate shape[0].closed =', a[0].closed, '| points =', a[0].points.length);
-    console.log('OK: round-trip works');
-  } else {
-    console.log('WARN: unexpected parsedGeometryData');
+  function run(f) {
+    ctx.parsedGeometryData = [];
+    const t = pathstoText1(null, f);
+    const g = ctx.parsedGeometryData;
+    return { t: (t||'').length, n: g ? g.length : 0,
+             closed: (g && g[0]) ? g[0].closed : null,
+             pts: (g && g[0]) ? g[0].points.length : 0 };
   }
+
+  const r1 = run(snap);
+  const r2 = run(snap);
+  const same = r1.t === r2.t && r1.n === r2.n && r1.closed === r2.closed && r1.pts === r2.pts;
+  const unchanged = JSON.stringify(snap) === JSON.stringify(beforeSnap);
+  console.log('run1:', JSON.stringify(r1));
+  console.log('run2:', JSON.stringify(r2));
+  console.log('deterministic across repeated restore:', same);
+  console.log('stored snapshot unchanged after hydrate:', unchanged);
+  console.log((same && unchanged && r1.n === 1) ? 'OK: repeated-restore bug fixed' : 'FAIL: still mutating');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
