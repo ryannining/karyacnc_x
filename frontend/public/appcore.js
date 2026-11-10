@@ -4134,7 +4134,9 @@ function jcJoinAllowed(chain, cand, eps, window) {
 	return 1;
 }
 
-function pathstoText1(gx) {
+var lastParsedSnapshot = null;
+
+function pathstoText1(gx, parsedInput) {
 	cache_ink_img = [];
 	mind = getnumber("minR");
 
@@ -4145,7 +4147,7 @@ function pathstoText1(gx) {
 
 	var join = getchecked("enablejoin");
 	gcstyle = [];
-	gs = gx.split("\n");
+	gs = (gx != null) ? gx.split("\n") : [];
 	var scale = 96 / 25.4;
 	var cflipx = 1;
 	var cflipy = 1;
@@ -4208,6 +4210,7 @@ function pathstoText1(gx) {
 	imgY = 0;
 	var xyscale = 1.0;
 	var imgdata = "";
+	if (!parsedInput) {
 	for (var i in gs) {
 		var lns = gs[i];
 		if (!inimg) {
@@ -4303,6 +4306,11 @@ function pathstoText1(gx) {
 
 
 
+	}
+		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images }));
+	} else {
+		paths = parsedInput.paths;
+		ink_images = parsedInput.ink_images;
 	}
 
 	if (join) {

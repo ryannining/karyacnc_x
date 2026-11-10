@@ -850,8 +850,17 @@ function loadHistoryIndex(n) {
     if (n < 0 || n >= text1_history.length) return;
     current_history_index = n;
     window.activeHistoryId = n;
-    buff = text1_history[n][1];
-    text1 = pathstoText1(buff);
+    var stored = text1_history[n][1];
+    var storedStr = (typeof stored === 'string');
+    if (storedStr) {
+        // History lama: teks protokol (parse seperti dulu).
+        text1 = pathstoText1(stored);
+    } else if (stored && Array.isArray(stored.paths)) {
+        // History baru: JOB terstruktur (tanpa parse teks).
+        text1 = pathstoText1(null, stored);
+    } else {
+        return;
+    }
     buff = "";
     // Muat kembali parameter proses (class saveit) yang tersimpan TERLEBIH DAHULU
     // agar G-code diproses ulang dengan setting history yang benar (bukan setting terakhir).
@@ -1029,7 +1038,8 @@ async function setupEventListeners() {
         console.log('WS_MESSAGE_RECEIVED', event);
         buff = event.payload;
         text1 = pathstoText1(buff);
-        savehistory(buff);
+        // History baru memakai JOB terstruktur (tanpa teks protokol).
+        savehistory((lastParsedSnapshot && Array.isArray(lastParsedSnapshot.paths)) ? lastParsedSnapshot : buff);
         refreshgcode();
     });
 
