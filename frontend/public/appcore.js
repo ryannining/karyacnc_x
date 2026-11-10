@@ -4495,9 +4495,12 @@ function pathstoText1(gx, parsedInput) {
 			}
 		}
 	}
-	if (!parsedInput) {
-		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: false }));
-		console.log("[JOB] parse teks selesai; snapshot (post-containment) tersimpan untuk history (" + paths.length + " path)");
+	{
+		var _sj = (parsedInput && parsedInput.skipJoin) ? true : false;
+		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: _sj }));
+		if (!parsedInput) {
+			console.log("[JOB] parse teks selesai; snapshot tersimpan untuk history (" + paths.length + " path)");
+		}
 	}
 
 	var npaths = [];
@@ -4823,7 +4826,7 @@ function pathstoText1(gx, parsedInput) {
 		paths[i][5] = parent;
 		sty.parent = parent;
 	}
-	if (!parsedInput) {
+	{
 		lastParsedSnapshot.containment = { flips: [], parents: [], childs: [] };
 		for (var ci3 in paths) {
 			lastParsedSnapshot.containment.flips.push(paths[ci3][1]);

@@ -1049,7 +1049,7 @@ async function setupEventListeners() {
         var job = jobFromMiniSketchJSON(event.payload);
         buff = "";
         text1 = pathstoText1(null, job);
-        savehistory(job);
+        savehistory((lastParsedSnapshot && Array.isArray(lastParsedSnapshot.paths)) ? lastParsedSnapshot : job);
         refreshgcode();
     });
 

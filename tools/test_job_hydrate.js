@@ -132,7 +132,9 @@ try {
   ctx.parsedGeometryData = [];
   const tW = pathstoText1(null, job);
   console.log('wire hydrate text1 len:', (tW||'').length, '| kontur:', ctx.parsedGeometryData ? ctx.parsedGeometryData.length : 0);
-  console.log((job.paths.length === 3 && job.skipJoin === true && ctx.parsedGeometryData && ctx.parsedGeometryData.length >= 1) ? 'OK: wire MiniSketch round-trip works' : 'FAIL: wire round-trip');
+  const snapW = ctx.lastParsedSnapshot;
+  console.log('wire snapshot paths:', snapW ? snapW.paths.length : 'NULL', '| containment:', snapW && snapW.containment ? 'yes' : 'no', '| skipJoin:', snapW ? snapW.skipJoin : '?');
+  console.log((job.paths.length === 3 && job.skipJoin === true && ctx.parsedGeometryData && ctx.parsedGeometryData.length >= 1 && snapW && snapW.containment && snapW.skipJoin === true) ? 'OK: wire MiniSketch round-trip + snapshot cache works' : 'FAIL: wire round-trip');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
