@@ -4136,6 +4136,40 @@ function jcJoinAllowed(chain, cand, eps, window) {
 
 var lastParsedSnapshot = null;
 
+// SVG dibangun LAZY: hanya saat benar-benar dibutuhkan (download/preview),
+// bukan pada setiap proses/restore. Sumber kebenaran = parsedGeometryData.
+var svgCache = null;
+var svgDirty = false;
+var svgMeta = null;
+var SVG_SCALE = 96 / 25.4;
+
+function getSvgText() {
+	if (svgCache !== null && !svgDirty) return svgCache;
+	var t1 = '';
+	var sc = 0;
+	var g = parsedGeometryData || [];
+	for (var i = 0; i < g.length; i++) {
+		var pts = g[i].points || [];
+		if (!pts.length) continue;
+		sc++;
+		if (sc > 1) t1 += ' ';
+		for (var j = 0; j < pts.length; j++) {
+			var x = pts[j][0] * SVG_SCALE;
+			var y = pts[j][1] * SVG_SCALE;
+			var xy = mround(x) + ' ' + mround(y);
+			if (j === 0) t1 += 'M' + xy;
+			else { if (j === 1) t1 += ' L'; t1 += ' ' + xy; }
+		}
+	}
+	var inw = (svgMeta && svgMeta.in_w) || 0;
+	var inh = (svgMeta && svgMeta.in_h) || 0;
+	t1 += '" stroke="none" fill="black" fill-rule="evenodd"/></svg>';
+	t1 = '<svg id="svg" version="1.1" viewbox="0 0 ' + (inw * 3.779528) + ' ' + (inh * 3.779528) + ' " width="' + inw + 'mm" height="' + inh + 'mm" xmlns="http://www.w3.org/2000/svg"><path d="' + t1;
+	svgCache = t1;
+	svgDirty = false;
+	return t1;
+}
+
 // Konversi wire JSON (MiniSketch v1) ke bentuk internal snapshot yang dipahami
 // pathstoText1(null, job). Warna menentukan op (seperti Inkscape).
 function jobFromMiniSketchJSON(payload) {
@@ -4869,11 +4903,6 @@ function pathstoText1(gx, parsedInput) {
 			sty: sty
 		});
 
-		sc++;
-		if (sc > 1) {
-			t1 += " ";
-		}
-
 		for (j in path) {
 			var p = path[j];
 			x = p[0] * scale;
@@ -4882,13 +4911,6 @@ function pathstoText1(gx, parsedInput) {
 			ymax = Math.max(ymax, y);
 			xmin = Math.min(xmin, x);
 			ymin = Math.min(ymin, y);
-			xy = mround(x) + " " + mround(y);
-			if (j == 0) {
-				t1 += "M" + xy;
-			} else {
-				if (j == 1) t1 += " L";
-				t1 += " " + xy;
-			}
 		}
 	}
 
@@ -4897,8 +4919,9 @@ function pathstoText1(gx, parsedInput) {
 		yzero /= czero;
 	}
 	setvalue("startat", mround2(xzero) + "," + mround2(yzero));
-	t1 += '" stroke="none" fill="black" fill-rule="evenodd"/></svg>';
-	t1 = '<svg id="svg" version="1.1" viewbox="0 0 ' + (in_w * 3.779528) + ' ' + (in_h * 3.779528) + ' " width="' + in_w + 'mm" height="' + in_h + 'mm" xmlns="http://www.w3.org/2000/svg"><path d="' + t1;
+	svgMeta = { in_w: in_w, in_h: in_h };
+	svgCache = null;
+	svgDirty = true;
 	sty = defaultsty;
 	sty.num = gcstyle.length;
 	gcstyle.push(sty);
@@ -4907,7 +4930,7 @@ function pathstoText1(gx, parsedInput) {
 	gcstyle.push(sty);
 	gcstyle.push(sty);
 	gcstyle.push(sty);
-	console.log("[JOB] selesai: " + (Date.now() - t0) + "ms | " + (parsedGeometryData ? parsedGeometryData.length : 0) + " kontur | text1 len " + t1.length);
+	console.log("[JOB] selesai: " + (Date.now() - t0) + "ms | " + (parsedGeometryData ? parsedGeometryData.length : 0) + " kontur | SVG deferred");
 	console.log("path1totext done.");
 	return t1;
 

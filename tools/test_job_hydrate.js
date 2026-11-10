@@ -81,6 +81,10 @@ try {
   console.log('deterministic across repeated restore:', same);
   console.log('stored snapshot unchanged after hydrate:', unchanged);
 
+  const svg1 = ctx.getSvgText();
+  const svg2 = ctx.getSvgText();   // should be cached
+  console.log('SVG lazy valid:', svg1.length > 100 && svg1.indexOf('<svg') === 0, '| cached identical:', svg1 === svg2, '| len', svg1.length);
+
   const snapClean = JSON.parse(JSON.stringify(snap));
   snapClean.skipJoin = true;
   const r3 = run(snapClean);

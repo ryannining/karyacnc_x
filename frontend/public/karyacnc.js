@@ -449,7 +449,7 @@ function applyAppTheme(name) {
     if (typeof currentViewMode !== 'undefined' && currentViewMode === 'simulator' &&
         typeof simState !== 'undefined' && simState.moves && simState.moves.length > 0) {
         simDraw();
-    } else if (typeof refreshgcode === 'function' && typeof text1 !== 'undefined' && text1) {
+    } else if (typeof refreshgcode === 'function' && ((typeof text1 !== 'undefined' && text1) || (window.parsedGeometryData && window.parsedGeometryData.length))) {
         refreshgcode();
     }
 }
@@ -1091,7 +1091,7 @@ function updatedownloadprofile() {
 function updatedownloadsvg() {
     var element = $("downloadsvg");
     element.setAttribute('download', "jobs.svg");
-    element.href = window.URL.createObjectURL(new Blob([text1], {
+    element.href = window.URL.createObjectURL(new Blob([getSvgText()], {
         type: 'image/svg'
     }));
 }
@@ -2485,7 +2485,7 @@ function createSVG(source, blob) {
 // (dipakai saat user men-drop file SVG eksternal).
 function refreshgcode(scale1) {
     console.log("refreshgcode called, text1 length:", text1 ? text1.length : 0, "ink_images count:", ink_images.length);
-    if (text1 == '') {
+    if ((!text1 || text1 === '') && (!window.parsedGeometryData || !window.parsedGeometryData.length)) {
         savesetting();
         console.log("text1 empty, using Paste_rendergcode");
         Paste_rendergcode("myCanvas1");
