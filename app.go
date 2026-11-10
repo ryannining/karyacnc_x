@@ -508,6 +508,37 @@ func (a *App) handleTelegramRequest(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK")
 }
 
+// WireJob is the structured JSON job received from MiniSketch (fast lane v1).
+type WireJob struct {
+	Type    string      `json:"type"`
+	Version int         `json:"version"`
+	Source  string      `json:"source"`
+	Units   string      `json:"units"`
+	Paths   []WirePath  `json:"paths"`
+	Images  []WireImage `json:"images"`
+}
+
+type WirePath struct {
+	ID       string       `json:"id"`
+	Color    string       `json:"color"`
+	Fill     string       `json:"fill"`
+	Pts      [][2]float64 `json:"pts"`
+	Closed   *bool        `json:"closed"`
+	Depth    *float64     `json:"depth"`
+	Sub      string       `json:"sub"`
+	ToolWidth float64      `json:"toolWidth"`
+	SkipJoin bool         `json:"skipJoin"`
+}
+
+type WireImage struct {
+	Src       string  `json:"src"`
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+	W        float64 `json:"w"`
+	H        float64 `json:"h"`
+	Transform string  `json:"transform"`
+}
+
 func (a *App) handleConnection(peer string, conn *websocket.Conn) {
 	defer conn.Close()
 
@@ -524,6 +555,18 @@ func (a *App) handleConnection(peer string, conn *websocket.Conn) {
 
 		if msgType == websocket.TextMessage {
 			text := string(message)
+			if strings.HasPrefix(text, "{") && strings.Contains(text, `"type":"job"`) {
+				var job WireJob
+				if err := json.Unmarshal([]byte(text), &job); err == nil {
+					a.emit("SKETCH_JOB_RECEIVED", job)
+				} else if SHOWDEBUG {
+					fmt.Printf("[WS] JSON job unmarshal error: %v\n", err)
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte("ACK")); err != nil {
+					break
+				}
+				continue
+			}
 			if text == ">REVECTOR2" {
 				if SHOWDEBUG {
 					fmt.Printf("[WS] Received full message from %s. Processing...\n", peer)

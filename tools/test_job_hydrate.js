@@ -23,6 +23,15 @@ const ctx = {
   mround2: x => Math.round(x),
   mround1: x => Math.round(x),
   isInside: () => false,
+  // segment intersection used by virtualStartPoints (returns t along AB or null)
+  intersect_point: (A, B, C, D) => {
+    const x1 = A[0], y1 = A[1], x2 = B[0], y2 = B[1];
+    const x3 = C[0], y3 = C[1], x4 = D[0], y4 = D[1];
+    const den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(den) < 1e-12) return null;
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
+    return (t < 0 || t > 1) ? null : t;
+  },
   CMD_LASER: 1,
   CMD_CNC: 3,
   cmd: 3,
@@ -106,6 +115,24 @@ try {
   console.log('nested hydrate flip:', hydFlips);
   console.log('nested flips equal:', flipsEqual, '| containment cached:', hasContainment);
   console.log((flipsEqual && hasContainment) ? 'OK: nested containment cache preserves flip' : 'FAIL: flip mismatch');
+
+  // ---- MiniSketch wire round-trip (kontrak v1) ----
+  const wire = {
+    type: 'job', version: 1, units: 'mm',
+    paths: [
+      { color: '#000000', closed: true, depth: 3, skipJoin: true,
+        pts: [[0,0],[100,0],[100,100],[0,100]] },
+      { color: '#008080', closed: false, pts: [[50,-10],[50,10]] },
+      { color: '#008080', closed: true, pts: [[-5,-5],[5,-5],[5,5],[-5,5]] }
+    ],
+    images: []
+  };
+  const job = ctx.jobFromMiniSketchJSON(wire);
+  console.log('wire->internal paths:', job.paths.length, '| skipJoin:', job.skipJoin);
+  ctx.parsedGeometryData = [];
+  const tW = pathstoText1(null, job);
+  console.log('wire hydrate text1 len:', (tW||'').length, '| kontur:', ctx.parsedGeometryData ? ctx.parsedGeometryData.length : 0);
+  console.log((job.paths.length === 3 && job.skipJoin === true && ctx.parsedGeometryData && ctx.parsedGeometryData.length >= 1) ? 'OK: wire MiniSketch round-trip works' : 'FAIL: wire round-trip');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);

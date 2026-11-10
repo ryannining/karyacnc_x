@@ -1043,6 +1043,16 @@ async function setupEventListeners() {
         refreshgcode();
     });
 
+    // Jalur tol: MiniSketch mengirim JOB JSON terstruktur (v1).
+    await window.listen('SKETCH_JOB_RECEIVED', (event) => {
+        console.log('SKETCH_JOB_RECEIVED', event);
+        var job = jobFromMiniSketchJSON(event.payload);
+        buff = "";
+        text1 = pathstoText1(null, job);
+        savehistory(job);
+        refreshgcode();
+    });
+
     await window.listen('NESTING_UPLOAD_RECEIVED', (event) => {
         console.log('NESTING_UPLOAD_RECEIVED', event);
         // Buka tab Nesting; app nesting polling timestamp sendiri, jadi cukup ganti tab

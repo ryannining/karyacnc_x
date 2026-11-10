@@ -4136,6 +4136,40 @@ function jcJoinAllowed(chain, cand, eps, window) {
 
 var lastParsedSnapshot = null;
 
+// Konversi wire JSON (MiniSketch v1) ke bentuk internal snapshot yang dipahami
+// pathstoText1(null, job). Warna menentukan op (seperti Inkscape).
+function jobFromMiniSketchJSON(payload) {
+	var paths = [];
+	var ink_images = [];
+	var list = (payload && payload.paths) || [];
+	var anySkip = !!(payload && payload.skipJoin);
+	for (var i = 0; i < list.length; i++) {
+		var p = list[i];
+		if (p && p.skipJoin) anySkip = true;
+		if (!p || !p.pts || !p.pts.length || p.pts.length < 2) continue;
+		var pts = [];
+		for (var k = 0; k < p.pts.length; k++) {
+			var pt = p.pts[k];
+			pts.push([+pt[0], +pt[1]]);
+		}
+		var fill = p.fill || "#000000";
+		var stro = p.color || "#000000";
+		var sty = { stroke: stro, fill: fill, "stroke-width": +p.toolWidth || 0 };
+		if (typeof p.depth === 'number' && isFinite(p.depth)) sty.strokedeep = p.depth;
+		var closed = (p.closed !== undefined) ? !!p.closed : false;
+		var flip = (fill === "#ffff00") ? 1 : 0;
+		paths.push([pts, flip, 0, 0, 0, [], 0, 0, closed, sty]);
+	}
+	var imgs = (payload && payload.images) || [];
+	for (var j = 0; j < imgs.length; j++) {
+		var im = imgs[j];
+		var tr = null;
+		try { tr = getMatrix(im.transform || ""); } catch (e) { tr = null; }
+		ink_images.push([+im.x || 0, +im.y || 0, +im.w || 0, +im.h || 0, String(im.src || ""), tr]);
+	}
+	return { version: 1, paths: paths, ink_images: ink_images, skipJoin: anySkip };
+}
+
 function pathstoText1(gx, parsedInput) {
 	var t0 = Date.now();
 	if (parsedInput && parsedInput.paths) {
@@ -4734,7 +4768,7 @@ function pathstoText1(gx, parsedInput) {
 		sty.greenskip = sty.greenskip || sty.cuttab || (stro == "#00ff00") || (fill == "#00ff00");
 		sty.greentravel = (stro == "#008000") || (fill == "#008000");
 		sty.strokedee = 0;
-		if ((cmd == CMD_CNC))
+		if ((cmd == CMD_CNC) && sty.strokedeep === undefined)
 			sty.strokedeep = parseInt("0x" + stro.substr(3, 2)) * 0.1;
 		sty.ratio = 0;
 		sty.error = 0;
