@@ -4307,8 +4307,6 @@ function pathstoText1(gx, parsedInput) {
 
 
 	}
-		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: false }));
-		console.log("[JOB] parse teks selesai; snapshot tersimpan untuk history (" + paths.length + " path)");
 	} else {
 		// Deep-clone supaya pemrosesan (flip/translasi) tidak memutasi
 		// JOB yang tersimpan di history — restore berulang harus deterministik.
@@ -4452,6 +4450,11 @@ function pathstoText1(gx, parsedInput) {
 			}
 		}
 	}
+	if (!parsedInput) {
+		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: false }));
+		console.log("[JOB] parse teks selesai; snapshot (post-join) tersimpan untuk history (" + paths.length + " path)");
+	}
+
 	var npaths = [];
 	cuttabs = [];
 	starttabs = [];
