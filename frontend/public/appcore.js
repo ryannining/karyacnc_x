@@ -4308,9 +4308,11 @@ function pathstoText1(gx, parsedInput) {
 
 	}
 		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images }));
+		console.log("[JOB] parse teks selesai; snapshot tersimpan untuk history (" + paths.length + " path)");
 	} else {
 		paths = parsedInput.paths;
 		ink_images = parsedInput.ink_images;
+		console.log("[JOB] hydrate dari snapshot (parsedInput) — tanpa parse teks (" + paths.length + " path)");
 	}
 
 	if (join) {
