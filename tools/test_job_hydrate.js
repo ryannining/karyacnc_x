@@ -71,7 +71,12 @@ try {
   console.log('run2:', JSON.stringify(r2));
   console.log('deterministic across repeated restore:', same);
   console.log('stored snapshot unchanged after hydrate:', unchanged);
-  console.log((same && unchanged && r1.n === 1) ? 'OK: repeated-restore bug fixed' : 'FAIL: still mutating');
+
+  const snapClean = JSON.parse(JSON.stringify(snap));
+  snapClean.skipJoin = true;
+  const r3 = run(snapClean);
+  console.log('run3 (skipJoin flag):', JSON.stringify(r3));
+  console.log((same && unchanged && r1.n === 1 && r3.n === 1 && r3.t === r1.t) ? 'OK: repeated-restore + skipJoin works' : 'FAIL: still mutating');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
