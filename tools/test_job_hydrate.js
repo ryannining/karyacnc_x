@@ -77,6 +77,35 @@ try {
   const r3 = run(snapClean);
   console.log('run3 (skipJoin flag):', JSON.stringify(r3));
   console.log((same && unchanged && r1.n === 1 && r3.n === 1 && r3.t === r1.t) ? 'OK: repeated-restore + skipJoin works' : 'FAIL: still mutating');
+
+  // ---- nested containment case (outer + inner square) ----
+  const nestedInput = [
+    'X:1',
+    'P:none:#000000:0',
+    '0,0','100,0','100,100','0,100','0,0',
+    '',
+    'P:none:#000000:0',
+    '30,30','70,30','70,70','30,70','30,30',
+    ''
+  ].join('\n');
+  function collectFlips() {
+    const g = ctx.parsedGeometryData;
+    const arr = [];
+    for (const sh of (g||[])) arr.push(sh.flip ? 1 : 0);
+    return arr.join(',');
+  }
+  pathstoText1(nestedInput);
+  const freshFlips = collectFlips();
+  const snapN = JSON.parse(JSON.stringify(ctx.lastParsedSnapshot));
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, snapN);
+  const hydFlips = collectFlips();
+  const flipsEqual = freshFlips === hydFlips;
+  const hasContainment = !!(snapN.containment);
+  console.log('nested fresh flip:', freshFlips);
+  console.log('nested hydrate flip:', hydFlips);
+  console.log('nested flips equal:', flipsEqual, '| containment cached:', hasContainment);
+  console.log((flipsEqual && hasContainment) ? 'OK: nested containment cache preserves flip' : 'FAIL: flip mismatch');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);

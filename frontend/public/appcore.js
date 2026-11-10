@@ -4139,7 +4139,7 @@ var lastParsedSnapshot = null;
 function pathstoText1(gx, parsedInput) {
 	var t0 = Date.now();
 	if (parsedInput && parsedInput.paths) {
-		console.log("[JOB] memakai CACHE (parsedInput) — skip parse & join (" + parsedInput.paths.length + " path)");
+		console.log("[JOB] memakai CACHE (parsedInput) — skip parse/join/containment (" + parsedInput.paths.length + " path)");
 	} else {
 		console.log("[JOB] parse data BARU dari teks");
 	}
@@ -4320,7 +4320,12 @@ function pathstoText1(gx, parsedInput) {
 		ink_images = (parsedInput.ink_images && parsedInput.ink_images.length)
 			? JSON.parse(JSON.stringify(parsedInput.ink_images))
 			: [];
-		console.log("[JOB] hydrate dari snapshot (parsedInput) — tanpa parse teks (" + paths.length + " path)");
+		if (parsedInput.containment) {
+			for (var ci4 = 0; ci4 < parsedInput.containment.childs.length; ci4++) {
+				if (paths[ci4] && paths[ci4][9]) paths[ci4][9].childs = parsedInput.containment.childs[ci4] || 0;
+			}
+		}
+		console.log("[JOB] hydrate dari snapshot (parsedInput) — tanpa parse teks/containment (" + paths.length + " path)");
 	}
 
 	if (join) {
@@ -4458,7 +4463,7 @@ function pathstoText1(gx, parsedInput) {
 	}
 	if (!parsedInput) {
 		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: false }));
-		console.log("[JOB] parse teks selesai; snapshot (post-join) tersimpan untuk history (" + paths.length + " path)");
+		console.log("[JOB] parse teks selesai; snapshot (post-containment) tersimpan untuk history (" + paths.length + " path)");
 	}
 
 	var npaths = [];
@@ -4744,32 +4749,38 @@ function pathstoText1(gx, parsedInput) {
 			pocket1 = sty.dopocket;
 			bound1 = sty.bound;
 			carve1 = sty.dovcarve;
-			for (ii in paths) {
-				psty = paths[ii][9];
-				if (!psty.closed) continue;
-				pocket2 = (RBcolor(psty["stroke"]) == "8080");
-				carve2 = (psty["stroke"] == "#00ffff");
-				psty.pocket = pocket2;
-				bound2 = psty.bound;
+			if (parsedInput && parsedInput.containment) {
+				var cc = parsedInput.containment;
+				flip = cc.flips[i];
+				parent = cc.parents[i].slice();
+			} else {
+				for (ii in paths) {
+					psty = paths[ii][9];
+					if (!psty.closed) continue;
+					pocket2 = (RBcolor(psty["stroke"]) == "8080");
+					carve2 = (psty["stroke"] == "#00ffff");
+					psty.pocket = pocket2;
+					bound2 = psty.bound;
 
-				if (pocket1 && !pocket2) continue;
-				if (!pocket1 && pocket2) continue;
-				if (carve1 && !carve2) continue;
-				if (!carve1 && carve2) continue;
-				if (bound1 && !bound2) continue;
-				if (!bound1 && bound2) continue;
+					if (pocket1 && !pocket2) continue;
+					if (!pocket1 && pocket2) continue;
+					if (carve1 && !carve2) continue;
+					if (!carve1 && carve2) continue;
+					if (bound1 && !bound2) continue;
+					if (!bound1 && bound2) continue;
 
-				if (i == ii || paths[ii][4] < l1 || (psty["stroke"] == "#00ff00" && psty["fill"] == "none")) continue;
+					if (i == ii || paths[ii][4] < l1 || (psty["stroke"] == "#00ff00" && psty["fill"] == "none")) continue;
 
-				var d = sqr(cx - paths[ii][2]) + sqr(cy - paths[ii][3]);
-				if (sqrt(d) > paths[ii][4] + l1) continue;
-				for (var j = 0; j < path.length; j += 10) {
-					var p = path[j];
-					if ((paths[ii][4] > l1) && isInside(p[0], p[1], paths[ii][0])) {
-						if (paths[i][9].closed && (psty["fill"] != "#ffff00")) flip = !flip;
-						parent.push(ii);
-						paths[ii][9].childs++;
-						break;
+					var d = sqr(cx - paths[ii][2]) + sqr(cy - paths[ii][3]);
+					if (sqrt(d) > paths[ii][4] + l1) continue;
+					for (var j = 0; j < path.length; j += 10) {
+						var p = path[j];
+						if ((paths[ii][4] > l1) && isInside(p[0], p[1], paths[ii][0])) {
+							if (paths[i][9].closed && (psty["fill"] != "#ffff00")) flip = !flip;
+							parent.push(ii);
+							paths[ii][9].childs++;
+							break;
+						}
 					}
 				}
 			}
@@ -4777,6 +4788,14 @@ function pathstoText1(gx, parsedInput) {
 		}
 		paths[i][5] = parent;
 		sty.parent = parent;
+	}
+	if (!parsedInput) {
+		lastParsedSnapshot.containment = { flips: [], parents: [], childs: [] };
+		for (var ci3 in paths) {
+			lastParsedSnapshot.containment.flips.push(paths[ci3][1]);
+			lastParsedSnapshot.containment.parents.push((paths[ci3][5] || []).slice());
+			lastParsedSnapshot.containment.childs.push((paths[ci3][9] && paths[ci3][9].childs) || 0);
+		}
 	}
 	var etime = new Date();
 	ms = etime.getTime() - ms;
