@@ -1660,6 +1660,7 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 		var ss0 = getvalue("startat").split(",");
 		lx = (ss0[0] * 1 + maxofs) * dpm;
 		ly = (ss0[1] * 1 + maxofs) * dpm;
+		console.log("[DRAW] startat=" + getvalue("startat") + " -> lx=" + lx + " ly=" + ly + " dpm=" + dpm + " maxofs=" + maxofs + " sxmax=" + sxmax + " symax=" + symax);
 	}
 	var olx = lx;
 	var oly = ly;
@@ -4945,10 +4946,13 @@ function pathstoText1(gx, parsedInput) {
 	if (czero > 0) {
 		xzero /= czero;
 		yzero /= czero;
+		// startat (teal/posisi mesin) mengikuti translasi xofs/yofs seperti
+		// path cut, supaya konsisten dgn geometri yang sudah dipusatkan (bbox min).
+		setvalue("startat", mround2(xzero - xofs) + "," + mround2(yzero - yofs));
+	} else {
+		// Tanpa objek teal: titik start default = kiri-atas data dinormalkan (0,0).
+		setvalue("startat", "0,0");
 	}
-	// startat (teal/posisi mesin) harus mengikuti translasi xofs/yofs seperti
-	// path cut, supaya konsisten dgn geometri yang sudah dipusatkan (bbox min).
-	setvalue("startat", mround2(xzero - xofs) + "," + mround2(yzero - yofs));
 	svgMeta = { in_w: in_w, in_h: in_h };
 	svgCache = null;
 	svgDirty = true;
