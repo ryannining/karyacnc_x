@@ -4407,11 +4407,6 @@ function pathstoText1(gx, parsedInput) {
 		ink_images = (parsedInput.ink_images && parsedInput.ink_images.length)
 			? JSON.parse(JSON.stringify(parsedInput.ink_images))
 			: [];
-		if (parsedInput.containment) {
-			for (var ci4 = 0; ci4 < parsedInput.containment.childs.length; ci4++) {
-				if (paths[ci4] && paths[ci4][9]) paths[ci4][9].childs = parsedInput.containment.childs[ci4] || 0;
-			}
-		}
 		console.log("[JOB] hydrate dari snapshot (parsedInput) — tanpa parse teks/containment (" + paths.length + " path)");
 	}
 

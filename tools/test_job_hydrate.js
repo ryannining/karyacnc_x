@@ -254,6 +254,17 @@ try {
   ctx.getchecked = origGc;
   console.log('join=ON fresh contours:', jFresh, '| hydrate contours:', jHyd);
   console.log((jFresh === 2 && jHyd === 2) ? 'OK: no double-join loss (outline+hole survive)' : 'FAIL: contour lost in hydrate (double-join)');
+
+  // ---- childs must not be double-counted on hydrate (regression) ----
+  ctx.parsedGeometryData = [];
+  pathstoText1(holeInput);
+  const childsFresh = (ctx.parsedGeometryData||[]).map(sh => (sh.sty.childs || 0));
+  const snapC = JSON.parse(JSON.stringify(ctx.lastParsedSnapshot));
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, snapC);
+  const childsHyd = (ctx.parsedGeometryData||[]).map(sh => (sh.sty.childs || 0));
+  console.log('childs fresh:', childsFresh.join(','), '| hydrate:', childsHyd.join(','));
+  console.log((JSON.stringify(childsFresh) === JSON.stringify(childsHyd)) ? 'OK: childs identical fresh vs hydrate (no double-count)' : 'FAIL: childs double-counted on hydrate');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
