@@ -4648,6 +4648,15 @@ function pathstoText1(gx, parsedInput) {
 	var in_w = xma - xmi;
 	var in_h = yma - ymi;
 
+	// Hanya untuk sumber wire (express JSON): translasi gambar raster terhadap bbox
+	// supaya konsisten dgn kontur cutting (jalur teks sudah menangani sendiri).
+	if (parsedInput) {
+		for (var _im = 0; _im < ink_images.length; _im++) {
+			ink_images[_im][0] -= xofs;
+			ink_images[_im][1] -= yofs;
+		}
+	}
+
 	for (var i in cuttabs) {
 		var p = cuttabs[i];
 		p[0][0] -= xofs;
