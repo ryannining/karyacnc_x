@@ -4212,6 +4212,13 @@ function jobFromMiniSketchJSON(payload) {
 			var f0 = pts[0], l0 = pts[pts.length - 1];
 			closed = pts.length > 2 && (sqr(f0[0] - l0[0]) + sqr(f0[1] - l0[1]) < 0.01);
 		}
+		// Tutup loop secara eksplisit (tambahkan titik awal di akhir) bila closed,
+		// supaya segmen penutup ikut di-scan (mis. virtualStartPoints/intersects_p)
+		// — identik dengan perilaku jalur teks yang menutup kontur.
+		if (closed && pts.length > 2) {
+			var _f = pts[0], _l = pts[pts.length - 1];
+			if (!(_f[0] === _l[0] && _f[1] === _l[1])) pts.push([_f[0], _f[1]]);
+		}
 		var flip = (fill === "#ffff00") ? 1 : 0;
 		sty.closed = closed;
 		sty.closedExplicit = (p.closed !== undefined);

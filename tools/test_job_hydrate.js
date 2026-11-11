@@ -280,6 +280,21 @@ try {
   const gFlip = (ctx.parsedGeometryData||[]).slice(-2).map(sh => (sh.flip?1:0)).join(',');
   console.log('green wire cut flips (big,small):', gFlip);
   console.log((gFlip === '1,0') ? 'OK: green guide boxes do not flip cut direction' : 'FAIL: green boxes flipped cut direction');
+
+  // ---- wire must close loops so starttab (teal line) detects BOTH crossings ----
+  const tlWire = { type:'job', version:1, units:'mm', paths:[
+    {color:'#000000', closed:true, pts:[[50,50],[150,50],[150,150],[50,150]]},
+    {color:'#008080', closed:false, pts:[[10,100],[190,100]]}
+  ], images:[] };
+  tlWire.skipJoin = true;
+  const tlJob = ctx.jobFromMiniSketchJSON(tlWire);
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, tlJob);
+  const tlVspTotal = (ctx.virtualStartPoints||[]).reduce((a,v)=>a+v.points.length,0);
+  const tlClosedAll = (ctx.parsedGeometryData||[]).every(s=>s.closed);
+  const tlContours = (ctx.parsedGeometryData||[]).length;
+  console.log('wire teal-line total vsp crossings:', tlVspTotal, '| contours:', tlContours, '| all closed:', tlClosedAll);
+  console.log((tlVspTotal >= 2 && tlClosedAll) ? 'OK: wire closes loop, teal-line detects crossings' : 'FAIL: wire not closing loop / vsp wrong');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
