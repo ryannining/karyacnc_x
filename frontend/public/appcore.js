@@ -4864,7 +4864,7 @@ function pathstoText1(gx, parsedInput) {
 			// AMAN: containment dihitung ulang (jangan percaya cache) sampai cache
 			// terbukti sinkron dengan urutan/orientasi paths. Ganti ke true bila
 			// ingin memakai cache (lebih cepat) setelah diverifikasi.
-			var USE_CONTAINMENT_CACHE = false;
+			var USE_CONTAINMENT_CACHE = true;
 			if (USE_CONTAINMENT_CACHE && parsedInput && parsedInput.containment) {
 				var cc = parsedInput.containment;
 				flip = cc.flips[i];
