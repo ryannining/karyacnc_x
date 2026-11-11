@@ -2923,6 +2923,7 @@ function sortGcodes() {
 
 				var newtarget = [gcodes[cs], cs + 1, sflip, sshift];
 				sgcodes.push(newtarget);
+				console.log("[SORT-ORDER] pilih #" + cs + " gc8=" + gcodes[cs][8] + " closed=" + gcodes[cs][7] + " grad=" + (gcstyle[gcodes[cs][8]] ? gcstyle[gcodes[cs][8]].childs : "?") + " flip=" + (gcstyle[gcodes[cs][8]] ? gcstyle[gcodes[cs][8]].flip : "?"));
 
 
 				if (dosafesort && (!(sty.greentravel || sty.greenskip))) {
@@ -4944,7 +4945,9 @@ function pathstoText1(gx, parsedInput) {
 		xzero /= czero;
 		yzero /= czero;
 	}
-	setvalue("startat", mround2(xzero) + "," + mround2(yzero));
+	// startat (teal/posisi mesin) harus mengikuti translasi xofs/yofs seperti
+	// path cut, supaya konsisten dgn geometri yang sudah dipusatkan (bbox min).
+	setvalue("startat", mround2(xzero - xofs) + "," + mround2(yzero - yofs));
 	svgMeta = { in_w: in_w, in_h: in_h };
 	svgCache = null;
 	svgDirty = true;
