@@ -231,6 +231,29 @@ try {
   const wireF = snapshotFlips();
   console.log('wire outline+hole flip:', wireF, '| text fresh:', freshF);
   console.log((wireF === freshF) ? 'OK: wire & text flip identical' : 'FAIL: wire flip differs from text');
+
+  // ---- double-join regression: enablejoin=ON, outline+hole must both survive ----
+  const origGc = ctx.getchecked;
+  ctx.getchecked = (k) => k === 'enablejoin' ? true : false;
+  const joinInput = [
+    'X:1',
+    'P:none:#000000:0',
+    '0,0','100,0','100,100','0,100','0,0',
+    '',
+    'P:none:#000000:0',
+    '40,40','60,40','60,60','40,60','40,40',
+    ''
+  ].join('\n');
+  ctx.parsedGeometryData = [];
+  pathstoText1(joinInput);
+  const jFresh = ctx.parsedGeometryData.length;
+  const snapJ = JSON.parse(JSON.stringify(ctx.lastParsedSnapshot));
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, snapJ);
+  const jHyd = ctx.parsedGeometryData.length;
+  ctx.getchecked = origGc;
+  console.log('join=ON fresh contours:', jFresh, '| hydrate contours:', jHyd);
+  console.log((jFresh === 2 && jHyd === 2) ? 'OK: no double-join loss (outline+hole survive)' : 'FAIL: contour lost in hydrate (double-join)');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);

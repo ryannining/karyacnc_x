@@ -4235,7 +4235,10 @@ function pathstoText1(gx, parsedInput) {
 	// cuttabGrid = null;
 	// starttabGrid = null;
 
-	var join = (parsedInput && parsedInput.skipJoin) ? false : getchecked("enablejoin");
+	// Jangan join ulang bila data sudah ter-join (snapshot post-join) atau
+	// source sudah bersih (skipJoin dari wire MiniSketch). Double-join bisa
+	// menggabungkan/menghilangkan kontur (mis. kotak luar).
+	var join = (parsedInput && (parsedInput.skipJoin || parsedInput.alreadyJoined)) ? false : getchecked("enablejoin");
 	gcstyle = [];
 	gs = (gx != null) ? gx.split("\n") : [];
 	var scale = 96 / 25.4;
@@ -4547,7 +4550,7 @@ function pathstoText1(gx, parsedInput) {
 	}
 	{
 		var _sj = (parsedInput && parsedInput.skipJoin) ? true : false;
-		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: _sj }));
+		lastParsedSnapshot = JSON.parse(JSON.stringify({ paths: paths, ink_images: ink_images, skipJoin: _sj, alreadyJoined: !_sj }));
 		if (!parsedInput) {
 			console.log("[JOB] parse teks selesai; snapshot tersimpan untuk history (" + paths.length + " path)");
 		}
