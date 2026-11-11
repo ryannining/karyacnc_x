@@ -527,6 +527,7 @@ type WirePath struct {
 	Depth    *float64     `json:"depth"`
 	Sub      string       `json:"sub"`
 	ToolWidth float64      `json:"toolWidth"`
+	Weight   float64      `json:"weight"`
 	SkipJoin bool         `json:"skipJoin"`
 }
 
