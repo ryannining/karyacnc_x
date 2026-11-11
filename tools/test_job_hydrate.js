@@ -124,7 +124,7 @@ try {
   const wire = {
     type: 'job', version: 1, units: 'mm',
     paths: [
-      { color: '#000000', closed: true, depth: 3, skipJoin: true,
+      { color: '#000000', closed: true, depth: 3, skipJoin: true, weight: 5000,
         pts: [[0,0],[100,0],[100,100],[0,100]] },
       { color: '#008080', closed: false, pts: [[50,-10],[50,10]] },
       { color: '#008080', closed: true, pts: [[-5,-5],[5,-5],[5,5],[-5,5]] }
@@ -139,6 +139,9 @@ try {
   const snapW = ctx.lastParsedSnapshot;
   console.log('wire snapshot paths:', snapW ? snapW.paths.length : 'NULL', '| containment:', snapW && snapW.containment ? 'yes' : 'no', '| skipJoin:', snapW ? snapW.skipJoin : '?');
   console.log((job.paths.length === 3 && job.skipJoin === true && ctx.parsedGeometryData && ctx.parsedGeometryData.length >= 1 && snapW && snapW.containment && snapW.skipJoin === true) ? 'OK: wire MiniSketch round-trip + snapshot cache works' : 'FAIL: wire round-trip');
+  const stSort = ctx.parsedGeometryData && ctx.parsedGeometryData[0] ? ctx.parsedGeometryData[0].sty.sortadd : null;
+  console.log('wire first path sortadd (weight 5000):', stSort);
+  console.log((stSort === 5000) ? 'OK: weight -> sortadd works' : 'FAIL: weight mapping');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);

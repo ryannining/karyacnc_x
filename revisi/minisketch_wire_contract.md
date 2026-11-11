@@ -40,6 +40,7 @@
       "depth": 3.0,                // opsional, mm — MENGALAHKAN byte-hijau
       "sub": null,                 // opsional — hanya untuk engrave: null | "half_dpi"
       "toolWidth": 0,              // opsional — diameter tool
+      "weight": 0,                 // opsional — BOBOT sorting (bertanda +/-, mm penalti jarak)
       "skipJoin": true             // opsional — true = data sudah bersih, skip join/dedupe
     }
   ],
@@ -86,6 +87,7 @@ Warna adalah pembawa operasi utama (seperti Inkscape).
 | `depth` | default material profile KaryaCNC | jika ada, menggantikan byte-hijau |
 | `sub` | `null` | `"half_dpi"` hanya valid utk `engrave` |
 | `toolWidth` | default tool | diameter pisau |
+| `weight` | `0` | bobot sorting (bertanda); positif = ditunda (dijalankan akhir), negatif = didahulukan |
 | `skipJoin` | `false` | `true` = bypass join/dedupe (data sudah bersih) |
 
 ---

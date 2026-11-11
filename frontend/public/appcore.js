@@ -4136,6 +4136,11 @@ function jcJoinAllowed(chain, cand, eps, window) {
 
 var lastParsedSnapshot = null;
 
+function wireWeightToSortadd(w) {
+	var v = +w;
+	return isFinite(v) ? v : 0;
+}
+
 // SVG dibangun LAZY: hanya saat benar-benar dibutuhkan (download/preview),
 // bukan pada setiap proses/restore. Sumber kebenaran = parsedGeometryData.
 var svgCache = null;
@@ -4190,6 +4195,7 @@ function jobFromMiniSketchJSON(payload) {
 		var stro = p.color || "#000000";
 		var sty = { stroke: stro, fill: fill, "stroke-width": +p.toolWidth || 0 };
 		if (typeof p.depth === 'number' && isFinite(p.depth)) sty.strokedeep = p.depth;
+		if (typeof p.weight === 'number' && isFinite(p.weight)) sty.sortadd = p.weight;
 		var closed = (p.closed !== undefined) ? !!p.closed : false;
 		var flip = (fill === "#ffff00") ? 1 : 0;
 		paths.push([pts, flip, 0, 0, 0, [], 0, 0, closed, sty]);
@@ -4799,8 +4805,8 @@ function pathstoText1(gx, parsedInput) {
 		sty.cuttab = (paths[i][0].length == 2) && (stro == "#800000");
 		sty.isCuttab = 0;
 		sty.flip = paths[i][1];
-		sty.sortadd = 0;
-		if (RBcolor(stro) == "2b00") { sty.isblack = true; sty.sortadd = 100000; }
+		if (!(sty.sortadd > 0)) sty.sortadd = 0;
+		if (RBcolor(stro) == "2b00" && !(sty.sortadd)) { sty.isblack = true; sty.sortadd = 100000; }
 
 		sty.greenskip = sty.greenskip || sty.cuttab || (stro == "#00ff00") || (fill == "#00ff00");
 		sty.greentravel = (stro == "#008000") || (fill == "#008000");
