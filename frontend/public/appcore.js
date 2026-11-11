@@ -2858,6 +2858,7 @@ function sortGcodes() {
 
 
 					dis += gcodes[i][6] * szs;
+					if (sty.sortadd) dis += sty.sortadd;
 					var axs = xs;
 					var ays = ys;
 					if (sty.sortadd > 0) { axs = 0; ays = 0; }
