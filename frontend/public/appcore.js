@@ -4192,8 +4192,12 @@ function jobFromMiniSketchJSON(payload) {
 			var pt = p.pts[k];
 			pts.push([+pt[0], +pt[1]]);
 		}
-		var fill = p.fill || "#000000";
 		var stro = p.color || "#000000";
+		// Hijau (garis panduan/travel) tanpa fill eksplisit dianggap 'none'
+		// (sama dgn classic) supaya TIDAK ikut dihitung sbg container saat
+		// containment (menghindari flip terbalik untuk cutting di dalamnya).
+		var hasFill = (p.fill !== undefined && p.fill !== null && String(p.fill) !== '');
+		var fill = hasFill ? p.fill : ((stro === '#00ff00' || stro === '#008000') ? 'none' : '#000000');
 		var sty = { stroke: stro, fill: fill, "stroke-width": +p.toolWidth || 0 };
 		if (typeof p.depth === 'number' && isFinite(p.depth)) sty.strokedeep = p.depth;
 		if (typeof p.weight === 'number' && isFinite(p.weight)) sty.sortadd = p.weight;

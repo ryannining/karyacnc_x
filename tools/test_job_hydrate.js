@@ -265,6 +265,21 @@ try {
   const childsHyd = (ctx.parsedGeometryData||[]).map(sh => (sh.sty.childs || 0));
   console.log('childs fresh:', childsFresh.join(','), '| hydrate:', childsHyd.join(','));
   console.log((JSON.stringify(childsFresh) === JSON.stringify(childsHyd)) ? 'OK: childs identical fresh vs hydrate (no double-count)' : 'FAIL: childs double-counted on hydrate');
+
+  // ---- green guide boxes must not flip cut direction when fill missing (wire) ----
+  const greenWire = { type:'job', version:1, units:'mm', paths:[
+    {color:'#00ff00', closed:true, pts:[[0,0],[200,0],[200,200],[0,200]]},
+    {color:'#00ff00', closed:true, pts:[[10,10],[190,10],[190,190],[10,190]]},
+    {color:'#00ff00', closed:true, pts:[[20,20],[180,20],[180,180],[20,180]]},
+    {color:'#000000', closed:true, pts:[[40,40],[160,40],[160,160],[40,160]]},
+    {color:'#000000', closed:true, pts:[[80,80],[120,80],[120,120],[80,120]]}
+  ], images:[] };
+  const gJob = ctx.jobFromMiniSketchJSON(greenWire);
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, gJob);
+  const gFlip = (ctx.parsedGeometryData||[]).slice(-2).map(sh => (sh.flip?1:0)).join(',');
+  console.log('green wire cut flips (big,small):', gFlip);
+  console.log((gFlip === '1,0') ? 'OK: green guide boxes do not flip cut direction' : 'FAIL: green boxes flipped cut direction');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
