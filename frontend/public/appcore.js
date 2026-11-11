@@ -4212,6 +4212,8 @@ function jobFromMiniSketchJSON(payload) {
 		var flip = (fill === "#ffff00") ? 1 : 0;
 		sty.closed = closed;
 		sty.closedExplicit = (p.closed !== undefined);
+		sty.childs = 0;
+		sty.subchilds = 0;
 		paths.push([pts, flip, 0, 0, 0, [], 0, 0, closed, sty]);
 	}
 	var imgs = (payload && payload.images) || [];
