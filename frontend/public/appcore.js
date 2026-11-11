@@ -1654,6 +1654,13 @@ function draw_leads() {
 function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, warn, cutpos) {
 	cuttabz = getnumber("tabc");
 
+	// Skala startat (posisi mesin) ke ruang layar SEBELUM menangkap olx/oly,
+	// supaya travel pertama berangkat dari startat (bukan koordinat mentah).
+	if (firstline) {
+		var ss0 = getvalue("startat").split(",");
+		lx = (ss0[0] * 1 + maxofs) * dpm;
+		ly = (ss0[1] * 1 + maxofs) * dpm;
+	}
 	var olx = lx;
 	var oly = ly;
 	if (shift == undefined) shift = 0;
@@ -1743,12 +1750,6 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 	ctx.beginPath();
 	if (firstline) {
 		firstline = 0;
-		var ss = getvalue("startat").split(",");
-		lx = ss[0] * 1;
-		ly = ss[1] * 1;
-
-		lx = (lx + maxofs) * dpm;
-		ly = (ly + maxofs) * dpm;
 		ctx.setLineDash([]);
 		ctx.moveTo(lx - 15, ly);
 		ctx.lineTo(lx + 15, ly);
