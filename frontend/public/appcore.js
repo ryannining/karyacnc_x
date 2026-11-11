@@ -4829,7 +4829,11 @@ function pathstoText1(gx, parsedInput) {
 			pocket1 = sty.dopocket;
 			bound1 = sty.bound;
 			carve1 = sty.dovcarve;
-			if (parsedInput && parsedInput.containment) {
+			// AMAN: containment dihitung ulang (jangan percaya cache) sampai cache
+			// terbukti sinkron dengan urutan/orientasi paths. Ganti ke true bila
+			// ingin memakai cache (lebih cepat) setelah diverifikasi.
+			var USE_CONTAINMENT_CACHE = false;
+			if (USE_CONTAINMENT_CACHE && parsedInput && parsedInput.containment) {
 				var cc = parsedInput.containment;
 				flip = cc.flips[i];
 				parent = cc.parents[i].slice();
