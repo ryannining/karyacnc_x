@@ -2656,7 +2656,7 @@ function sortGcodes() {
 		}
 
 		dis = sqrt(dis);
-		if (sty.sortadd) { console.log("[SORT] findnearest sortadd=" + sty.sortadd + " disBefore=" + dis + " -> disAfter=" + (dis + sty.sortadd)); dis += sty.sortadd; }
+		if (sty.sortadd) dis += sty.sortadd;
 		return [newx, newy, dis, shift, flip];
 	}
 	var lasttarget = 0;
@@ -2776,7 +2776,6 @@ function sortGcodes() {
 	for (var kk = 0; kk < 2; kk++) {
 		for (var i = 0; i < gcodes.length; i++) {
 			var sty = gcstyle[gcodes[i][8]];
-			if (sty.sortadd) console.log("[SORT] gcode#" + i + " gc8=" + gcodes[i][8] + " sortadd=" + sty.sortadd + " closed=" + gcodes[i][7]);
 			sty.lchilds = sty.childs = sty.ochilds + sty.exchilds;
 
 		}
@@ -2859,7 +2858,7 @@ function sortGcodes() {
 
 
 					dis += gcodes[i][6] * szs;
-					if (sty.sortadd) { console.log("[SORT] sortGcodes[i=" + i + " gc8=" + gcodes[i][8] + " sortadd=" + sty.sortadd + " dis=" + dis); dis += sty.sortadd; }
+					if (sty.sortadd) dis += sty.sortadd;
 					var axs = xs;
 					var ays = ys;
 					if (sty.sortadd > 0) { axs = 0; ays = 0; }
@@ -4811,9 +4810,6 @@ function pathstoText1(gx, parsedInput) {
 		// normalkan undefined/null. Jangan nol-kan nilai non-positif.
 		if (sty.sortadd === undefined || sty.sortadd === null) sty.sortadd = 0;
 		if (RBcolor(stro) == "2b00" && !(sty.sortadd)) { sty.isblack = true; sty.sortadd = 100000; }
-		if (sty.sortadd !== 0) {
-			console.log("[JOB] bobot sortadd=" + sty.sortadd + " pada path #" + i + " (closed=" + sty.closed + ")");
-		}
 
 		sty.greenskip = sty.greenskip || sty.cuttab || (stro == "#00ff00") || (fill == "#00ff00");
 		sty.greentravel = (stro == "#008000") || (fill == "#008000");
