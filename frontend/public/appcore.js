@@ -4665,36 +4665,6 @@ function pathstoText1(gx, parsedInput) {
 
 	}
 	virtualStartPoints = [];
-	for (var i in paths) {
-		var ps = paths[i][0];
-		var closed = paths[i][8];
-		var vpoints = [];
-
-		if (closed && starttabs.length > 0) {
-			for (var k = 0; k < starttabs.length; k++) {
-				var p1 = starttabs[k][0];
-				var p2 = starttabs[k][1];
-
-				for (var e = 0; e < ps.length - 1; e++) {
-					var si = intersects_p(p1[0], p1[1], p2[0], p2[1],
-						ps[e][0], ps[e][1], ps[e + 1][0], ps[e + 1][1]);
-					if (si !== null) {
-						var ix = ps[e][0] + si * (ps[e + 1][0] - ps[e][0]);
-						var iy = ps[e][1] + si * (ps[e + 1][1] - ps[e][1]);
-						vpoints.push([ix, iy]);
-
-						// // Insert point ke path setelah index e
-						// ps.splice(e + 1, 0, [ix, iy]);
-						// e++; // skip inserted point untuk iterasi berikutnya
-					}
-				}
-			}
-		}
-		virtualStartPoints.push({
-			points: vpoints,
-			realPointCache: null  // lazy computed
-		});
-	}
 	// Build spatial-hash indices for cuttab and starttab segments so the
 	// O(E·T) intersection scan in prepare_line2 becomes O(E·k). Each entry
 	// in arr is [p1, p2], indexed by segment midpoint. Cell size = 1.0
@@ -4766,6 +4736,36 @@ function pathstoText1(gx, parsedInput) {
 		paths[i][6] = xma - xmi;
 		paths[i][7] = yma - ymi;
 	}
+
+	// Bangun virtualStartPoints SETELAH kontur ditranslasi (xofs/yofs) supaya
+	// starttabs (yang sudah ditranslasi) di-test terhadap koordinat kontur yang
+	// JAU juga. Sebelumnya, saat koordinat besar (express JSON), terjadi mismatch
+	// sehingga start_point teal tak pernah terdeteksi (vpoints=0).
+	for (var i in paths) {
+		var ps = paths[i][0];
+		var closed = paths[i][8];
+		var vpoints = [];
+		if (closed && starttabs.length > 0) {
+			for (var k = 0; k < starttabs.length; k++) {
+				var p1 = starttabs[k][0];
+				var p2 = starttabs[k][1];
+				for (var e = 0; e < ps.length - 1; e++) {
+					var si = intersects_p(p1[0], p1[1], p2[0], p2[1],
+						ps[e][0], ps[e][1], ps[e + 1][0], ps[e + 1][1]);
+					if (si !== null) {
+						var ix = ps[e][0] + si * (ps[e + 1][0] - ps[e][0]);
+						var iy = ps[e][1] + si * (ps[e + 1][1] - ps[e][1]);
+						vpoints.push([ix, iy]);
+					}
+				}
+			}
+		}
+		virtualStartPoints.push({
+			points: vpoints,
+			realPointCache: null  // lazy computed
+		});
+	}
+
 	var etime = new Date();
 	var ms = etime.getTime();
 
