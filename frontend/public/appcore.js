@@ -4206,6 +4206,8 @@ function jobFromMiniSketchJSON(payload) {
 			closed = pts.length > 2 && (sqr(f0[0] - l0[0]) + sqr(f0[1] - l0[1]) < 0.01);
 		}
 		var flip = (fill === "#ffff00") ? 1 : 0;
+		sty.closed = closed;
+		sty.closedExplicit = (p.closed !== undefined);
 		paths.push([pts, flip, 0, 0, 0, [], 0, 0, closed, sty]);
 	}
 	var imgs = (payload && payload.images) || [];
@@ -4796,7 +4798,7 @@ function pathstoText1(gx, parsedInput) {
 			stro = "#00" + gray + "ff";
 			sty["stroke"] = stro;
 		}
-		sty.closed = mind < 0.1 ? false : sqrt(sqr(path[0][0] - path[path.length - 1][0]) + sqr(path[0][1] - path[path.length - 1][1])) < mind;
+		if (!sty.closedExplicit) sty.closed = mind < 0.1 ? false : sqrt(sqr(path[0][0] - path[path.length - 1][0]) + sqr(path[0][1] - path[path.length - 1][1])) < mind;
 		sty.deep = paths[i][5].length;
 		sty.doEngrave = (RBcolor(stro) == "00ff") || (RBcolor(stro) == "0080");
 		sty.halfDPI = (RBcolor(stro) == "0080");

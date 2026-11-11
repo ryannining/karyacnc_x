@@ -22,7 +22,18 @@ const ctx = {
   mround: x => Math.round(x),
   mround2: x => Math.round(x),
   mround1: x => Math.round(x),
-  isInside: () => false,
+  // real point-in-polygon (ray cast), signature used by pathstoText1
+  isInside: (x, y, poly) => {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0], yi = poly[i][1];
+      const xj = poly[j][0], yj = poly[j][1];
+      const intersect = ((yi > y) !== (yj > y)) &&
+        (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  },
   // segment intersection used by virtualStartPoints (returns t along AB or null)
   intersect_point: (A, B, C, D) => {
     const x1 = A[0], y1 = A[1], x2 = B[0], y2 = B[1];
@@ -170,6 +181,56 @@ try {
   const stNeg = ctx.parsedGeometryData && ctx.parsedGeometryData[0] ? ctx.parsedGeometryData[0].sty.sortadd : null;
   console.log('negative weight sortadd:', stNeg);
   console.log((stNeg === -10000) ? 'OK: negative weight preserved' : 'FAIL: negative weight zeroed');
+
+  // Outline + hole (nested real case): compare fresh vs hydrate final flip + points
+  const holeInput = [
+    'X:1',
+    'P:none:#000000:0',
+    '0,0','100,0','100,100','0,100','0,0',
+    '',
+    'P:none:#000000:0',
+    '40,40','60,40','60,60','40,60','40,40',
+    ''
+  ].join('\n');
+  function snapshotFlips() {
+    const g = ctx.parsedGeometryData;
+    return (g||[]).map(sh => (sh.flip ? 1 : 0)).join(',');
+  }
+  function snapshotPts() {
+    const g = ctx.parsedGeometryData;
+    return (g||[]).map(sh => sh.points.length).join(',');
+  }
+  pathstoText1(holeInput);
+  const freshF = snapshotFlips();
+  const freshPts = snapshotPts();
+  const snapH = JSON.parse(JSON.stringify(ctx.lastParsedSnapshot));
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, snapH);
+  const hydF = snapshotFlips();
+  const hydPts = snapshotPts();
+  console.log('outline+hole fresh flip:', freshF, '| hydrate flip:', hydF);
+  console.log('outline+hole points fresh:', freshPts, '| hydrate:', hydPts);
+  // SEMANTIK: pada kasus nested, hole harus flip BERLAWANAN dgn outline (yaitu
+  // salah satunya ter-inversi oleh containment). Bukan sekadar konsistensi.
+  const fArr = freshF.split(',').map(Number);
+  const holeDistinct = fArr.length >= 2 && fArr[0] !== fArr[1];
+  console.log('SEMANTIK outline flip != hole flip:', holeDistinct, '(fresh flip=', freshF, ')');
+  console.log((freshF === hydF && freshPts === hydPts && holeDistinct) ? 'OK: outline+hole flip & pts identical fresh vs hydrate, hole distinct' : (holeDistinct ? 'OK: hole distinct; konsistensi gagal' : 'FAIL: hole TIDAK dibedakan dari outline (gejala bug)'));
+
+  // Compare TEXT path vs WIRE path for identical geometry (flip)
+  const wireHole = {
+    type: 'job', version: 1, units: 'mm',
+    paths: [
+      { color: '#000000', closed: true, pts: [[0,0],[100,0],[100,100],[0,100]] },
+      { color: '#000000', closed: true, pts: [[40,40],[60,40],[60,60],[40,60]] }
+    ], images: []
+  };
+  const jobH = ctx.jobFromMiniSketchJSON(wireHole);
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, jobH);
+  const wireF = snapshotFlips();
+  console.log('wire outline+hole flip:', wireF, '| text fresh:', freshF);
+  console.log((wireF === freshF) ? 'OK: wire & text flip identical' : 'FAIL: wire flip differs from text');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
