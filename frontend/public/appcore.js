@@ -4807,6 +4807,9 @@ function pathstoText1(gx, parsedInput) {
 		sty.flip = paths[i][1];
 		if (!(sty.sortadd > 0)) sty.sortadd = 0;
 		if (RBcolor(stro) == "2b00" && !(sty.sortadd)) { sty.isblack = true; sty.sortadd = 100000; }
+		if (sty.sortadd !== 0) {
+			console.log("[JOB] bobot sortadd=" + sty.sortadd + " pada path #" + i + " (closed=" + sty.closed + ")");
+		}
 
 		sty.greenskip = sty.greenskip || sty.cuttab || (stro == "#00ff00") || (fill == "#00ff00");
 		sty.greentravel = (stro == "#008000") || (fill == "#008000");
