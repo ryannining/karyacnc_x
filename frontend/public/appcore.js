@@ -4197,7 +4197,14 @@ function jobFromMiniSketchJSON(payload) {
 		var sty = { stroke: stro, fill: fill, "stroke-width": +p.toolWidth || 0 };
 		if (typeof p.depth === 'number' && isFinite(p.depth)) sty.strokedeep = p.depth;
 		if (typeof p.weight === 'number' && isFinite(p.weight)) sty.sortadd = p.weight;
-		var closed = (p.closed !== undefined) ? !!p.closed : false;
+		// closed: jika tidak dikirim, deteksi dari ujung (seperti jalur teks)
+		var closed;
+		if (p.closed !== undefined) {
+			closed = !!p.closed;
+		} else {
+			var f0 = pts[0], l0 = pts[pts.length - 1];
+			closed = pts.length > 2 && (sqr(f0[0] - l0[0]) + sqr(f0[1] - l0[1]) < 0.01);
+		}
 		var flip = (fill === "#ffff00") ? 1 : 0;
 		paths.push([pts, flip, 0, 0, 0, [], 0, 0, closed, sty]);
 	}
