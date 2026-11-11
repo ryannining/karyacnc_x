@@ -142,6 +142,34 @@ try {
   const stSort = ctx.parsedGeometryData && ctx.parsedGeometryData[0] ? ctx.parsedGeometryData[0].sty.sortadd : null;
   console.log('wire first path sortadd (weight 5000):', stSort);
   console.log((stSort === 5000) ? 'OK: weight -> sortadd works' : 'FAIL: weight mapping');
+
+  // Inkscape-style #2B0000 vs weight
+  const w2 = {
+    type: 'job', version: 1, units: 'mm',
+    paths: [
+      { color: '#2B0000', closed: true, pts: [[0,0],[10,0],[10,10],[0,10]] }
+    ], images: []
+  };
+  const job2 = ctx.jobFromMiniSketchJSON(w2);
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, job2);
+  const st2 = ctx.parsedGeometryData && ctx.parsedGeometryData[0] ? ctx.parsedGeometryData[0].sty.sortadd : null;
+  console.log('legacy #2B0000 sortadd:', st2);
+  console.log((st2 === 100000) ? 'OK: legacy #2B0000 -> sortadd 100000' : 'FAIL: legacy mapping');
+
+  // Negative weight must survive (not zeroed)
+  const wNeg = {
+    type: 'job', version: 1, units: 'mm',
+    paths: [
+      { color: '#000000', closed: true, weight: -10000, pts: [[0,0],[10,0],[10,10],[0,10]] }
+    ], images: []
+  };
+  const jobNeg = ctx.jobFromMiniSketchJSON(wNeg);
+  ctx.parsedGeometryData = [];
+  pathstoText1(null, jobNeg);
+  const stNeg = ctx.parsedGeometryData && ctx.parsedGeometryData[0] ? ctx.parsedGeometryData[0].sty.sortadd : null;
+  console.log('negative weight sortadd:', stNeg);
+  console.log((stNeg === -10000) ? 'OK: negative weight preserved' : 'FAIL: negative weight zeroed');
 } catch (e) {
   console.error('ERROR:', e.stack);
   process.exit(1);
