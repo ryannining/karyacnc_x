@@ -1065,7 +1065,6 @@ function prepare_line2(lenmm, lines, ofs1) {
 											var si = intersects_p(p1[0], p1[1], p2[0], p2[1], ox, oy, x, y);
 											if (si != null) {
 												si = s + ds * (si);
-												console.log("Intersect at" + (si));
 												cuts.push(si);
 											}
 										}
@@ -2583,7 +2582,6 @@ function sortGcodes() {
 
 			// Lazy compute cache
 			if (vdata.realPointCache === null) {
-				console.log("calc start point cache");
 				vdata.realPointCache = [];
 				for (var v = 0; v < vdata.points.length; v++) {
 					var bestIdx = 0;
@@ -2713,6 +2711,7 @@ function sortGcodes() {
 			var _medSpan = _spans[Math.floor(_nG / 2)] || 0;
 			var _srtCell = Math.max(Math.abs(_medSpan) / 8, _extent / 32, 1.0);
 			srtGrid = { grid: Object.create(null), cellSize: _srtCell };
+			var _gMinCx = Infinity, _gMaxCx = -Infinity, _gMinCy = Infinity, _gMaxCy = -Infinity;
 			for (var _gi2 = 0; _gi2 < _nG; _gi2++) {
 				var _p = gcodes[_gi2][4];
 				if (!_p || _p.length === 0) continue;
@@ -2721,7 +2720,13 @@ function sortGcodes() {
 				var _k = _ccx + "," + _ccy;
 				if (!srtGrid.grid[_k]) srtGrid.grid[_k] = [];
 				srtGrid.grid[_k].push(_gi2);
+				if (_ccx < _gMinCx) _gMinCx = _ccx;
+				if (_ccx > _gMaxCx) _gMaxCx = _ccx;
+				if (_ccy < _gMinCy) _gMinCy = _ccy;
+				if (_ccy > _gMaxCy) _gMaxCy = _ccy;
 			}
+			srtGrid.minCx = _gMinCx; srtGrid.maxCx = _gMaxCx;
+			srtGrid.minCy = _gMinCy; srtGrid.maxCy = _gMaxCy;
 		}
 	}
 
@@ -2738,17 +2743,9 @@ function sortGcodes() {
 		var _cs = srtGrid.cellSize;
 		var _ccx0 = Math.floor(x / _cs);
 		var _ccy0 = Math.floor(y / _cs);
-		// Compute L-inf max ring needed to cover the grid extent
-		var _minCx = Infinity, _maxCx = -Infinity, _minCy = Infinity, _maxCy = -Infinity;
-		for (var _gk in srtGrid.grid) {
-			var _cma = _gk.indexOf(",");
-			var _gcx = +_gk.substring(0, _cma);
-			var _gcy = +_gk.substring(_cma + 1);
-			if (_gcx < _minCx) _minCx = _gcx;
-			if (_gcx > _maxCx) _maxCx = _gcx;
-			if (_gcy < _minCy) _minCy = _gcy;
-			if (_gcy > _maxCy) _maxCy = _gcy;
-		}
+		// Pakai batas grid yang sudah di-cache saat build (minCx/maxCx/…)
+		// — tidak perlu menscan semua sel tiap query.
+		var _minCx = srtGrid.minCx, _maxCx = srtGrid.maxCx, _minCy = srtGrid.minCy, _maxCy = srtGrid.maxCy;
 		var _maxR = Math.max(_maxCx - _ccx0, _ccx0 - _minCx, _maxCy - _ccy0, _ccy0 - _minCy) + 1;
 		if (!isFinite(_maxR) || _maxR < 1) _maxR = 1;
 		var _seen = Object.create(null);
@@ -2774,6 +2771,11 @@ function sortGcodes() {
 		}
 		return _out;
 	}
+
+	// Daftar index shape yang BELUM dikerjakan — dipakai oleh fallback
+	// Fase 2 agar tidak menscan semua N setiap kali (hanya yang tersisa).
+	var _remaining = [];
+	for (var _rr = 0; _rr < gcodes.length; _rr++) _remaining.push(_rr);
 
 	for (var kk = 0; kk < 2; kk++) {
 		for (var i = 0; i < gcodes.length; i++) {
@@ -2826,21 +2828,26 @@ function sortGcodes() {
 
 				}
 				// Spatial-hash-accelerated nearest-polygon scan. Query the
-				// expanding ring around (lx, ly) until we have enough
-				// candidates or the grid is exhausted. If exhausted and we
-				// still have room, fall back to the remaining gcodes that
-				// aren't in the seen set (preserves correctness even when
-				// the grid cell size is too small for the workspace).
-				var _qResults = srtQuery(lx, ly, gcodes.length);
-				for (var _qi = 0; _qi < _qResults.length; _qi++) {
-					var i = _qResults[_qi];
+				// expanding ring around (lx, ly) for a BOUNDED candidate set
+				// (SORT_CANDIDATE_LIMIT). Karena greedy sort dipengaruhi modifier
+				// jarak dan guard child/parent, set terbatas bisa saja tidak
+				// memuat kandidat layak pada suatu langkah — maka Fase 2 di
+				// bawah melakukan fallback scan penuh agar kelengkapan selalu
+				// terjamin (semua shape dikerjakan, hanya urutan yang berubah).
+				// Evaluasi satu kandidat (index i) terhadap head (lx,ly) saat ini.
+				// Mengembalikan true jika i adalah kandidat LAYAK (eligible, belum
+				// dikerjakan dan tidak diblokir guard child/parent).
+				function _evalCandidate(i) {
+					// Lewati yang sudah dikerjakan (area negatif) SEJAK AWAL —
+					// hindari biaya findnearest untuk shape yang tak akan dipilih.
+					if (!(gcodes[i][6] > 0)) return false;
 					var sty = gcstyle[gcodes[i][8]];
 					var subch = gcodes[i][10];
-					k1 = sty.doEngrave || sty.domarking || sty.dovcarve || sty.dopocket;
-					if (kk == (k1 ? 1 : 0) && sepcut) continue;
-					if (!k1) {
-						if (subch == 0 && sty.subchilds > 0) continue;
-						if (sty.childs > 0) continue;
+					var k1c = sty.doEngrave || sty.domarking || sty.dovcarve || sty.dopocket;
+					if (kk == (k1c ? 1 : 0) && sepcut) return false;
+					if (!k1c) {
+						if (subch == 0 && sty.subchilds > 0) return false;
+						if (sty.childs > 0) return false;
 					}
 					var dis = 0;
 					if (sparent != -1 && usefinishpart && (sparent == sty.topparent || sparent == sty.idp)) dis = -10000;
@@ -2901,7 +2908,27 @@ function sortGcodes() {
 						sshift = shift;
 						sflip = flip;
 						bg = dis;
+					}
+					return (gcodes[i][6] > 0);
+				}
 
+				// Fase 1: query terbatas (candidate set kecil) — kasus umum yang
+				// cepat (O(N·K)). Grid query mengembalikan K terdekat dari head.
+				var SORT_CANDIDATE_LIMIT = 256;
+				var _qResults = srtQuery(lx, ly, Math.min(gcodes.length, SORT_CANDIDATE_LIMIT));
+				var _anyEligible = false;
+				for (var _qi = 0; _qi < _qResults.length; _qi++) {
+					if (_evalCandidate(_qResults[_qi])) _anyEligible = true;
+				}
+
+				// Fase 2 (jaminan kelengkapan): bila ternyata di set terbatas
+				// tidak ada kandidat layak (mis. semua terblokir guard child/near
+				// atau jauh ditarik modifier jarak), fallback ke scan PENUH atas
+				// seluruh gcode yang tersisa. Ini memastikan TIDAK ada shape yang
+				// terlewat — hanya urutan yang bisa berbeda, bukan hasilnya.
+				if (!_anyEligible) {
+					for (var _fi = 0; _fi < _remaining.length; _fi++) {
+						if (_evalCandidate(_remaining[_fi])) _anyEligible = true;
 					}
 				}
 			} else cs = j;
@@ -2919,13 +2946,15 @@ function sortGcodes() {
 				}
 				if (!(sty.greenskip || sty.greentravel)) sparent = sty.topparent;
 				gcodes[cs][6] = -gcodes[cs][6];
+				// Koreksi daftar sisa: shape ini sudah dikerjakan (hapus via swap-pop).
+				var _ri = _remaining.indexOf(cs);
+				if (_ri >= 0) { _remaining[_ri] = _remaining[_remaining.length - 1]; _remaining.pop(); }
 				var pts = gcodes[cs][4];
 				lx = pts[sshift][1];
 				ly = pts[sshift][2];
 
 				var newtarget = [gcodes[cs], cs + 1, sflip, sshift];
 				sgcodes.push(newtarget);
-				console.log("[SORT-ORDER] pilih #" + cs + " gc8=" + gcodes[cs][8] + " closed=" + gcodes[cs][7] + " grad=" + (gcstyle[gcodes[cs][8]] ? gcstyle[gcodes[cs][8]].childs : "?") + " flip=" + (gcstyle[gcodes[cs][8]] ? gcstyle[gcodes[cs][8]].flip : "?"));
 
 
 				if (dosafesort && (!(sty.greentravel || sty.greenskip))) {

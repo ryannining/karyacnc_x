@@ -798,6 +798,34 @@ function setprofile() {
     loadProfileIntoForm(sel.name, sel.src);
 }
 
+// Cache JSON terakhir per key agar savesetting() TIDAK menulis berulang
+// ke localStorage saat tidak ada yang berubah. Ini menghindari biaya
+// storage.setItem + JSON.stringify data besar (history, gcstyle, dll.)
+// pada panggilan yang redundan (mis. di dalam jalur rebuild).
+var _savesettingKeyCache = {};
+
+// Tulis key hanya jika nilai serialized-nya berubah. Mengembalikan true
+// jika benar-benar menulis (ada perubahan). Aman: perubahan apa pun yang
+// asli tetap terdeteksi oleh perbandingan string, jadi tidak ada data yang
+// hilang — hanya tulis yang redundant yang dilewati.
+function storeIfChanged(key, val) {
+    var s;
+    try { s = JSON.stringify(val); } catch (e) { return false; }
+    if (_savesettingKeyCache[key] === s) return false;
+    try {
+        storage.setItem(key, s);
+        _savesettingKeyCache[key] = s;
+        return true;
+    } catch (e) {
+        if (e.name === 'QuotaExceededError') {
+            console.warn('Storage quota exceeded for key:', key);
+            // Tidak update cache: biarkan mencoba lagi saat kuota tersedia.
+            return false;
+        }
+        throw e;
+    }
+}
+
 function savesetting(name) {
     if (name == undefined) name = "";
     var a = document.getElementsByClassName("saveit");
@@ -824,22 +852,17 @@ function savesetting(name) {
         ebounds: engravebounds,
         jobsettings: jobsettings
     };
+    // Hanya tulis + publish jika ada yang benar-benar berubah.
+    var changedAny = false;
     for (var key in storageData) {
-        try {
-            storage.setItem(key, JSON.stringify(storageData[key]));
-        } catch (e) {
-            if (e.name === 'QuotaExceededError') {
-                console.warn('Storage quota exceeded for key:', key);
-                // Lanjutkan menyimpan item lain
-            } else {
-                throw e;
-            }
-        }
+        if (storeIfChanged(key, storageData[key])) changedAny = true;
     }
-    updatedownloadprofile();
-    updatedownloadsvg();
-    // PC master: publish profil terbaru ke backend untuk diserve ke slave.
-    pushProfilesToMaster();
+    if (changedAny) {
+        updatedownloadprofile();
+        updatedownloadsvg();
+        // PC master: publish profil terbaru ke backend untuk diserve ke slave.
+        pushProfilesToMaster();
+    }
 }
 
 // ============================================================
