@@ -1420,7 +1420,7 @@ function pocketcarve(tofs, ofs1, clines) {
 function pocketgcode() {
 	pockettime = 0;
 	if (cglines.length == 0) return;
-	// Kedalaman pocket per-shape dibawa di sglines[j][2] (dari conline[i][1] =
+	// Kedalaman pocket per-shape dibawa di sglines[j][1] (dari conline[i][1] =
 	// pocketdeep, yang sudah menghormati sty.strokedeep). `carved` dipakai hanya
 	// sebagai FALLBACK bila tidak ada nilai per-shape, bukan nilai absolut, agar
 	// override depth per-part tetap berlaku untuk pocket (garis ungu).
@@ -1511,7 +1511,9 @@ function pocketgcode() {
 			var _deep = cglines[cs][4];
 			if (!(typeof _deep === 'number' && isFinite(_deep) && _deep > 0)) _deep = carvedeep;
 			lastcut.push(lines);
-			sglines.push([lines, _deep, cglines[cs][4], cglines[cs][6], shifti, first ? f3 : f2, slow, first]);
+			// sglines[j][1] (index 1) = kedalaman efektif; sglines[j][2] (index 2)
+			// = carved fallback. Pemakaian Z di bawah membaca index 1.
+			sglines.push([lines, _deep, carvedeep, cglines[cs][6], shifti, first ? f3 : f2, slow, first]);
 			first = cglines[cs][6];
 			cglines[cs][5] = -1;
 			lastlines = lines;
@@ -1526,16 +1528,18 @@ function pocketgcode() {
 		var gline = sglines[j][0];
 		f2 = sglines[j][5];
 		gline = arrayRotate(gline, sglines[j][4]);
-		var _re = Math.ceil(sglines[j][2] / (j == 0 ? rz1 : rz));
+		// Kedalaman efektif (override per-shape bila ada, fallback carved) di index 1.
+		var pocketDepth = sglines[j][1];
+		var _re = Math.ceil(pocketDepth / (j == 0 ? rz1 : rz));
 		if (CMD_CNC) {
-			pup2 = re == 1 ? "" : "G0 F" + speedretract + " Z" + mround(-sglines[j][2] / re) + "\n";
+			pup2 = re == 1 ? "" : "G0 F" + speedretract + " Z" + mround(-pocketDepth / re) + "\n";
 		}
-		var _rz = sglines[j][2] / (_re);
+		var _rz = pocketDepth / (_re);
 		var a = sglines[j][1];
 		var slow = sglines[j][6];
 		if (slow) {
-			_re = Math.ceil(sglines[j][2] / rz1);
-			_rz = sglines[j][2] / (_re);
+			_re = Math.ceil(pocketDepth / rz1);
+			_rz = pocketDepth / (_re);
 		}
 		var lstF = 0;
 		var jump;
