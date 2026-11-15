@@ -1420,6 +1420,10 @@ function pocketcarve(tofs, ofs1, clines) {
 function pocketgcode() {
 	pockettime = 0;
 	if (cglines.length == 0) return;
+	// Kedalaman pocket per-shape dibawa di sglines[j][2] (dari conline[i][1] =
+	// pocketdeep, yang sudah menghormati sty.strokedeep). `carved` dipakai hanya
+	// sebagai FALLBACK bila tidak ada nilai per-shape, bukan nilai absolut, agar
+	// override depth per-part tetap berlaku untuk pocket (garis ungu).
 	var carvedeep = getnumber('carved');
 	var f2 = getnumber('vcarvefeed') * 60;
 	var f3 = f2 * 0.7;
@@ -1502,8 +1506,12 @@ function pocketgcode() {
 			var lines = cglines[cs][0];
 			lx = lines[shifti][0];
 			ly = lines[shifti][1];
+			// Kedalaman override per-shape untuk pocket (cglines[cs][4]). Bila
+			// tidak ada / tidak valid, pakai carved global (fallback).
+			var _deep = cglines[cs][4];
+			if (!(typeof _deep === 'number' && isFinite(_deep) && _deep > 0)) _deep = carvedeep;
 			lastcut.push(lines);
-			sglines.push([lines, cglines[cs][1], cglines[cs][4], cglines[cs][6], shifti, first ? f3 : f2, slow, first]);
+			sglines.push([lines, _deep, cglines[cs][4], cglines[cs][6], shifti, first ? f3 : f2, slow, first]);
 			first = cglines[cs][6];
 			cglines[cs][5] = -1;
 			lastlines = lines;

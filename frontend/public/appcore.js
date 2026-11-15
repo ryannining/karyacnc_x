@@ -3103,7 +3103,14 @@ function emitGcodeOnly(source) {
 			lenmm = sgcodes[j][0][0];
 			var sty = gcstyle[snum];
 			if (sty == undefined) sty = defaultsty;
-			if (!sty.closed) vcuttab = cncdeep;
+			// Depth override per-shape: jika sty.strokedeep > 0, nilai itu (mm,
+			// positif) menjadi kedalaman POTONG shape ini — menggantikan kedalaman
+			// default (cncdeep / carved) untuk SEMUA jenis operasi (cut, engrave,
+			// mark). Tanpa override, effCutDepth == cncdeep sehingga perilaku
+			// lama tidak berubah. Internal disimpan negatif (arah turun).
+			var strokedeep = sty.strokedeep;
+			var effCutDepth = (strokedeep > 0) ? -strokedeep : cncdeep;
+			if (!sty.closed) vcuttab = effCutDepth;
 			var f2 = getvalue('feed') * 60;
 
 			if ((ov > 0) && (cmd == CMD_CNC)) {
@@ -3124,7 +3131,7 @@ function emitGcodeOnly(source) {
 				else _re += Math.floor(slsmallv);
 
 			}
-			var zdown = cncdeep / _re;
+			var zdown = effCutDepth / _re;
 			var ismark = marking_cut.indexOf(sgcodes[j][1] + "") >= 0;
 			if (ismark) {
 				zdown = -1;
@@ -3133,7 +3140,6 @@ function emitGcodeOnly(source) {
 			var docarve = 0;
 			var iscut = 1;
 			var iseng = 0;
-			var strokedeep = sty.strokedeep;
 
 			var _rz = getnumber("firstd");
 
@@ -3188,7 +3194,7 @@ function emitGcodeOnly(source) {
 
 			if (fnl) {
 				_re = 1;
-				var zdown = cncdeep;
+				var zdown = effCutDepth;
 			}
 			cncz = zdown;
 			var cncz2 = 0;
