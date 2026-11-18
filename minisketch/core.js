@@ -1742,6 +1742,70 @@ function lineLineIntersect(a, b, c, d) {
   return [{ x: a.x + rx * t, y: a.y + ry * t }];
 }
 
+// Axis-aligned bounds of a point list. Used by the drag-wall collision cache:
+// every obstacle and every candidate wall gets one box before the (much more
+// expensive) segment sweep.
+function polyBBox(pts) {
+  if (!pts || !pts.length) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (!p || !isFinite(p.x) || !isFinite(p.y)) continue;
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+}
+
+function bboxOverlap(a, b) {
+  if (!a || !b) return false;
+  return a.minX <= b.maxX && a.maxX >= b.minX &&
+         a.minY <= b.maxY && a.maxY >= b.minY;
+}
+
+// Inclusive segment intersection, including touching and collinear overlap.
+// The wall is a clearance envelope: a wall that merely touches an obstacle is
+// already a collision. The orientation tests are the standard ones; the small
+// epsilon keeps a shared endpoint (two contours that meet exactly) from being
+// missed by a floating-point sign flip.
+function segmentsIntersect(a, b, c, d) {
+  const orient = (p, q, r) =>
+    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const onSeg = (p, q, r) =>
+    r.x >= Math.min(p.x, q.x) - 1e-9 && r.x <= Math.max(p.x, q.x) + 1e-9 &&
+    r.y >= Math.min(p.y, q.y) - 1e-7 && r.y <= Math.max(p.y, q.y) + 1e-7 &&
+    Math.abs(orient(p, q, r)) <= 1e-7;
+  const o1 = orient(a, b, c);
+  const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a);
+  const o4 = orient(c, d, b);
+  if (((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) &&
+      ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0))) return true;
+  if (onSeg(a, b, c) || onSeg(a, b, d) || onSeg(c, d, a) || onSeg(c, d, b)) return true;
+  return false;
+}
+
+// Boundary-only intersection between two polylines / polygons. Area containment
+// is deliberately NOT tested here: a part placed inside a sheet outline is a
+// valid nesting layout, and a filled-area test would refuse it. What must not
+// happen is one boundary crossing another.
+function polylineIntersectsPolyline(ptsA, closedA, ptsB, closedB) {
+  const na = ptsA ? ptsA.length : 0;
+  const nb = ptsB ? ptsB.length : 0;
+  if (na < 2 || nb < 2) return false;
+  const ea = closedA ? na : na - 1;
+  const eb = closedB ? nb : nb - 1;
+  for (let i = 0; i < ea; i++) {
+    const a = ptsA[i], b = ptsA[(i + 1) % na];
+    for (let j = 0; j < eb; j++) {
+      const c = ptsB[j], d = ptsB[(j + 1) % nb];
+      if (segmentsIntersect(a, b, c, d)) return true;
+    }
+  }
+  return false;
+}
+
 function lineCircleIntersect(a, b, c, r) {
   const dx = b.x - a.x, dy = b.y - a.y;
   const fx = a.x - c.x, fy = a.y - c.y;
@@ -2211,11 +2275,11 @@ function dxfEmit(rec, blocks, t, out, depth) {
 
 // ---- PDF -------------------------------------------------------------------
 // Minimal PDF vector reader: decompress content streams and turn painted paths
-// into node/handle primitives (the same shape the spline model uses). No font
-// parsing: text is skipped (CAD exports outline their text anyway), and clip
-// regions are ignored. Coordinates stay in raw PDF user space.
+// into node/handle primitives (the same shape the spline model uses). Text is
+// extracted as note primitives (the app imports them as comments or text
+// objects); clip regions are ignored. Coordinates stay in raw PDF user space.
 
-function pdfTokens(content) {
+function pdfTokens(content, uniMap) {
   const out = [];
   let i = 0;
   const n = content.length;
@@ -2257,21 +2321,21 @@ function pdfTokens(content) {
       let j = content.indexOf('>', i);
       j = j < 0 ? n : j + 1;
       // HEX string (e.g. <0049><0055> inside a TJ array — how many CAD/PDF
-      // writers encode text): pairs of hex digits are bytes. CID exports write
-      // the glyph id UTF-16BE-style as 4-digit groups, so when the length is a
-      // multiple of 4 and every other byte is zero treat it as UTF-16BE,
-      // otherwise as latin1 pairs.
+      // writers encode text). Two encodings show up:
+      //   - simple fonts: pairs of hex digits are single-byte character codes
+      //   - Type0 / Identity-H: 4-digit groups are 2-byte glyph codes, and the
+      //     file's ToUnicode CMap (uniMap) is keyed by those 16-bit codes.
+      // Pick 16-bit units when the CMap knows them, otherwise fall back to
+      // bytes (which also covers UTF-16BE text, high byte zero).
       const hex = content.slice(i + 1, j).replace(/[^0-9A-Fa-f]/g, '');
       let v = '';
       if (hex.length >= 4 && hex.length % 4 === 0) {
-        let utf16 = true;
-        for (let k = 0; k + 3 < hex.length; k += 4) {
-          if (parseInt(hex.slice(k, k + 2), 16) !== 0) { utf16 = false; break; }
-        }
-        if (utf16) {
-          for (let k = 0; k + 3 < hex.length; k += 4) {
-            v += String.fromCharCode(parseInt(hex.slice(k + 2, k + 4), 16));
-          }
+        const units = [];
+        for (let k = 0; k + 3 < hex.length; k += 4) units.push(parseInt(hex.slice(k, k + 4), 16));
+        const as16 = units.some(c => uniMap && uniMap.has(String.fromCharCode(c)));
+        const utf16be = !(uniMap && uniMap.size) && units.every(c => c < 0x100);
+        if (as16 || utf16be) {
+          v = units.map(c => String.fromCharCode(c)).join('');
         }
       }
       if (!v) {
@@ -2352,8 +2416,8 @@ function decodePdfString(s) {
 // Parse one PDF content stream into primitives:
 //   { color, closed, nodes: [{ p:[x,y], o:[x,y]|null, i:[x,y]|null }] }
 // and note primitives for text: { kind:'note', x, y, text }
-function pdfContentPrims(content, uniMap) {
-  const toks = pdfTokens(String(content));
+function pdfContentPrims(content, uniMap, fonts, ocg) {
+  const toks = pdfTokens(String(content), uniMap);
   const out = [];
   let ctm = [1, 0, 0, 1, 0, 0];
   const stack = [];
@@ -2366,24 +2430,70 @@ function pdfContentPrims(content, uniMap) {
   let arrayBuf = [];
   let pendingTJ = '';
   // text extraction (-> comments): position from the text matrix, strings from
-  // Tj / TJ / ' / " — no font parsing needed
+  // Tj / TJ / ' / " — no font parsing needed. Tf/Tc/Tw/Tz/Ts are tracked
+  // only to know how big the text is and where its top-left corner sits, so
+  // per-glyph text runs can be merged back into words.
   let tm = [1, 0, 0, 1, 0, 0];
   let leading = 0;
+  let fontSize = 10;
+  let charSpace = 0;
+  let wordSpace = 0;
+  let hScale = 1;
+  let rise = 0;
+  let curFont = null;
   let inText = false;
 
   const T = (x, y) => ({ x: ctm[0] * x + ctm[2] * y + ctm[4], y: ctm[1] * x + ctm[3] * y + ctm[5] });
+  // text space -> user space: the text matrix places/scales the glyphs, the
+  // CTM then places the whole text object in the page
+  const TT = (x, y) => {
+    const tx = tm[0] * x + tm[2] * y + tm[4];
+    const ty = tm[1] * x + tm[3] * y + tm[5];
+    return T(tx, ty);
+  };
+  const textHeight = () => {
+    const a = TT(0, rise), b = TT(0, rise + (fontSize || 10));
+    const h = Math.hypot(b.x - a.x, b.y - a.y);
+    return Number.isFinite(h) && h > 0 ? h : (fontSize || 10);
+  };
+  // Optional-content (layer) stack: /OC <res> BDC opens a marked section, EMC
+  // closes it. Prims carry the layer name so the import dialog can offer the
+  // same layer visibility a PDF viewer's layers panel does.
+  const ocgStack = [];
+  const ocgCur = () => (ocgStack.length ? ocgStack[ocgStack.length - 1] : null);
+
   const emitNote = (str) => {
-    // CID subset fonts name glyphs by arbitrary id; the file's ToUnicode CMap
-    // (parsed in parsePdf) is what turns those codes back into real text
+    // CID subset fonts name glyphs by arbitrary id; the ToUnicode CMap turns
+    // those codes back into real text. The font's own CMap wins over the
+    // global fallback: different subset fonts reuse the same codes.
+    const map = (fonts && curFont && fonts.get(curFont)) || uniMap;
     const s = String(str == null ? '' : str)
       .split('')
-      .map(c => (uniMap && uniMap.has(c) ? uniMap.get(c) : c))
+      .map(c => (map && map.has(c) ? map.get(c) : c))
       .join('')
       .replace(/\u0000/g, '')
       .trim();
     if (!s) return;
-    const p = T(tm[4], tm[5]);
-    out.push({ kind: 'note', x: p.x, y: p.y, text: s, color: null, closed: false, nodes: [] });
+    const h = textHeight();
+    // comment anchors are top-left (a comment's text grows right and down),
+    // so lift the baseline to the text's cap line instead of keeping the
+    // baseline, which would hang every imported label below its artwork
+    const p = TT(0, rise + (fontSize || 10) * 0.75);
+    // a rough advance for the whole run: enough to tell touching runs from
+    // separate labels when merging below (no /Widths parsing here)
+    const em = h / (fontSize || 10);
+    const spaces = (s.match(/ /g) || []).length;
+    const w = (s.length * fontSize * 0.5 + s.length * charSpace + spaces * wordSpace) * hScale * em;
+    // baseline (advance) and up directions in user space, used to merge split
+    // runs and to lay the text frame out in the page's own orientation
+    const ax = TT(1, 0).x - TT(0, 0).x, ay = TT(1, 0).y - TT(0, 0).y;
+    const al = Math.hypot(ax, ay) || 1;
+    const bx = TT(0, 1).x - TT(0, 0).x, by = TT(0, 1).y - TT(0, 0).y;
+    const bl = Math.hypot(bx, by) || 1;
+    out.push({ kind: 'note', x: p.x, y: p.y, text: s, size: h, w,
+      ux: ax / al, uy: ay / al, vx: bx / bl, vy: by / bl,
+      color: null, closed: false, nodes: [],
+      ocg: ocgCur() ? ocgCur().name : null, ocgOff: ocgCur() ? ocgCur().off : false });
   };
   const showStr = (v) => { if (v != null && v !== '') emitNote(v); };
 
@@ -2410,7 +2520,8 @@ function pdfContentPrims(content, uniMap) {
       // never reach the drawing: it poisons bounds and the loop weld
       if (built.nodes.length >= 2 &&
         built.nodes.every(nd => Number.isFinite(nd.p[0]) && Number.isFinite(nd.p[1]))) {
-        out.push({ color: color || null, closed: built.closed, nodes: built.nodes });
+        out.push({ color: color || null, closed: built.closed, nodes: built.nodes,
+          ocg: ocgCur() ? ocgCur().name : null, ocgOff: ocgCur() ? ocgCur().off : false });
       }
     }
     subpaths = [];
@@ -2481,6 +2592,15 @@ function pdfContentPrims(content, uniMap) {
       }
       case 'h': if (cur) cur.closed = true; break;
       case 'n': subpaths = []; cur = null; break;
+      case 'BDC': case 'BMC': {
+        // /OC <resource> BDC — a layer section; anything else (tagged PDF etc.)
+        // pushes a null frame so EMC stays balanced
+        const [kind, res] = ops.slice(-2);
+        const entry = (op === 'BDC' && kind === 'OC' && ocg) ? ocg.get(String(res)) : null;
+        ocgStack.push(entry || null);
+        break;
+      }
+      case 'EMC': if (ocgStack.length) ocgStack.pop(); break;
       case 'S': case 's': emit(stroke); break;
       case 'f': case 'F': case 'f*': emit(fill); break;
       case 'B': case 'B*': case 'b': case 'b*': emit(stroke || fill); break;
@@ -2515,6 +2635,19 @@ function pdfContentPrims(content, uniMap) {
         break;
       }
       case 'TJ': showStr(pendingTJ); pendingTJ = ''; break;
+      case 'Tf': {
+        // font name + size: the name selects the page font resource (and its
+        // ToUnicode CMap), the last operand is the size
+        const name = ops.length >= 2 ? ops[ops.length - 2] : null;
+        if (typeof name === 'string') curFont = name;
+        const v = ops.slice(-1)[0];
+        if (typeof v === 'number' && Number.isFinite(v) && v > 0) fontSize = v;
+        break;
+      }
+      case 'Tc': { const v = ops.slice(-1)[0]; if (Number.isFinite(v)) charSpace = v; break; }
+      case 'Tw': { const v = ops.slice(-1)[0]; if (Number.isFinite(v)) wordSpace = v; break; }
+      case 'Tz': { const v = ops.slice(-1)[0]; if (Number.isFinite(v) && v !== 0) hScale = v / 100; break; }
+      case 'Ts': { const v = ops.slice(-1)[0]; if (Number.isFinite(v)) rise = v; break; }
       case 'RG': stroke = pdfColor(ops.slice(-3)); break;
       case 'rg': fill = pdfColor(ops.slice(-3)); break;
       case 'G': stroke = pdfColor(ops.slice(-1)); break;
@@ -2527,7 +2660,67 @@ function pdfContentPrims(content, uniMap) {
     }
     ops = [];
   }
+  mergePdfNotes(out);
   return out;
+}
+
+// CAD/PDF writers often put every glyph in its own BT/ET block with an absolute
+// text matrix. Left alone, a single label like "1D" arrives as two one-letter
+// comments. Join the runs that sit on the same baseline and nearly touch back
+// into the word they were split from (a real space is kept as one space).
+// The baseline direction comes from the text matrix, so rotated labels merge
+// along their own reading direction, not along the page x axis.
+function mergePdfNotes(out) {
+  const idx = [];
+  for (let i = 0; i < out.length; i++) if (out[i].kind === 'note') idx.push(i);
+  if (idx.length < 2) return;
+  const items = idx.map(i => {
+    const pr = out[i];
+    let ux = pr.ux, uy = pr.uy;
+    if (!Number.isFinite(ux) || !Number.isFinite(uy) || (ux === 0 && uy === 0)) { ux = 1; uy = 0; }
+    const len = Math.hypot(ux, uy) || 1;
+    ux /= len; uy /= len;
+    return {
+      i, pr, ux, uy, size: pr.size || 10,
+      along: pr.x * ux + pr.y * uy,
+      across: pr.x * -uy + pr.y * ux
+    };
+  });
+  // group by line (across), then reading order along the line
+  items.sort((a, b) => (Math.abs(a.across - b.across) <= 0.3 * Math.max(a.size, b.size)
+    ? a.along - b.along
+    : a.across - b.across));
+  const runs = [];
+  for (const it of items) {
+    const run = runs[runs.length - 1];
+    if (run) {
+      const tol = Math.max(it.size, run.size) * 0.3;
+      const gap = it.along - run.endAlong;
+      const limit = Math.max(it.size, run.size) * 0.6;
+      const sameLine = Math.abs(it.across - run.across) <= tol;
+      const sameDir = it.ux * run.ux + it.uy * run.uy > 0.9;
+      if (sameLine && sameDir && gap <= limit && gap >= -limit) {
+        // a gap wider than a fraction of the font is a space, not a kern
+        const space = gap > Math.max(it.size, run.size) * 0.15;
+        run.text += (space && !/\s$/.test(run.text) ? ' ' : '') + it.pr.text;
+        run.endAlong = it.along + (it.pr.w || 0);
+        run.items.push(it);
+        continue;
+      }
+    }
+    runs.push({
+      text: it.pr.text, size: it.size, along: it.along, across: it.across,
+      ux: it.ux, uy: it.uy,
+      endAlong: it.along + (it.pr.w || 0), items: [it]
+    });
+  }
+  if (runs.length === idx.length) return;   // nothing merged
+  const drop = new Set();
+  for (const run of runs) {
+    run.items[0].pr.text = run.text;
+    for (let k = 1; k < run.items.length; k++) drop.add(run.items[k].i);
+  }
+  for (let i = out.length - 1; i >= 0; i--) if (drop.has(i)) out.splice(i, 1);
 }
 
 async function pdfInflate(bytes) {
@@ -2595,12 +2788,10 @@ async function parsePdf(bytes) {
     return pdfLatin1(body);
   };
 
-  // page objects, in document order
-  // ToUnicode CMaps: any object whose stream carries beginbfchar/beginbfrange.
-  // They are merged into ONE global code->text map (a minimal reader cannot
-  // track which font resource each /F1 name resolves to, and in practice a
-  // document's subset fonts never collide on the same code).
-  const uniMap = new Map();
+  // ToUnicode CMaps -> code->text map. One CMap per font: subset fonts from
+  // different families reuse the same codes, so a single global map turns some
+  // pages into gibberish. The global map stays as the fallback for content
+  // whose font resource we cannot resolve.
   const decodeCMapHex = (h) => {
     // <00480065> = two UTF-16BE chars
     const clean = String(h).replace(/[^0-9A-Fa-f]/g, '');
@@ -2610,18 +2801,14 @@ async function parsePdf(bytes) {
     }
     return out2;
   };
-  for (let i = 0; i < objs.length; i++) {
-    const seg = bodyOf(i);
-    if (!/begincmap|beginbfchar|beginbfrange/.test(seg)) continue;
-    let t = null;
-    try { t = await streamTextOf(i); } catch (err) { t = null; }
-    if (!t || !/begin(bfchar|bfrange)/.test(t)) continue;
+  const cmapTextToMap = (t) => {
+    const map = new Map();
     for (const bm of t.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) {
       for (const em of bm[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g)) {
         // source code: ONE 16-bit code unit from the last 4 hex digits
         // (Identity-H codes are 2 bytes); our hex-string tokenizer delivers
         // exactly those code units
-        uniMap.set(String.fromCharCode(parseInt(em[1].slice(-4), 16)), decodeCMapHex(em[2]));
+        map.set(String.fromCharCode(parseInt(em[1].slice(-4), 16)), decodeCMapHex(em[2]));
       }
     }
     for (const rm of t.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) {
@@ -2632,17 +2819,76 @@ async function parsePdf(bytes) {
         if (!isFinite(lo) || !isFinite(hi) || hi < lo || hi - lo > 65535) continue;
         const dstBase = parseInt(em[3], 16);
         for (let c = lo; c <= hi; c++) {
-          uniMap.set(String.fromCharCode(c), String.fromCharCode(dstBase + (c - lo)));
+          map.set(String.fromCharCode(c), String.fromCharCode(dstBase + (c - lo)));
         }
       }
       // <lo> <hi> [<d1> <d2> ...]
       for (const em of body.matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([^\]]*)\]/g)) {
         const lo = parseInt(em[1], 16);
         const dsts = em[3].match(/<[0-9A-Fa-f]+>/g) || [];
-        dsts.forEach((d, k) => uniMap.set(String.fromCharCode(lo + k), decodeCMapHex(d)));
+        dsts.forEach((d, k) => map.set(String.fromCharCode(lo + k), decodeCMapHex(d)));
       }
     }
+    return map;
+  };
+  const uniMap = new Map();
+  for (let i = 0; i < objs.length; i++) {
+    const seg = bodyOf(i);
+    if (!/begincmap|beginbfchar|beginbfrange/.test(seg)) continue;
+    let t = null;
+    try { t = await streamTextOf(i); } catch (err) { t = null; }
+    if (!t || !/begin(bfchar|bfrange)/.test(t)) continue;
+    for (const [k, v] of cmapTextToMap(t)) uniMap.set(k, v);
   }
+  // font object -> its ToUnicode CMap object (a font's /ToUnicode may also be
+  // a direct stream; only the indirect form is handled here)
+  const fontCmapNum = new Map();
+  for (let i = 0; i < objs.length; i++) {
+    const seg = bodyOf(i);
+    if (!/\/Type\s*\/Font\b/.test(seg)) continue;
+    const tu = /\/ToUnicode\s+(\d+)\s+\d+\s+R/.exec(seg);
+    if (tu) fontCmapNum.set(objs[i].num, +tu[1]);
+  }
+  const fontUniCache = new Map();   // CMap object number -> Map|null
+  const fontUni = async (fontObjNum) => {
+    const cmapNum = fontCmapNum.get(fontObjNum);
+    if (!cmapNum) return null;
+    if (fontUniCache.has(cmapNum)) return fontUniCache.get(cmapNum);
+    let map = null;
+    const ci = objs.findIndex(o => o.num === cmapNum);
+    if (ci >= 0) {
+      let t = null;
+      try { t = await streamTextOf(ci); } catch (err) { t = null; }
+      if (t && /begin(bfchar|bfrange)/.test(t)) map = cmapTextToMap(t);
+    }
+    fontUniCache.set(cmapNum, map);
+    return map;
+  };
+
+  // Optional content (PDF layers): OCG object number -> name, plus the default
+  // config's /OFF list — the layers a viewer hides until the user enables them.
+  const ocgNames = new Map();
+  for (let i = 0; i < objs.length; i++) {
+    const seg = bodyOf(i);
+    if (!/\/Type\s*\/OCG\b/.test(seg)) continue;
+    const nm = /\/Name\s*\(([^)]*)\)/.exec(seg);
+    const hx = !nm && /\/Name\s*<([0-9A-Fa-f]+)>/.exec(seg);
+    let name = 'Layer ' + objs[i].num;
+    if (nm) name = decodePdfString(nm[1]);
+    else if (hx) {
+      const h = hx[1];
+      name = '';
+      for (let k = 0; k + 3 < h.length; k += 4) name += String.fromCharCode(parseInt(h.slice(k, k + 4), 16));
+    }
+    ocgNames.set(objs[i].num, name);
+  }
+  const ocgOff = new Set();
+  const ocpi = raw.indexOf('/OCProperties');
+  if (ocpi >= 0) {
+    const offm = /\/OFF\s*\[([^\]]*)\]/.exec(raw.slice(ocpi, ocpi + 2000));
+    if (offm) for (const rm of offm[1].matchAll(/(\d+)\s+\d+\s+R/g)) ocgOff.add(+rm[1]);
+  }
+
   const pages = [];
   for (let i = 0; i < objs.length; i++) {
     const seg = bodyOf(i);
@@ -2661,7 +2907,36 @@ async function parsePdf(bytes) {
       const cr = /\/Contents\s+(\d+)\s+\d+\s+R/.exec(dict);
       if (cr) refs.push(+cr[1]);
     }
-    pages.push({ box, refs });
+    // page font resources: /F1 -> font object -> its ToUnicode map. Resources
+    // may sit in an indirect object; inherited resources are not followed.
+    const fonts = new Map();
+    let resSeg = dict;
+    const rr = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(dict);
+    if (rr) {
+      const ri = objs.findIndex(o => o.num === +rr[1]);
+      if (ri >= 0) resSeg = bodyOf(ri);
+    }
+    const fd = /\/Font\s*<<([\s\S]*?)>>/.exec(resSeg);
+    if (fd) {
+      for (const fm of fd[1].matchAll(/\/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R/g)) {
+        const m = await fontUni(+fm[2]);
+        if (m) fonts.set(fm[1], m);
+      }
+    }
+    // page layer resources: /oc1 -> OCG object -> name + default visibility
+    const ocg = new Map();
+    const pd = /\/Properties\s*<<([\s\S]*?)>>/.exec(resSeg);
+    if (pd) {
+      for (const pm of pd[1].matchAll(/\/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R/g)) {
+        const name = ocgNames.get(+pm[2]);
+        if (name != null) ocg.set(pm[1], { name, off: ocgOff.has(+pm[2]) });
+      }
+    }
+    // /Rotate: degrees clockwise the viewer turns the page. Ignoring it made
+    // AutoCAD exports import 90° off from every viewer.
+    const rotm = /\/Rotate\s+(-?\d+)/.exec(dict);
+    const rot = rotm ? ((+rotm[1] % 360) + 360) % 360 : 0;
+    pages.push({ box, refs, fonts, ocg, rot });
   }
 
   const out = [];
@@ -2679,8 +2954,27 @@ async function parsePdf(bytes) {
     return pr;
   };
 
+  // /Rotate applied to origin-normalized page coords (Y-up): the viewer turns
+  // the page clockwise, so 90 maps (x,y) -> (y, W-x), 270 -> (H-y, x).
+  const rotatePrim = (pr, rot, W, H) => {
+    const pt = (x, y) => rot === 90 ? [y, W - x] : rot === 180 ? [W - x, H - y] : [H - y, x];
+    const vec = (x, y) => rot === 90 ? [y, -x] : rot === 180 ? [-x, -y] : [-y, x];
+    if (pr.kind === 'note') {
+      const [x, y] = pt(pr.x, pr.y); pr.x = x; pr.y = y;
+      if (pr.ux != null) { const [a, b] = vec(pr.ux, pr.uy); pr.ux = a; pr.uy = b; }
+      if (pr.vx != null) { const [a, b] = vec(pr.vx, pr.vy); pr.vx = a; pr.vy = b; }
+      return pr;
+    }
+    for (const nd of pr.nodes) {
+      let [x, y] = pt(nd.p[0], nd.p[1]); nd.p[0] = x; nd.p[1] = y;
+      if (nd.o) { [x, y] = pt(nd.o[0], nd.o[1]); nd.o[0] = x; nd.o[1] = y; }
+      if (nd.i) { [x, y] = pt(nd.i[0], nd.i[1]); nd.i[0] = x; nd.i[1] = y; }
+    }
+    return pr;
+  };
+
   if (pages.length) {
-    const gap = 28.34646;   // 10 mm between pages, in pt
+    const gap = 283.4646;   // 100 mm between pages, in pt
     // Bounding-box driven layout: each page starts after the previous
     // page's REAL right edge (not its nominal MediaBox width), so artwork
     // narrower than the box packs tight and artwork bleeding past the box
@@ -2704,7 +2998,11 @@ async function parsePdf(bytes) {
       const dy = -box[1];
       if (content) {
         try {
-          for (const pr of pdfContentPrims(content, uniMap)) out.push(shiftPrim(pr, dx, dy));
+          for (const pr of pdfContentPrims(content, uniMap, pg.fonts, pg.ocg)) { pr.page = pageNo; out.push(shiftPrim(pr, dx, dy)); }
+          if (pg.rot) {
+            const W = box[2] - box[0], H = box[3] - box[1];
+            for (let k = from; k < out.length; k++) rotatePrim(out[k], pg.rot, W, H);
+          }
         } catch (err) { /* keep going with the other pages */ }
       }
       if (out.length === from) continue;   // empty page: no slot, no marker
@@ -2747,7 +3045,7 @@ async function parsePdf(bytes) {
           }
         }
         if (!isFinite(minX)) continue;
-        out.push({ kind: 'note', x: minX, y: maxY + 34, text: '=== Page ' + spans[i].n + ' ===', color: null, closed: false, nodes: [] });
+        out.push({ kind: 'note', x: minX, y: maxY + 34, text: '=== Page ' + spans[i].n + ' ===', pageLabel: true, page: spans[i].n, color: null, closed: false, nodes: [] });
       }
     }
     return out;
@@ -2759,7 +3057,7 @@ async function parsePdf(bytes) {
     if (!t || t.length < 8) continue;
     if (!/[mnlcre]\s/.test(t)) continue;
     try {
-      for (const pr of pdfContentPrims(t, uniMap)) out.push(pr);
+      for (const pr of pdfContentPrims(t, uniMap)) { pr.page = 1; out.push(pr); }
     } catch (err) { /* not a content stream after all */ }
   }
   return out;
@@ -3381,12 +3679,12 @@ async function parseCdr(bytes) {
   }
 
   // multi-page documents lay out left to right: each page starts after
-  // the previous page's REAL right edge (page width + 10mm is only the
+  // the previous page's REAL right edge (page width + 100mm is only the
   // minimum gap), so a page whose artwork bleeds past its box — or whose
   // master-page residue sits elsewhere — never overlaps ("menumpuk")
   // the page before it. Page 0 is the master/cover residue and keeps its
   // own coordinates; content pages 1..N slot in after it.
-  const PG_GAP = 10;   // mm between pages
+  const PG_GAP = 100;   // mm between pages
 
   // X6+ chunks can be 16-byte redirect stubs into the external streams:
   // (stream number, payload length, offset in stream, 0)
@@ -3493,7 +3791,21 @@ async function parseCdr(bytes) {
       const ax = cdrCoord(cdrReadS32(dv, coords)) ;
       const ay = cdrCoord(cdrReadS32(dv, coords + 4));
       const at = cdrTrafoApply(trafo, ax, ay);
-      if (textStr) out.push({ kind: 'note', x: at[0], y: at[1], text: textStr, color: null, closed: false, nodes: [] });
+      // CDR text has no reliable size in the chunk we read: 5 mm is the usual
+      // CAD lettering height, and the importer's text-frame fit refines it
+      if (textStr) {
+        // the group/frame transform also carries the text's rotation: keep its
+        // baseline/up directions so a rotated label imports rotated
+        let ux = 1, uy = 0, vx = 0, vy = 1;
+        if (trafo) {
+          const al = Math.hypot(trafo.v0, trafo.v3) || 1;
+          const bl = Math.hypot(trafo.v1, trafo.v4) || 1;
+          ux = trafo.v0 / al; uy = trafo.v3 / al;
+          vx = trafo.v1 / bl; vy = trafo.v4 / bl;
+        }
+        out.push({ kind: 'note', x: at[0], y: at[1], text: textStr,
+          size: 5, ux, uy, vx, vy, color: null, closed: false, nodes: [] });
+      }
       pageSpans.push({ page: g.page, from: spanFrom, to: out.length });
       continue;
     }
@@ -3575,6 +3887,9 @@ async function parseCdr(bytes) {
     // it — recompute is unnecessary since marker code only reads bbox, but
     // spans stay valid as ranges (the prims themselves moved in place)
   }
+  for (const s of pageSpans) {
+    for (let i = s.from; i < s.to; i++) out[i].page = s.page;
+  }
   // multi-page documents get a marker comment above each page
   const maxPage = pageSpans.reduce((m, s) => Math.max(m, s.page), -1);
   if (maxPage >= 2) {
@@ -3590,7 +3905,7 @@ async function parseCdr(bytes) {
         }
       }
       if (!isFinite(minX)) continue;
-      out.push({ kind: 'note', x: minX, y: maxY + 12, text: '=== Page ' + pg + ' ===', color: null, closed: false, nodes: [] });
+      out.push({ kind: 'note', x: minX, y: maxY + 12, text: '=== Page ' + pg + ' ===', pageLabel: true, page: pg, color: null, closed: false, nodes: [] });
     }
   }
   return out;
@@ -3609,6 +3924,7 @@ if (typeof module !== 'undefined' && module.exports) {
     lmSolve, solveLinear,
     partTransform, partMarkerWorld, solveAssembly,
     pointInPoly, signedAreaPts, interiorProbe, normalizeWinding, chainPolylines,
+    polyBBox, bboxOverlap, segmentsIntersect, polylineIntersectsPolyline,
     dedupeSorted, lineLineIntersect, lineCircleIntersect,
     parseDxf, pdfContentPrims, parsePdf, parseCdr, cdrRectNodes, cdrEllipseNodes,
     imagePixelDensity, IMAGE_DEFAULT_DPI,

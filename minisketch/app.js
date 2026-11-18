@@ -69,6 +69,7 @@
   // It decides when a selection walks on (N), when an imported path counts as
   // closed, and when two ends of a contour make a loop.
   let JOIN_TOL = 0.1;
+  let LOOP_CLOSE_TOL = 0.25;   // loop detection bridges CAD-export rounding gaps
   let NUDGE_STEP = 1;               // mm per arrow key press (Settings)
   let NOTE_SIZE = 3;                // comment text height, mm (Settings)
   let NOTE_MIN_PX = 20;             // comment text never renders smaller than this many screen px (Settings)
@@ -82,6 +83,13 @@
   const ctx = canvas.getContext('2d');
   const stage = document.getElementById('stage');
   const fileInput = document.getElementById('file-input');
+  // Base directory of THIS script, not of the document: served under a subpath
+  // (KaryaCNC /sketcher, no trailing slash) a document-relative 'tools/x.js'
+  // resolves one level too high and every Worker 404s.
+  const SCRIPT_BASE = ((document.currentScript && document.currentScript.src) || location.href).replace(/[^/]*$/, '');
+  // Set by bindUI to pickSketchFile (the handle-keeping picker). Ctrl+O /
+  // Ctrl+I route through it so keyboard and menu open the SAME dialog.
+  let pickSketchFileHook = null;
 
   // ---- Theme -------------------------------------------------------------
   // UI colours live in styles.css (--tokens per data-theme). The canvas is
@@ -156,7 +164,8 @@
     CANVAS_DARK[key.toLowerCase().replace(/\s+/g, '')] = CANVAS_DARK_RAW[key];
   }
   let themeName = 'dark';
-  let loopFillVisible = true;            // settings → Renderer → Loop fills
+  let loopFillCurrentVisible = true;     // settings → Renderer → Loop fills · current layer
+  let loopFillOthersVisible = true;      // settings → Renderer → Loop fills · other layers
   let loopFillScale = 0.5;              // settings → Renderer → Loop fill resolution
 
   function themedCanvasColor(v) {
@@ -315,6 +324,15 @@
 
 
 
+  // Elements are matched on their LOCAL name: SVG is namespace-aware, so
+  // <svg:path> and <path> are the same shape, while nodeName keeps whichever
+  // prefix the file (or an Inkscape clipboard payload) happened to use.
+  function svgName(el) {
+    const n = String((el && (el.localName || el.nodeName)) || '').toLowerCase();
+    const c = n.indexOf(':');
+    return c < 0 ? n : n.slice(c + 1);
+  }
+
   // --- style -------------------------------------------------------------------
   function svgStyleDecls(text) {
     const out = {};
@@ -343,7 +361,7 @@
   }
 
   function svgApplyRules(rules, el, style) {
-    const tag = String(el.nodeName || '').toLowerCase();
+    const tag = svgName(el);
     const cls = String(el.getAttribute ? (el.getAttribute('class') || '') : '').split(/\s+/).filter(Boolean);
     const id = el.getAttribute ? (el.getAttribute('id') || '') : '';
     for (const rule of rules) {
@@ -372,12 +390,14 @@
     const st = {
       stroke: parent.stroke, fill: parent.fill, fillSet: !!parent.fillSet,
       strokeWidth: parent.strokeWidth, fillRule: parent.fillRule,
+      fontSize: parent.fontSize,
       display: parent.display, visibility: parent.visibility, opacity: parent.opacity
     };
     const attr = (k) => (el.getAttribute && el.hasAttribute && el.hasAttribute(k) ? el.getAttribute(k) : null);
     const keys = {
       stroke: 'stroke', fill: 'fill', 'stroke-width': 'strokeWidth',
-      'fill-rule': 'fillRule', display: 'display', visibility: 'visibility', opacity: 'opacity'
+      'fill-rule': 'fillRule', 'font-size': 'fontSize',
+      display: 'display', visibility: 'visibility', opacity: 'opacity'
     };
     for (const k in keys) {
       const v = attr(k);
@@ -395,6 +415,7 @@
       if (d.fill != null) st.fillSet = true;
       if (d['stroke-width'] != null) st.strokeWidth = d['stroke-width'];
       if (d['fill-rule'] != null) st.fillRule = d['fill-rule'];
+      if (d['font-size'] != null) st.fontSize = d['font-size'];
       if (d.display != null) st.display = d.display;
       if (d.visibility != null) st.visibility = d.visibility;
       if (d.opacity != null) st.opacity = d.opacity;
@@ -466,7 +487,7 @@
   }
 
   function svgShapeSegs(el) {
-    const tag = String(el.nodeName || '').toLowerCase();
+    const tag = svgName(el);
     const a = (k, d) => {
       const v = el.getAttribute(k);
       if (v == null || v === '') return d;
@@ -502,7 +523,7 @@
 
   function svgWalk(el, ctx, ctm, parentStyle, groupTag, depth) {
     if (!el || depth > 40) return;
-    const tag = String(el.nodeName || '').toLowerCase();
+    const tag = svgName(el);
     if (tag === 'title' || tag === 'desc' || tag === 'metadata' || tag === 'style') return;
 
     const style = svgStyleFor(el, parentStyle, ctx.rules);
@@ -566,7 +587,33 @@
       return;
     }
 
-    if (tag === 'text') { ctx.skipped.text++; return; }
+    if (tag === 'text') {
+      // SVG text becomes a note (comment) item. The anchor is the element's
+      // x/y in its own user space, mapped through the CTM to world mm. The
+      // font size is a CSS length: physical units (mm/pt/...) are absolute,
+      // unitless/px values are user units scaled by the CTM.
+      if (svgHidden(style)) return;
+      const raw = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!raw) { ctx.skipped.text++; return; }
+      const x = parseFloat(el.getAttribute('x') || '0') || 0;
+      const y = parseFloat(el.getAttribute('y') || '0') || 0;
+      const p = matApply(m, { x, y });
+      const fsRaw = String(style.fontSize || '16').trim();
+      const fsNum = parseFloat(fsRaw);
+      const mScale = Math.hypot(m[0], m[1]) || 1;
+      const size = /(mm|cm|in|pt|pc)$/i.test(fsRaw)
+        ? svgLenToMm(fsRaw)
+        : (isFinite(fsNum) ? fsNum : 16) * mScale;
+      const color = svgColorToHex(style.fill) || '#000000';
+      // SVG y is the baseline; a comment/text frame hangs from its top-left,
+      // so lift the anchor to the cap line (0.75 em)
+      const anchorY = p.y - size * 0.75;
+      ctx.items.push({ kind: 'note', x: p.x, y: anchorY, text: raw, size,
+        color, group, source: 'text' });
+      ctx.colors.set(color, (ctx.colors.get(color) || 0) + 1);
+      ctx.textCount = (ctx.textCount || 0) + 1;
+      return;
+    }
     if (tag === 'image') { ctx.skipped.image++; return; }
     if (tag === 'use') {
       const id = svgHref(el);
@@ -583,6 +630,10 @@
       tag === 'mask' || tag === 'pattern' || tag === 'lineargradient' || tag === 'radialgradient') {
       return;                                  // only reachable through <use>
     }
+    // What Inkscape puts on the clipboard: the bbox of the copy plus the originals
+    // of any linked duplicates, which the <use> elements in the sibling groups
+    // point at. A defs block in disguise — walked as a drawing it pastes clones twice.
+    if (tag === 'clipboard') return;
 
     const kids = el.childNodes || [];
     for (let i = 0; i < kids.length; i++) {
@@ -609,7 +660,7 @@
     const subpaths = [];
     const collect = (el, ctm2, depth) => {
       if (!el || depth > 12) return;
-      const tag = String(el.nodeName || '').toLowerCase();
+      const tag = svgName(el);
       if (SVG_SHAPES[tag]) {
         const m2 = matMul(ctm2, parseTransformList(el.getAttribute && el.getAttribute('transform')));
         for (const sub of svgSegmentsToSubpaths(svgShapeSegs(el), m2)) subpaths.push(sub);
@@ -619,7 +670,7 @@
       for (let i = 0; i < kids.length; i++) {
         const kid = kids[i];
         if (kid.nodeType === 3) continue;
-        const t = String(kid.nodeName || '').toLowerCase();
+        const t = svgName(kid);
         if (t === 'defs') continue;
         const m3 = matMul(ctm2, parseTransformList(kid.getAttribute && kid.getAttribute('transform')));
         if (SVG_SHAPES[t]) {
@@ -632,7 +683,7 @@
   }
 
   function svgOwnBBox(el) {
-    const tag = String(el.nodeName || '').toLowerCase();
+    const tag = svgName(el);
     const num = (k, d) => {
       const v = parseFloat(el.getAttribute(k));
       return isFinite(v) ? v : d;
@@ -732,7 +783,7 @@
   // --- document level ----------------------------------------------------------
   const SVG_DEFAULT_STYLE = {
     stroke: 'none', fill: '#000000', fillSet: false, strokeWidth: '1', fillRule: 'nonzero',
-    display: null, visibility: null, opacity: null
+    fontSize: '16', display: null, visibility: null, opacity: null
   };
 
   function svgCollectBounds(items) {
@@ -745,6 +796,10 @@
       if (y > maxY) maxY = y;
     };
     for (const item of items) {
+      if (item.kind === 'note') {
+        put(item.x, item.y);
+        continue;
+      }
       if (item.kind === 'circle') {
         put(item.c.x - item.r, item.c.y - item.r);
         put(item.c.x + item.r, item.c.y + item.r);
@@ -770,15 +825,23 @@
     const err = doc.getElementsByTagName('parsererror');
     if (err && err.length) throw new Error('SVG could not be parsed');
     const root = doc.documentElement;
-    if (!root || String(root.nodeName).toLowerCase() !== 'svg') throw new Error('Not an SVG document');
+    if (!root || svgName(root) !== 'svg') throw new Error('Not an SVG document');
 
     const byId = new Map();
+    const styleNodes = [];
+    // Inkscape signs its documents with an inkscape:version attribute on the root
+    // (kept on clipboard payloads too) and may add an <inkscape:clipboard> node;
+    // either marks this payload as coming from the Inkscape editor.
+    let isInkscapeClipboard = false;
+    const rootVersion = root.getAttribute && root.getAttribute('inkscape:version');
+    if (rootVersion) isInkscapeClipboard = true;
     const all = root.getElementsByTagName('*');
     for (let i = 0; i < all.length; i++) {
       const id = svgLocalId(all[i]);
       if (id && !byId.has(id)) byId.set(id, all[i]);
+      if (svgName(all[i]) === 'style') styleNodes.push(all[i]);
+      if (!isInkscapeClipboard && svgName(all[i]) === 'clipboard') isInkscapeClipboard = true;
     }
-    const styleNodes = root.getElementsByTagName('style');
     let rules = [];
     for (let i = 0; i < styleNodes.length; i++) {
       rules = rules.concat(svgParseStyleSheets(styleNodes[i].textContent || ''));
@@ -793,15 +856,36 @@
     if (vb && vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
       if (wMm > 0) scale = wMm / vb[2];
       else if (hMm > 0) scale = hMm / vb[3];
-    } else if (wMm > 0 && !vb) {
-      scale = 1;                                // already mm through the width unit
+    } else if (!vb && (wMm > 0 || hMm > 0)) {
+      // No viewBox: one user unit equals one unit of the root width/height. A
+      // px (or unitless) size puts the drawing in CSS pixels; a physical size
+      // means the coordinates already live in that physical unit.
+      const rawUnit = String(root.getAttribute('width') || root.getAttribute('height') || '').trim();
+      const unitMatch = rawUnit.match(/[a-z%]*$/i);
+      const unit = (unitMatch && unitMatch[0]) ? unitMatch[0].toLowerCase() : 'px';
+      scale = (unit && unit !== 'px' && SVG_MM_PER[unit] != null) ? SVG_MM_PER[unit] : SVG_MM_PER.px;
+      pasteTrace('no viewBox: width unit', unit, '-> scale', scale);
+    }
+    // The Inkscape clipboard markup keeps only the viewBox and drops the root
+    // width/height, so its user units are CSS pixels (96 dpi for Inkscape >=
+    // 0.92). A shape authored in mm then needs the px→mm step, otherwise a
+    // 100 mm copy lands as ~378 mm (one user unit read as one millimetre).
+    if (isInkscapeClipboard &&
+        (!wMm || wMm <= 0) && (!hMm || hMm <= 0) &&
+        vb && vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
+      scale = SVG_MM_PER.px;                    // 25.4 / 96
+      pasteTrace('Inkscape clipboard has no root width/height — using CSS px scale', scale);
+    } else {
+      pasteTrace('svg root: width=', root.getAttribute('width'), 'height=', root.getAttribute('height'),
+        'viewBox=', root.getAttribute('viewBox'), 'inkscape?', isInkscapeClipboard,
+        'scale=', scale);
     }
     if (isFinite(o.scale) && o.scale > 0) scale *= o.scale;
     const vbX = vb && isFinite(vb[0]) ? vb[0] : 0;
     const vbY = vb && isFinite(vb[1]) ? vb[1] : 0;
     // The sketch is Y-down (screen/SVG convention) — a file SVG maps straight
     // in, no flip. o.flipY === false reads the SVG AS Y-up (AI-authored
-    // drawings): y' = -scale*(y - vbY), mirroring it into the sketch frame.
+    // drawings): y = -scale*(y - vbY) mirrors into the sketch frame.
     const base = o.flipY === false
       ? [scale, 0, 0, -scale, -vbX * scale, vbY * scale]
       : [scale, 0, 0, scale, -vbX * scale, -vbY * scale];
@@ -842,6 +926,7 @@
       colorList: colors,
       segments: segments,
       skipped: ctx.skipped,
+      textCount: ctx.textCount || 0,
       groupNames: ctx.groupNames,
       groupCount: Object.keys(ctx.groupNames).length
     };
@@ -866,7 +951,7 @@
       return id;
     };
     const colorOfSrc = (hex) => colorMap[hex] || hex;
-    const made = { entities: [], groups: new Set(), lines: 0, splines: 0, circles: 0, framed: 0 };
+    const made = { entities: [], groups: new Set(), lines: 0, splines: 0, circles: 0, framed: 0, notes: 0 };
     const groupBag = new Map();
 
     const tagEntity = (ent, item) => {
@@ -927,6 +1012,25 @@
     for (const item of ir.items) {
       const color = colorOfSrc(item.color);
       const meta = { color, filled: item.filled, group: keepGroups ? null : item.group };
+
+      if (item.kind === 'note') {
+        const text = String(item.text || '').slice(0, 500);
+        if (!text) continue;
+        if (o.textMode === 'skip') continue;
+        if (o.textMode === 'text') {
+          const id = addImportedTextObject(item.x + off.x, item.y + off.y, text,
+            item.size || 5, { ux: 1, uy: 0, vx: 0, vy: -1 });
+          made.entities.push(id);
+          made.framed++;
+        } else {
+          const pid = mkPoint(item.x + off.x, item.y + off.y);
+          const id = newId();
+          state.entities[id] = { id, type: 'note', p: pid, text, layer: ui.activeLayer };
+          made.entities.push(id);
+          made.notes++;
+        }
+        continue;
+      }
 
       if (item.kind === 'circle') {
         const cid = mkPoint(item.c.x + off.x, item.c.y + off.y);
@@ -997,6 +1101,11 @@
       }
     }
 
+    // connect same-colour segments that meet within the join tolerance (SVG
+    // often arrives as many tiny open paths; Settings > Geometry > Join
+    // imported points)
+    if (settings.joinImportAuto !== 'off' && made.lines >= 2) joinImportedSegments(made.entities, settings.joinImportTol);
+
     return made;
   }
 
@@ -1044,6 +1153,7 @@
     bits.push(ir.items.length + (ir.items.length === 1 ? ' shape' : ' shapes'));
     if (ir.segments) bits.push(ir.segments + ' segments');
     if (ir.groupCount) bits.push(ir.groupCount + (ir.groupCount === 1 ? ' group' : ' groups'));
+    if (ir.textCount) bits.push(ir.textCount + ' text');
     if (ir.skipped.text) bits.push(ir.skipped.text + ' text skipped');
     if (ir.skipped.image) bits.push(ir.skipped.image + ' image skipped');
     if (ir.skipped.use) bits.push(ir.skipped.use + ' unresolved use');
@@ -1097,12 +1207,19 @@
     }
   }
 
-  function runSvgImport() {
+  async function runSvgImport() {
     const job = svgImportJob;
     if (!job) return;
     const keepGroups = !!(document.getElementById('imp-keep-groups') || {}).checked;
     const fillEl = document.getElementById('imp-fill');
     const fillMode = fillEl ? fillEl.value : 'gray';
+    const textEl = document.getElementById('imp-text-mode');
+    const textMode = textEl ? textEl.value : 'comment';
+    // text objects need the real face before the first render, or the glyphs
+    // only show up on the next repaint
+    if (textMode === 'text' && window.MiniSketchFonts) {
+      await window.MiniSketchFonts.load(TEXT_DEFAULT_FONT, 400, 'normal');
+    }
     const colorMap = {};
     for (const sel of document.querySelectorAll('#imp-colors select[data-src]')) {
       colorMap[sel.dataset.src] = sel.value;
@@ -1111,7 +1228,7 @@
     pushHistory();
     let made = null;
     try {
-      made = svgImportInsert(job.ir, { keepGroups, fillMode, colorMap });
+      made = svgImportInsert(job.ir, { keepGroups, fillMode, colorMap, textMode });
     } catch (err) {
       history.pop();
       updateHistoryButtons();
@@ -1127,6 +1244,7 @@
     if (made.splines) parts.push(made.splines + ' curve' + (made.splines === 1 ? '' : 's'));
     if (made.circles) parts.push(made.circles + ' circle' + (made.circles === 1 ? '' : 's'));
     if (made.framed) parts.push(made.framed + ' framed object' + (made.framed === 1 ? '' : 's'));
+    if (made.notes) parts.push(made.notes + ' comment' + (made.notes === 1 ? '' : 's'));
     const skipped = job.ir.skipped;
     const sk = [];
     if (skipped.text) sk.push(skipped.text + ' text');
@@ -1196,18 +1314,30 @@
       help: 'Base colour for the explicit Yellow loop fill (CNC).' },
     { group: 'Renderer', key: 'loopTintGray', label: 'Loop fill · gray', unit: '', text: true, def: '#8a94a3',
       help: 'Base colour for the explicit Gray loop fill (CNC).' },
-    { group: 'Renderer', key: 'loopFillVisible', label: 'Loop fills', unit: '',
+    { group: 'Renderer', key: 'loopFillCurrent', label: 'Loop fills · current layer', unit: '',
       def: 'on', choices: [['on', 'On'], ['off', 'Off']],
-      help: 'Draw the interior tint / gray-yellow fill of loops. Turning this off removes the largest area pass for a quick A/B of drag frame time — with it off you see what the rest of the scene alone costs.' },
+      help: 'Draw the interior tint / gray-yellow fill of loops on the ACTIVE layer. Turning this off removes the largest area pass for a quick A/B of drag frame time.' },
+    { group: 'Renderer', key: 'loopFillOthers', label: 'Loop fills · other layers', unit: '',
+      def: 'on', choices: [['on', 'On'], ['off', 'Off']],
+      help: 'Draw loop fills on layers other than the active one. Off keeps the reference layers as plain outlines while the layer you work on stays filled. Dim other layers still fades whatever fills remain visible.' },
     { group: 'Renderer', key: 'loopFillScale', label: 'Loop fill resolution', unit: '%',
       def: '50', choices: [['100', '100'], ['75', '75'], ['50', '50'], ['33', '33']],
       help: 'Resolution of the offscreen loop-fill layer relative to the canvas. Fills are flat solid areas, so 50% renders a quarter of the fill pixels and is visually indistinguishable — this is the cheapest dial for drag speed (the loop fill is the biggest pass). Strokes/markers are unaffected.' },
     { group: 'Geometry', key: 'bakeJoinTol', label: 'Chain tolerance', unit: 'mm',
       def: 0.1, min: 0.001, max: 5, step: 0.01,
-      help: 'Ends closer than this become one node when grouping (Ctrl+G) or offsetting (Ctrl+O).' },
+      help: 'Ends closer than this become one node when grouping (Ctrl+G) or offsetting (Ctrl+J).' },
     { group: 'Geometry', key: 'joinTol', label: 'Join tolerance', unit: 'mm',
       def: 0.1, min: 0.001, max: 5, step: 0.01,
       help: 'The CNC tolerance: points closer than this count as one joint. Used when selecting connected geometry (N), when deciding whether an imported path is closed, and when building loops. Keep it below half your SHORTEST segment: a value larger than a segment welds its ends to the neighbours and the shape stops being a loop.' },
+    { group: 'Geometry', key: 'loopCloseTol', label: 'Loop closure gap', unit: 'mm',
+      def: 0.25, min: 0.01, max: 2, step: 0.01,
+      help: 'Maximum gap between segment ends that loop detection still bridges into a closed loop. Customer CAD exports round coordinates, leaving 0.1-0.2 mm cracks at junctions that the CNC join tolerance (often 0.1) refuses to close — the shape then never fills or lists as a loop. Independent of the join tolerance: it only affects loop topology, never moves a point.' },
+    { group: 'Geometry', key: 'joinImportAuto', label: 'Join imported points', unit: '',
+      def: 'on', choices: [['on', 'On — weld same-colour ends when importing'], ['off', 'Off — import segments exactly as-is']],
+      help: 'When On, PDF / SVG / DXF / CDR imports weld same-colour segment ends that meet within the join tolerance so contours arrive connected and loops close: an open end snaps onto the vertex it touches (T-junctions), otherwise the surviving point keeps its exact file position. Then simplify drops staircase noise points whose turn is below the Ctrl+K sharp-corner angle and whose chord stays within the curve fit tolerance — corners and curve nodes keep their valid positions. Off keeps every imported segment exactly as the file describes it.' },
+    { group: 'Geometry', key: 'joinImportTol', label: 'Join imported distance', unit: 'mm',
+      def: 0.1, min: 0.001, max: 5, step: 0.01,
+      help: 'How close two same-colour segment ends must be before an import welds them, AND the maximum chord deviation when import simplify hops staircase noise points. Ends within 20% of this distance merge as file noise without moving (loops close); across a real gap only a short segment’s open end may snap onto the other’s exact position. Ends of segments longer than 20x this distance are VALID anchors: never moved by welding, never dropped by simplify. Raise it to collapse coarser staircases; lower it to keep more of the file’s nodes.' },
     { group: 'Geometry', key: 'nudgeStep', label: 'Arrow key nudge', unit: 'mm',
       def: 1, min: 0.001, max: 50, step: 0.5,
       help: 'How far the arrow keys move the selected objects or points AT 100% ZOOM. The step follows the view: zoomed out every press covers more world (fast), zoomed in it shrinks for precision. The live value is shown under the scale bar, bottom left.' },
@@ -1243,6 +1373,9 @@
     { group: 'Geometry', key: 'offsetMiter', label: 'Offset miter limit', unit: 'x',
       def: 4, min: 1, max: 10, step: 0.5,
       help: 'How far a mitred corner may reach before Clipper squares it off.' },
+    { group: 'Geometry', key: 'wallDragMm', label: 'Drag wall thickness', unit: 'mm',
+      def: 1, min: 0, max: 50, step: 0.1,
+      help: 'The outward offset the Drag wall tool wraps around a selected compound object. The wall is a live collision envelope only: it is drawn while you drag and is never added to the drawing. 0 = the outline itself; 1 mm keeps a 1 mm gap to every other object.' },
     { group: 'Geometry', key: 'offsetJoin', label: 'Offset corners', unit: '',
       def: 'sharp', choices: [['sharp', 'Sharp (miter)'], ['round', 'Rounded'], ['square', 'Squared (bevel)']],
       help: 'Corner shape an offset produces: sharp mitres, rounded arcs, or squared-off bevels.' },
@@ -1327,11 +1460,42 @@
       }
     }
   }
+  // F1/F2 modes (Inkscape-style). F1 = select/move: points and lines are not
+  // editable (pick filter locks them) and node markers are hidden. F2 = node
+  // edit: everything selectable, markers show on the selection.
+  function setMode(mode) {
+    if (mode !== 'select' && mode !== 'node') return;
+    ui.mode = mode;
+    if (mode === 'select') {
+      pickFilter.point = false;
+      pickFilter.line = false;
+      pickFilter.loop = true;
+      ui.showPoints = false;
+    } else {
+      pickFilter.point = true;
+      pickFilter.line = true;
+      pickFilter.loop = true;
+      // F2 always STARTS selection-based: only the selected object's points
+      // (or an explicit point selection) show. The Points menu toggle is the
+      // temporary "show all points" override — reset on every F2 entry so a
+      // stale saved view cannot turn F2 into an all-points view.
+      ui.showPoints = false;
+    }
+    savePickFilter();
+    syncPickFilterUI();
+    syncViewToggles();
+    updateUI();
+    scheduleRender();
+    toast(mode === 'select'
+      ? 'F1 · Select/Move — points & lines locked'
+      : 'F2 · Node edit — points & lines editable');
+  }
   let CIRCLE_CHORD = 1.5;
   let OFFSET_MITER = 4;
   let OFFSET_TOL = 0.05;
   let OFFSET_JOIN = 'sharp';
   let OFFSET_ARC_TOL = 0.05;
+  let WALL_DRAG_MM = 1;
   // Renderer: markers and strokes are BASE_PX * zoom, clamped to the min/max
   // percentages (a marker must stay clickable when zoomed out and must not
   // swamp the drawing when zoomed in).
@@ -1350,6 +1514,22 @@
   let SEL_WIDTH = 2.6;
   let LINE_ZOOM_MIN = 0.5;
   let LINE_ZOOM_MAX = 1.25;
+  // How far above the finger a touch-dragged point is lifted so the thumb does
+  // not cover it (screen px).
+  const TOUCH_LIFT_PX = 70;
+  // Touch "lift": for DRAFTING, steer the pointer from a virtual cursor
+  // ~TOUCH_LIFT_PX above the finger so the created point is not hidden by the
+  // thumb. Returns the lifted world, or null to keep the real pointer.
+  // Suppressed while the finger is on an existing point (so welds still land).
+  function touchLiftWorld(realWorld, pos, suppressNearPoint) {
+    if (!ui._touchPress || !ui._touching) return null;
+    if (Math.hypot(pos.x - ui._touchPress.x, pos.y - ui._touchPress.y) <= 8) return null;
+    if (suppressNearPoint) {
+      const sp = snapPoint(realWorld, { skip: new Set() });
+      if (sp && sp.id != null) return null;
+    }
+    return s2w(pos.x, pos.y - TOUCH_LIFT_PX);
+  }
   let RENDER_AA = true;
   let RENDER_SCALE = 1;
 
@@ -1415,6 +1595,7 @@
     ART_MAX_MM = settings.pasteMaxMm;
     BAKE_JOIN_TOL = settings.bakeJoinTol;
     JOIN_TOL = settings.joinTol;
+    LOOP_CLOSE_TOL = clamp(Number(settings.loopCloseTol) || 0.25, 0.01, 2);
     NUDGE_STEP = settings.nudgeStep;
     NOTE_SIZE = settings.noteSize;
     NOTE_MIN_PX = Math.max(0, +settings.noteMinPx || 0);
@@ -1427,7 +1608,11 @@
     setTint('sel', 'loopTintSel', '#2563eb');
     setTint('yellow', 'loopTintYellow', '#eab308');
     setTint('gray', 'loopTintGray', '#8a94a3');
-    loopFillVisible = settings.loopFillVisible !== 'off';
+    // The old single "Loop fills" toggle migrates to both new switches: a
+    // document saved with fills off stays off until the user says otherwise.
+    const legacyOff = settings.loopFillVisible === 'off';
+    loopFillCurrentVisible = settings.loopFillCurrent != null ? settings.loopFillCurrent !== 'off' : !legacyOff;
+    loopFillOthersVisible = settings.loopFillOthers != null ? settings.loopFillOthers !== 'off' : !legacyOff;
     loopFillScale = clamp(Number(settings.loopFillScale) || 50, 10, 100) / 100;
     SPLINE_SEG = settings.splineSeg;
     ARC_SEG = settings.arcSeg;
@@ -1436,6 +1621,7 @@
     OFFSET_TOL = settings.offsetTol;
     OFFSET_JOIN = settings.offsetJoin;
     OFFSET_ARC_TOL = settings.offsetArcTol;
+    WALL_DRAG_MM = clamp(+settings.wallDragMm || 0, 0, 50);
     POINT_SIZE = settings.pointSize;
     POINT_ZOOM_MIN = settings.pointZoomMin / 100;
     POINT_ZOOM_MAX = Math.max(settings.pointZoomMin, settings.pointZoomMax) / 100;
@@ -1452,6 +1638,8 @@
     if (cnc) cnc.tol = settings.cncFlatten;
     // the text tracer caches by raster size, so drop it whenever it changes
     if (textTraceCache && textTraceCache.clear) textTraceCache.clear();
+    syncWallInput();
+    syncWallIndicator();
     invalidateLoops();
     if (W > 1) resize();   // pick up the new canvas quality and repaint
     if (typeof updateCncTolField === 'function') updateCncTolField();
@@ -1706,6 +1894,7 @@
     saveSettings();
     fillSettingsForm();
     refreshLinkedSettings();
+    syncWallIndicator();
     render();
     // P1-13: Apply keeps the modal open — the search + tweak loop stays alive.
     // Close explicitly with Close / Esc / backdrop.
@@ -1718,6 +1907,7 @@
     applySettings();
     saveSettings();
     fillSettingsForm();
+    syncWallIndicator();
     render();
     toast('Settings back to their defaults');
   }
@@ -1763,8 +1953,12 @@
     selection: [],
     groupSelect: false,
     snap: true,
+    // F1/F2 mode: 'select' (move objects, points/lines locked, no node
+    // markers) vs 'node' (edit points/lines, node markers show on selection).
+    // Default is F1; init() forces it on every reload.
+    mode: 'select',
     showGrid: true,
-    showPoints: true,
+    showPoints: false,
     showLoops: true,
     raw: null,
     // Touch toggle state for Shift, Ctrl, Alt (used when no modifier key is pressed)
@@ -1793,7 +1987,7 @@
     solverCost: null,
     solveMode: 'release',      // 'live' | 'release' | 'manual'
     solveDirty: false,         // geometry has been edited since the last solve
-    offsetJob: null,           // live offset drafting (Ctrl+O)
+    offsetJob: null,           // live offset drafting (Ctrl+J)
     fitted: false,
     polySides: 6,
     polyInner: 50
@@ -2140,6 +2334,15 @@
     return true;
   }
 
+  // Drag wall borrows the whole select-mode interaction (pick, marquee, body
+  // drag, loop click) and only adds the collision envelope on top. Keeping it a
+  // real tool (W) means the ribbon/menu can show it as a mode; every select-mode
+  // branch below has to accept it as the same interaction.
+  function isSelectLikeTool(tool) {
+    const t = tool || ui.tool;
+    return t === 'select' || t === 'dragwall';
+  }
+
   function setTool(tool) {
     if (ui.transform.pending) {
       toast('Apply or cancel the transform first');
@@ -2151,6 +2354,7 @@
       ui.xfHits = [];
       document.body.classList.remove('xf-active');
       document.body.classList.remove('xf-pending');
+      ui.toolBeforeTransform = null;   // explicit tool switch: no restore target
     }
     if (ui.tool === tool) return;
     cancelDraft();
@@ -2162,6 +2366,95 @@
     render();
   }
 
+  // Circumcenter of three points; the returned c/start/end describe the arc
+  // that passes through all three with start..end as the CCW endpoints (the
+  // middle point lies on the drawn curve). Returns null when collinear.
+  function threePointArcCenter(a, b, m) {
+    const ax = a.x, ay = a.y, bx = b.x, by = b.y, mx = m.x, my = m.y;
+    const d = 2 * (ax * (by - my) + bx * (my - ay) + mx * (ay - by));
+    if (Math.abs(d) < 1e-12) return null;
+    const a2 = ax * ax + ay * ay;
+    const b2 = bx * bx + by * by;
+    const m2 = mx * mx + my * my;
+    const ux = (a2 * (by - my) + b2 * (my - ay) + m2 * (ay - by)) / d;
+    const uy = (a2 * (mx - bx) + b2 * (ax - mx) + m2 * (bx - ax)) / d;
+    const ang = p => {
+      const t = Math.atan2(p.y - uy, p.x - ux);
+      return t < 0 ? t + TAU : t;
+    };
+    const aA = ang(a), aB = ang(b), aM = ang(m);
+    const ccw = (p, q) => {
+      const t = q - p;
+      return t <= 0 ? t + TAU : t;
+    };
+    const start = ccw(aA, aM) < ccw(aA, aB) ? a : b;
+    return { c: { x: ux, y: uy }, start, end: start === a ? b : a };
+  }
+
+  // Mobile tap-on-icon: an existing point selection seeds/completes the shape
+  // instead of opening a blank draft. Line + 2 pts = connect; + 1 pt = start
+  // the chain from it. Circle + 1 pt = centre (tap for radius). Arc + 2 pts =
+  // endpoints, next tap is the through-point (3-point arc).
+  function toolIconTapped(tool) {
+    if (xfBlock()) return;
+    if (tool === 'line' || tool === 'arc' || tool === 'circle') {
+      const pts = selectedPointIds();
+      if (tool === 'line' && pts.length === 2) {
+        const a = P(pts[0]), b = P(pts[1]);
+        if (a && b && dist(a, b) >= 1e-9) {
+          pushHistory();
+          const id = newId();
+          state.entities[id] = { id, type: 'line', a: pts[0], b: pts[1], color: ui.color };
+          ui.selection = [{ kind: 'entity', id }];
+          setTool('line');
+          requestSolve();
+          commit();
+          return;
+        }
+      }
+      if (tool === 'line' && pts.length === 1) {
+        const a = P(pts[0]);
+        if (a) {
+          setTool('line');
+          ui.draft = { type: 'line', a: { x: a.x, y: a.y, id: pts[0] }, chain: [] };
+          updateUI();
+          render();
+          return;
+        }
+      }
+      if (tool === 'circle' && pts.length === 1) {
+        const a = P(pts[0]);
+        if (a) {
+          setTool('circle');
+          ui.draft = { type: 'circle', c: { x: a.x, y: a.y, id: pts[0] } };
+          updateUI();
+          render();
+          return;
+        }
+      }
+      if (tool === 'arc' && pts.length === 2) {
+        const a = P(pts[0]), b = P(pts[1]);
+        if (a && b) {
+          setTool('arc');
+          ui.draft = {
+            type: 'arc', stage: 2,
+            a: { x: a.x, y: a.y, id: pts[0] },
+            b: { x: b.x, y: b.y, id: pts[1] },
+            fullCircle: false
+          };
+          updateUI();
+          render();
+          return;
+        }
+      }
+    }
+    // Tap toggle: tapping the Drag wall button while it is already active
+    // returns to Select. On a phone the ribbon is on a different tab than
+    // Select, so without this there is no quick way back to the normal mode.
+    if (tool === 'dragwall' && ui.tool === 'dragwall') { setTool('select'); return; }
+    setTool(tool);
+  }
+
   function updateCanvasCursor() {
     if (ui.pan) {
       canvas.style.cursor = 'grabbing';
@@ -2171,7 +2464,7 @@
       canvas.style.cursor = ui.drag && ui.drag.kind && ui.drag.kind.indexOf('xf') === 0 ? 'grabbing' : 'default';
       return;
     }
-    if (ui.tool === 'select') {
+    if (ui.tool === 'select' || ui.tool === 'dragwall') {
       canvas.style.cursor = ui.hover && ui.hover.kind === 'partMarker' ? 'grab' : 'default';
     } else if (ui.tool === 'trim') {
       canvas.style.cursor = 'crosshair';
@@ -2219,6 +2512,21 @@
         render();
         return;
       }
+    } else if (d.type === 'arc') {
+      if (d.stage === 2) {
+        d.stage = 1;
+        delete d.b;
+        d.fullCircle = false;
+        toast('Back to the first endpoint — click the second, Esc again to cancel');
+        updateUI();
+        render();
+        return;
+      } else if (d.stage === 1) {
+        cancelDraft();
+        updateUI();
+        render();
+        return;
+      }
     }
     cancelDraft();
     updateUI();
@@ -2259,6 +2567,26 @@
     if (!b) {
       view = { ox: W / 2, oy: H / 2, zoom: 1 };
       render();
+      return;
+    }
+    const margin = 58;
+    const w = Math.max(1, b.maxX - b.minX);
+    const h = Math.max(1, b.maxY - b.minY);
+    let zoom = Math.min((W - margin * 2) / w, (H - margin * 2) / h, 12);
+    zoom = clamp(zoom, 0.03, 100);
+    view.zoom = zoom;
+    view.ox = W / 2 - ((b.minX + b.maxX) / 2) * zoom;
+    view.oy = H / 2 - ((b.minY + b.maxY) / 2) * zoom;
+    render();
+    scheduleViewSave();
+  }
+
+  // Inkscape-style "3" = fit the selection (zoom to what is selected).
+  // Uses the same framing math as fitView but off the selection bbox.
+  function fitSelection() {
+    const b = selectionBounds();
+    if (!b) {
+      toast('Select something first');
       return;
     }
     const margin = 58;
@@ -2409,6 +2737,7 @@
       }
       localStorage.setItem(STORAGE_KEY, serializeDoc());
       docDirty = false;
+      paintFileDirty(false);
       if (!quiet) setSavedLabel('saved');
     } catch (err) {
       if (!quiet) toast('Browser storage is unavailable', { type: 'error' });
@@ -2486,6 +2815,7 @@
   function scheduleSave() {
     docDirty = true;
     setSavedLabel('saving...');
+    paintFileDirty(true);
     clearTimeout(saveTimer);
     saveTimer = setTimeout(persistNow, 350);
   }
@@ -2797,6 +3127,16 @@
     return true;
   }
 
+  // The colour of the geometry being dragged (for weld permission): the colour
+  // of the point's owning entities if they all agree, else null (no weld).
+  function dragWeldColor(pid) {
+    const uses = pointUses(pid);
+    if (!uses || !uses.length) return null;
+    const c = colorOf(uses[0]);
+    for (const e of uses) if (colorOf(e) !== c) return null;
+    return c;
+  }
+
   function materializePoint(snap) {
     // Welding is topology, not a dimension: clicking onto an existing point of
     // the SAME colour reuses it, so a drawn polyline stays one connected chain
@@ -2890,12 +3230,12 @@
       if (onGeometry) return onGeometry;
       // A loop centre is the last geometry snap: the midpoint of a line is a
       // more specific feature and wins over it.
-      const loopSnap = snapLoopCentroid(world, tol);
+      const loopSnap = snapLoopCentroid(world, tol, opts.skipLoops);
       if (loopSnap) return loopSnap;
       // The grid is only a drafting aid: no grid on screen, no grid snap.
       if (ui.showGrid) {
         const step = gridStep();
-        return { x: Math.round(world.x / step) * step, y: Math.round(world.y / step) * step };
+        return { x: Math.round(world.x / step) * step, y: Math.round(world.y / step) * step, grid: true };
       }
     }
     return { x: world.x, y: world.y };
@@ -2908,27 +3248,43 @@
   // `virtual: true` means materializePoint() must only create a point here, not
   // invent a Midpoint constraint: a loop centre has no single entity to attach
   // one to.
-  function snapLoopCentroid(world, tol) {
+  let loopCentroidLoops = null;
+  let loopCentroidMap = null;
+  function loopCentroids() {
+    const loops = getLoops();
+    if (loopCentroidLoops !== loops) {
+      loopCentroidLoops = loops;
+      const m = new Map();
+      for (const loop of loops) {
+        if (!loop.poly || loop.poly.length < 3) continue;
+        let a2 = 0, cx = 0, cy = 0;
+        const poly = loop.poly;
+        for (let i = 0; i < poly.length; i++) {
+          const a = poly[i];
+          const b = poly[(i + 1) % poly.length];
+          const cross = a.x * b.y - b.x * a.y;
+          a2 += cross;
+          cx += (a.x + b.x) * cross;
+          cy += (a.y + b.y) * cross;
+        }
+        if (Math.abs(a2) < 1e-9) continue;
+        m.set(loop, { mx: cx / (3 * a2), my: cy / (3 * a2) });
+      }
+      loopCentroidMap = m;
+    }
+    return loopCentroidMap;
+  }
+  function snapLoopCentroid(world, tol, skipLoops) {
     let best = null;
     let bestD = tol;
-    for (const loop of getLoops()) {
-      if (!loop.poly || loop.poly.length < 3) continue;
-      let a2 = 0, cx = 0, cy = 0;
-      for (let i = 0; i < loop.poly.length; i++) {
-        const a = loop.poly[i];
-        const b = loop.poly[(i + 1) % loop.poly.length];
-        const cross = a.x * b.y - b.x * a.y;
-        a2 += cross;
-        cx += (a.x + b.x) * cross;
-        cy += (a.y + b.y) * cross;
-      }
-      if (Math.abs(a2) < 1e-9) continue;
-      const mx = cx / (3 * a2);
-      const my = cy / (3 * a2);
-      const d = Math.hypot(mx - world.x, my - world.y);
+    for (const [loop, c] of loopCentroids()) {
+      // A body drag excludes the loops it is dragging (their centres move with
+      // the selection); drafting and single-point drags pass no skip set.
+      if (skipLoops && skipLoops.has(loop)) continue;
+      const d = Math.hypot(c.mx - world.x, c.my - world.y);
       if (d < bestD) {
         bestD = d;
-        best = { x: mx, y: my, virtual: true, loop: true };
+        best = { x: c.mx, y: c.my, virtual: true, loop: true };
       }
     }
     return best;
@@ -2952,6 +3308,12 @@
       if (skipEntities && skipEntities.has(+key)) continue;
       const a = P(e.a), b = P(e.b);
       if (!a || !b) continue;
+      // cheap AABB reject before any distance math: if the cursor is outside
+      // the segment's box by more than tol, no point on the segment can be
+      // within tol of it — four compares beat a hypot per line.
+      const minx = Math.min(a.x, b.x), maxx = Math.max(a.x, b.x);
+      const miny = Math.min(a.y, b.y), maxy = Math.max(a.y, b.y);
+      if (world.x < minx - tol || world.x > maxx + tol || world.y < miny - tol || world.y > maxy + tol) continue;
       const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
       const dm = Math.hypot(mx - world.x, my - world.y);
       if (dm < bestMidD) {
@@ -3492,11 +3854,9 @@
           const e1 = state.entities[c.line1];
           const e2 = state.entities[c.line2];
           if (!e1 || !e2 || e1.type !== 'line' || e2.type !== 'line') continue;
-          const a1 = GP(e1.a), b1 = GP(e1.b);
-          const a2 = GP(e2.a), b2 = GP(e2.b);
-          const ang1 = Math.atan2(b1.y - a1.y, b1.x - a1.x);
-          const ang2 = Math.atan2(b2.y - a2.y, b2.x - a2.x);
-          const deg = wrapPi(ang2 - ang1) * 180 / Math.PI;
+          const g = angleRays(GP(e1.a), GP(e1.b), GP(e2.a), GP(e2.b));
+          if (!g) continue;
+          const deg = g.delta * 180 / Math.PI;
           out.push(wrapDeg(deg - c.value) * 2);
         } else if (c.type === 'fix') {
           if (!state.points[c.p]) continue;
@@ -3540,6 +3900,18 @@
     // the hitch felt while dragging a free object around a drawing that has
     // constraints somewhere else. Only a drag-carrying call pays for the
     // extra probe: everything else still probes once, as before.
+    // Drag targets for points no constraint reads are dead weight: such a
+    // point is not a solver variable, so its target residual can never pull
+    // anything — it only enlarges the Jacobian (a select-all drag carried
+    // 16k targets for 4 constraints). Hold them out before the probe so the
+    // variable set stays the constraint-read points.
+    if (opts.dragTargets && opts.dragTargets.length) {
+      gateProbe = true;
+      residual([]);
+      gateProbe = false;
+      const read = new Set(refPts);
+      opts = { ...opts, dragTargets: opts.dragTargets.filter(t => read.has(+t.p)) };
+    }
     if (opts.dragPoints) {
       gateProbe = true;
       residual([]);        // constraints only — the drag targets are held out
@@ -3561,7 +3933,7 @@
         const r = residual([]);
         for (let i = 0; i < r.length; i++) cost += r[i] * r[i];
         // Not solved, so the cost the status chip shows must not move either.
-        return { cost, iterations: 0, ok: false, skipped: true };
+        return { cost, iterations: 0, ok: false, skipped: true, moved: false };
       }
     }
 
@@ -3636,7 +4008,7 @@
     if (!vars.length) {
       const r = residual([]);
       const cost = r.reduce((s, v) => s + v * v, 0);
-      return { cost, iterations: 0, ok: cost < 1e-7 };
+      return { cost, iterations: 0, ok: cost < 1e-7, moved: false };
     }
 
     // A step cap keeps one iteration from teleporting the shape across the
@@ -3651,13 +4023,18 @@
     const stalled = !result.converged && !(result.cost < 1e-2);
     if (stalled) {
       markUnsolved();
-      return { cost: result.cost, iterations: result.iterations, ok: false, stalled: true };
+      return { cost: result.cost, iterations: result.iterations, ok: false, stalled: true, moved: false };
     }
+    let moved = false;
     for (let i = 0; i < vars.length; i++) {
       const v = vars[i];
-      if (v.k === 'px') state.points[v.id].x = result.x[i];
-      else if (v.k === 'py') state.points[v.id].y = result.x[i];
-      else {
+      if (v.k === 'px') {
+        if (Math.abs(result.x[i] - state.points[v.id].x) > 1e-9) moved = true;
+        state.points[v.id].x = result.x[i];
+      } else if (v.k === 'py') {
+        if (Math.abs(result.x[i] - state.points[v.id].y) > 1e-9) moved = true;
+        state.points[v.id].y = result.x[i];
+      } else {
         // A radius may not run away: a nearly singular system can push it to
         // absurd values, and a circle that jumps from r=3 to r=300 is never what
         // the user meant. The solve may change it by at most 2x in either
@@ -3665,10 +4042,12 @@
         const before = Math.max(0.01, state.entities[v.id].r);
         const lo = Math.max(0.01, before / RADIUS_SOLVE_LIMIT);
         const hi = before * RADIUS_SOLVE_LIMIT;
-        state.entities[v.id].r = clamp(result.x[i], lo, hi);
+        const nr = clamp(result.x[i], lo, hi);
+        if (Math.abs(nr - before) > 1e-9) moved = true;
+        state.entities[v.id].r = nr;
       }
     }
-    return { cost: result.cost, iterations: result.iterations, ok: result.cost < 1e-6 };
+    return { cost: result.cost, iterations: result.iterations, ok: result.cost < 1e-6, moved };
   }
 
 
@@ -3784,8 +4163,10 @@
         rebaseDrag(d, d.lastDx || 0, d.lastDy || 0);
         // Nothing moved (gate) or nothing is allowed to (manual): the frame
         // the pointermove scheduled is already the right one — skip the full
-        // panel rebuild and the repaint that made each slot hitch.
-        if (res == null || res.skipped) return;
+        // panel rebuild and the repaint that made each slot hitch. A solve
+        // that ran but displaced nothing (rigid drag of an already-satisfied
+        // constraint) is the same case: the geometry on screen is current.
+        if (res == null || res.skipped || res.moved === false) return;
         invalidateLoops();
         updateUI();
         scheduleRender();
@@ -3822,6 +4203,57 @@
     }
     d.offX = dx || 0;
     d.offY = dy || 0;
+  }
+
+  // Arrow-key rotation while dragging a CLONES-ONLY selection (Left/Right = 5°).
+  // Each instance matrix turns about the grab point; the wall envelope turns
+  // with it so the classic collision stays aligned. The drag keeps applying its
+  // translation on top: we rotate the current pose, then rewrite the press-base
+  // so base + delta still reproduces it on the next pointermove.
+  function rotateDragClones(d, deg) {
+    if (!d || d.kind !== 'entity' || !d.clones || !d.clones.length) return false;
+    if (d.ids && d.ids.length) return false;   // mixed selection: not clones-only
+    const a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+    const pivot = d.rotPivot || d.grab || d.startWorld;
+    if (!pivot) return false;
+    d.rotPivot = pivot;
+    // Recover the translation the drag has applied (current matrix minus base).
+    let dx = 0, dy = 0;
+    for (const cl of d.clones) {
+      const e = state.entities[cl.id];
+      const inst = e && e.instances && e.instances[0];
+      const base = cl.base && cl.base[0];
+      if (inst && inst.m && base) { dx = inst.m[4] - base[4]; dy = inst.m[5] - base[5]; break; }
+    }
+    // Turn the wall envelope (press-pose world polys) about the grab pivot.
+    if (d.wall && d.wall.polys) {
+      const rw = (x, y) => ({
+        x: pivot.x + c * (x - pivot.x) - s * (y - pivot.y),
+        y: pivot.y + s * (x - pivot.x) + c * (y - pivot.y)
+      });
+      d.wall.polys = d.wall.polys.map(pts => pts.map(p => rw(p.x, p.y)));
+      d.wall.boxes = d.wall.polys.map(polyBBox);
+      d.wall.box = wallBoxUnion(d.wall.boxes);
+    }
+    // Turn the current instance matrices about the moved pivot (pivot + delta),
+    // then rebase so the drag's base + delta reproduces the rotated pose.
+    const ccx = pivot.x + dx, ccy = pivot.y + dy;
+    const Mc = [c, s, -s, c, ccx - (c * ccx - s * ccy), ccy - (s * ccx + c * ccy)];
+    for (const cl of d.clones) {
+      const e = state.entities[cl.id];
+      if (!e || e.type !== 'array') continue;
+      e.instances = (e.instances || []).map((inst, i) => {
+        if (!inst || !inst.m) return inst;
+        const m = matMul(Mc, inst.m);
+        if (cl.base) cl.base[i] = [m[0], m[1], m[2], m[3], m[4] - dx, m[5] - dy];
+        return { ...inst, m };
+      });
+      delete e.shapes;
+    }
+    d.moved = true;
+    invalidateLoops();
+    scheduleRender();
+    return true;
   }
 
   // The solve that runs when a drag ends. Unlike a plain projection, this one
@@ -4434,11 +4866,8 @@
   }
 
   function measureAngleDeg(e1, e2) {
-    const d1 = dirOf(e1);
-    const d2 = dirOf(e2);
-    const a1 = Math.atan2(d1.y, d1.x);
-    const a2 = Math.atan2(d2.y, d2.x);
-    return wrapPi(a2 - a1) * 180 / Math.PI;
+    const g = angleRays(P(e1.a), P(e1.b), P(e2.a), P(e2.b));
+    return g ? g.delta * 180 / Math.PI : 0;
   }
 
   function isDimensionConstraint(c) {
@@ -4488,15 +4917,29 @@
 
   // Safe arithmetic parser: numbers, + - * /, parentheses, unary sign and
   // postfix % (percent of the current value). Examples: "100*2", "150%", "(20+5)*3".
+  // Numeric field parser. `base` is the value the field currently shows.
+  //   -1100           absolute — typing over the shown value just sets it,
+  //                   no prefix needed (a bare signed number is NEVER relative)
+  //   +10             relative: base + 10 (also "+10*2", "+(3+4)")
+  //   10- / 10+       relative the other way round: base - 10 / base + 10
+  //   -1200-10        plain arithmetic on the typed numbers: -1210
+  //   150%            150% of base
+  //   =-10            "=" forces a literal reading (escape hatch)
   function evalFormula(text, base) {
-    const raw = String(text == null ? '' : text).replace(/\s+/g, '');
+    const raw0 = String(text == null ? '' : text).replace(/\s+/g, '');
     const b = isFinite(base) ? base : 0;
+    if (!raw0) return NaN;
+    const forceLiteral = raw0[0] === '=';
+    const raw = forceLiteral ? raw0.slice(1) : raw0;
     if (!raw) return NaN;
-    // A leading + / - with no left operand means "relative to the current
-    // value": +20 on a field showing 100 edits as 100+20. Without this the
-    // primary() below sees no number and the whole field is NaN.
-    const s = (/^[+-]/.test(raw) && !/^[+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?[+\-*/]/.test(raw) && !/^\(/.test(raw))
-      ? String(b) + raw : raw;
+    // Relative edits are the ones that cannot be a value by themselves: a
+    // leading "+" (+10) or a trailing operator (10-, 10+). A leading "-"
+    // belongs to the number or the arithmetic: "-1100" is absolute -1100,
+    // "-1200-10" is -1210 — never base-relative.
+    const trail = !forceLiteral && /^(.+?)([+-])$/.exec(raw);
+    const s = (!forceLiteral && raw[0] === '+') ? String(b) + raw
+      : trail ? String(b) + trail[2] + '(' + trail[1] + ')'
+        : raw;
     let i = 0;
     function expr() {
       let v = term();
@@ -4723,6 +5166,56 @@
     if (bb.maxY > b.maxY) b.maxY = bb.maxY;
     return b;
   }
+  // Everything that belongs INSIDE one outer loop: the entities fully inside
+  // it (nested loops' lines, stray lines, texts) plus the point-less containers
+  // (art groups, clone arrays, parts) whose bounds sit inside, plus the member
+  // entities of any art group caught this way (a group's members carry the
+  // geometry, so translating the group id alone would move nothing).
+  function arrangeLoopContents(loop, selEnts) {
+    const ids = new Set();
+    for (const id of loopEntities(loop)) ids.add(+id);
+    // ONLY explicitly selected children travel with the parent. Whatever else
+    // happens to sit inside the loop (unselected objects, geometry on other
+    // layers) must stay where it is — arrange never kidnaps bystanders.
+    const kids = entitiesInsideLoop(loop)
+      .filter(id => selEnts.has(+id))
+      .filter(id => {
+        const e = state.entities[id];
+        return e && entityEditable(e);
+      });
+    // One group index per call: the old full entity scan PER queued kid was
+    // O(kids × entities) — a whole-document selection made it ~90M iterations.
+    const byGroup = new Map();
+    for (const eid in state.entities) {
+      const m = state.entities[eid];
+      if (!m || m.group == null) continue;
+      let g = byGroup.get(m.group);
+      if (!g) byGroup.set(m.group, g = []);
+      g.push(+eid);
+    }
+    const queue = kids.slice();
+    for (let qi = 0; qi < queue.length; qi++) {
+      const id = +queue[qi];
+      if (ids.has(id)) continue;
+      ids.add(id);
+      const e = state.entities[id];
+      if (!e) continue;
+      // A selected art group travels as one: its guide points and the member
+      // entities carrying the geometry follow (members respect the layer rule).
+      if (e.type === 'art' && Array.isArray(e.guide)) {
+        for (const gid of e.guide) {
+          const g = state.entities[gid];
+          if (g && entityEditable(g)) ids.add(+gid);
+        }
+      }
+      for (const mid of byGroup.get(id) || []) {
+        const m = state.entities[mid];
+        if (m && entityEditable(m) && !ids.has(mid)) queue.push(mid);
+      }
+    }
+    return Array.from(ids);
+  }
+
   function arrangeableUnits() {
     const selEnts = new Set();
     const selPts = new Set();
@@ -4735,6 +5228,7 @@
     // 1) complete loops: all of the loop's ENTITIES selected, or all of its
     //    POINTS selected (a marquee leaves point selections, which the entity
     //    cascade may not fill in when pick filters are off)
+    const loops = [];
     for (const loop of getLoops()) {
       const ids = loopEntities(loop);
       if (!ids.length) continue;
@@ -4755,19 +5249,52 @@
       let b = null;
       for (const id of ids) {
         b = mergeBounds(b, entityTightBounds(state.entities[id]));
-        seenEnt.add(+id);
       }
-      if (b) units.push({ ids, b });
+      if (b) loops.push({ loop, ids, b });
     }
-    // 2) container objects (group / clone-array / part), skipping any already
-    //    consumed as part of a loop unit
+    // 1b) compound rule: with several compounds selected, only the OUTERMOST
+    //     loop of each compound is an arrange unit — everything fully inside
+    //     the loop (nested loops, lines, texts, groups, clones) travels with
+    //     its parent, exactly like Drag wall treats the compound. A selected
+    //     loop with a selected ancestor in the LoopTree is NOT its own unit.
+    loops.sort((a, b2) => b2.b.maxX - b2.b.minX - (a.b.maxX - a.b.minX) ||
+                          (b2.b.maxY - b2.b.minY) - (a.b.maxY - a.b.minY));
+    loopTree();
+    const outer = [];
+    const outerSet = new Set();
+    for (const cand of loops) {
+      let inside = false;
+      for (let p = cand.loop.parent; p; p = p.parent) {
+        if (outerSet.has(p)) { inside = true; break; }
+      }
+      if (!inside) { outer.push(cand); outerSet.add(cand.loop); }
+    }
+    for (const o of outer) {
+      const ids = arrangeLoopContents(o.loop, selEnts);
+      if (!ids.length) continue;
+      let b = o.b;
+      for (const id of ids) {
+        if (!o.ids.includes(id)) {
+          const e = state.entities[id];
+          if (e) b = mergeBounds(b, entityTightBounds(e));
+        }
+        seenEnt.add(id);
+      }
+      units.push({ ids, b });
+    }
+    // 2) container objects (group / clone-array / part) and framed objects
+    //    (text / image), skipping any already consumed as part of a loop unit.
+    //    A text owns no LOOP — only its frame points — so without this pass a
+    //    selected text was invisible to arrange (selecting text + a circle
+    //    left just one unit and the arrange buttons stayed disabled).
     for (const id of selEnts) {
-      if (seenEnt.has(id)) continue;
+      if (seenEnt.has(+id)) continue;
       const e = state.entities[id];
       if (!e) continue;
-      if (e.type !== 'art' && e.type !== 'array' && e.type !== 'part') continue;
+      if (e.type !== 'art' && e.type !== 'array' && e.type !== 'part' &&
+          e.type !== 'text' && e.type !== 'image') continue;
       const bb = entityTightBounds(e);
-      if (bb) units.push({ ids: [id], b: bb });
+      if (bb) units.push({ ids: [+id], b: bb });
     }
     return units;
   }
@@ -4987,8 +5514,8 @@
     refreshSelectionDimensions(pids, eids, sx, sy);
   }
 
-  // Alt+R landing spot: focus L with its content selected, so a leading
-  // + / - edits relative to the current value (see evalFormula). Warns when
+  // Alt+R landing spot: focus L with its content selected, so typing +10 or
+  // 10- shifts relative to the current value (see evalFormula). Warns when
   // there is no selection instead of focusing a dead field.
   function focusFrameStrip() {
     updateTransformPanel(true);
@@ -5004,36 +5531,112 @@
   function updateTransformPanel(force) {
     const ids = ['tf-left', 'tf-top', 'tf-width', 'tf-height'];
     const els = ids.map(id => document.getElementById(id));
+    const wel = document.getElementById('tf-weight');
+    const zel = document.getElementById('tf-depth');
     if (!els[0]) return;
     const lock = document.getElementById('tf-lock');
     const b = xfBusy() ? null : selectionBounds();
     for (const el of els) el.disabled = !b;
     if (lock) lock.disabled = !b;
+    const ents = selectedEntities();
+    const hasEnts = ents.length > 0 && !!b;
+    if (wel) wel.disabled = !hasEnts;
+    if (zel) zel.disabled = !hasEnts;
     if (!b) {
       for (const el of els) if (force || document.activeElement !== el) el.value = '';
+      if (wel && (force || document.activeElement !== wel)) wel.value = '';
+      if (zel && (force || document.activeElement !== zel)) zel.value = '';
       return;
     }
-    const vals = [b.minX, b.maxY, b.maxX - b.minX, b.maxY - b.minY];
+    // World Y runs DOWN (canvas), so the visual top-left is (minX, minY):
+    // T edits the top edge, and W/H grow away from that corner.
+    const vals = [b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY];
     els.forEach((el, i) => {
       if (!force && document.activeElement === el) return;
       el.value = fmt(vals[i]);
     });
+    // Weight and depth are per-entity properties, not geometry: show the
+    // shared value when the whole selection agrees, blank when it is mixed.
+    if (wel && (force || document.activeElement !== wel)) {
+      const w0 = ents[0] ? (ents[0].sortWeight || 0) : 0;
+      const uni = ents.every(e => (e.sortWeight || 0) === w0);
+      wel.value = uni ? String(w0) : '';
+    }
+    if (zel && (force || document.activeElement !== zel)) {
+      const d0 = ents[0] ? (ents[0].depth || 0) : 0;
+      const uni = ents.every(e => (e.depth || 0) === d0);
+      zel.value = uni ? String(d0) : '';
+    }
+  }
+
+  // One numeric per-entity property edited from the strip (Wt -> sortWeight,
+  // Z -> depth). Absolute only: a plain number is the value itself, never an
+  // offset from the current one. Empty clears to 0. `parse` maps the typed
+  // text to the stored value, or returns null to reject it (toast label).
+  function applyEntityNumber(prop, raw, parse, rejectLabel) {
+    const ents = selectedEntities();
+    if (!ents.length) {
+      updateTransformPanel(true);
+      return;
+    }
+    const txt = String(raw == null ? '' : raw).trim();
+    const val = parse(txt);
+    if (val == null) {
+      toast(rejectLabel);
+      updateTransformPanel(true);
+      return;
+    }
+    pushHistory();
+    let changed = false;
+    for (const e of ents) {
+      if ((e[prop] || 0) !== val) { e[prop] = val; changed = true; }
+    }
+    if (changed) {
+      invalidateLoops();
+      commit();
+    } else {
+      history.pop();
+      updateHistoryButtons();
+      updateTransformPanel(true);
+    }
   }
 
   function applyTransformField(field, raw) {
     if (xfBlock()) return;
+    if (field === 'weight') {
+      // Absolute, but arithmetic is allowed (1200+100, 50*2). The "=" prefix
+      // forces the literal reading, so "+10" is the value 10, never a shift.
+      applyEntityNumber('sortWeight', raw, (txt) => {
+        if (txt === '') return 0;
+        const v = evalFormula(txt[0] === '=' ? txt : '=' + txt, 0);
+        if (!isFinite(v)) return null;
+        return Math.max(-100, Math.min(100, Math.round(v)));
+      }, 'Enter a number between -100 and 100');
+      return;
+    }
+    if (field === 'depth') {
+      // Millimetre depth override for the machine. 0 / empty means "no
+      // override": KaryaCNC then uses its global carved/zdown depth.
+      applyEntityNumber('depth', raw, (txt) => {
+        if (txt === '') return 0;
+        const v = evalFormula(txt[0] === '=' ? txt : '=' + txt, 0);
+        if (!isFinite(v) || v < 0) return null;
+        return v > 0 ? Math.round(v * 100) / 100 : 0;
+      }, 'Enter a depth in mm above 0 (empty = machine default)');
+      return;
+    }
     const b = selectionBounds();
     if (!b) {
       updateTransformPanel(true);
       return;
     }
     const cur = field === 'left' ? b.minX
-      : field === 'top' ? b.maxY
+      : field === 'top' ? b.minY
         : field === 'width' ? b.maxX - b.minX
           : b.maxY - b.minY;
     const target = evalFormula(raw, cur);
     if (!isFinite(target)) {
-      toast('Enter a number or a formula, e.g. 100*2 or 150%');
+      toast('Enter a number, +10 or 10- to shift from the current value, or a formula like 100*2 or 150%');
       updateTransformPanel(true);
       return;
     }
@@ -5049,7 +5652,7 @@
     if (field === 'left') {
       moveSelection(target - b.minX, 0);
     } else if (field === 'top') {
-      moveSelection(0, target - b.maxY);
+      moveSelection(0, target - b.minY);
     } else {
       const curSize = field === 'width' ? b.maxX - b.minX : b.maxY - b.minY;
       if (curSize <= 1e-9) {
@@ -5060,8 +5663,10 @@
         return;
       }
       const factor = target / curSize;
-      if (field === 'width') scaleSelection(factor, lock ? factor : 1, b.minX, b.maxY);
-      else scaleSelection(lock ? factor : 1, factor, b.minX, b.maxY);
+      // pivot = visual top-left (minX, minY): width grows rightward, height
+      // grows downward, the top-left corner never moves
+      if (field === 'width') scaleSelection(factor, lock ? factor : 1, b.minX, b.minY);
+      else scaleSelection(lock ? factor : 1, factor, b.minX, b.minY);
     }
     invalidateLoops();
     requestSolve(pinned);
@@ -5119,7 +5724,11 @@
     if (hasPart) { toast('Parts rotate with the transform tool (R) — they are pose-driven'); return; }
     pushHistory();
     const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
-    const phi = deg * Math.PI / 180;
+    // World Y runs DOWN, so the standard math rotation below turns CLOCKWISE
+    // on screen for a positive angle. `deg` is the VISUAL direction (CCW
+    // positive, matching the ↺ button, Ctrl+[ and the toast), hence the sign
+    // flip here — one place, so every caller speaks the same language.
+    const phi = -deg * Math.PI / 180;
     const c = Math.cos(phi), s = Math.sin(phi);
     let removed = 0;
     for (const cid in state.constraints) {
@@ -5172,15 +5781,15 @@
       (removed ? ' — ' + removed + ' H/V constraint(s) removed' : ''));
   }
 
-  // Ctrl+M: CAD move — click a reference point, then a destination point, then
-  // confirm (and edit) the resulting dx,dy in the prompt. Enter moves.
+  // Ctrl+Shift+M: CAD move — click a reference point, then a destination point,
+  // then confirm (and edit) the resulting dx,dy in the prompt. Enter moves.
   function startMoveJob() {
     if (xfBlock()) return;
     const pinned = selectionPointIds();
     // a parts-only selection owns no points but can still be moved by pose
     const hasMovablePart = selectedEntities().some(e => e.type === 'part' && !e.fixed);
     if (!pinned.size && !hasMovablePart) {
-      toast('Select objects first, then press Ctrl+M');
+      toast('Select objects first, then press Ctrl+Shift+M');
       return;
     }
     ui.moveJob = { stage: 'ref', ref: null };
@@ -6027,6 +6636,12 @@
       commit();
     }
     cancelDraft();
+    // Remember the mode we came from: Transform (Ctrl+M) is used mid-workflow —
+    // e.g. while arranging parts in Drag wall mode (W). Leaving Transform must
+    // put the user back into that mode instead of always dropping to Select,
+    // or they would have to press W again after every single transform.
+    if (ui.tool === 'dragwall') ui.toolBeforeTransform = 'dragwall';
+    else if (ui.tool !== 'transform') ui.toolBeforeTransform = null;
     ui.tool = 'transform';
     // xfPivot() is the remembered pivot for this exact selection, falling back to
     // the bounding-box centre. Writing the centre unconditionally here made the
@@ -6041,7 +6656,10 @@
 
   function exitTransformMode() {
     if (ui.transform.pending) xfCancel();
-    ui.tool = 'select';
+    // Back to the mode Transform was entered from (Drag wall stays on — see
+    // enterTransformMode); otherwise the plain Select tool.
+    ui.tool = ui.toolBeforeTransform === 'dragwall' ? 'dragwall' : 'select';
+    ui.toolBeforeTransform = null;
     ui.transform.pivot = null;
     ui.transform.frame = 0;
     ui.xfHits = [];
@@ -6464,7 +7082,7 @@
         toast('Measure added');
         return;
       }
-      const input = prompt('Radius (enter "rx, ry" for an ellipse)', fmt(e.r));
+      const input = prompt('Diameter (enter "rx, ry" radii for an ellipse)', fmt(e.r * 2));
       if (input == null) return;
       const pair = parsePairInput(input);
       if (pair) {
@@ -6495,7 +7113,7 @@
         toast('Enter a positive number or formula');
         return;
       }
-      const c = { type: 'radius', entity: e.id, value };
+      const c = { type: 'radius', entity: e.id, value: value / 2 };
       addConstraint(c, { solve: false });
       selectOnly('constraint', c.id);
       requestSolve();
@@ -7402,28 +8020,20 @@
     toast(count + ' loop' + (count === 1 ? '' : 's') + ' kept');
   }
 
-  // Everything a loop encloses: the entities whose nodes all sit inside its
-  // polygon. The loop's own outline is skipped — loopEntities has that.
+  // Everything a loop encloses: its subtree in the LoopTree — nested loops'
+  // outlines plus the leaf entities owned by any loop below it. The loop's own
+  // outline is skipped — loopEntities has that.
   function entitiesInsideLoop(loop) {
-    const poly = loop.poly;
-    if (!poly || poly.length < 3) return [];
+    const t = loopTree();
     const own = new Set(loopEntities(loop).map(Number));
-    const out = [];
-    for (const eid in state.entities) {
-      const id = +eid;
-      if (own.has(id)) continue;
-      const e = state.entities[eid];
-      let any = false;
-      let all = true;
-      for (const pid of entityPointIds(e)) {
-        const p = P(pid);
-        if (!p) continue;
-        any = true;
-        if (!pointInPoly(p, poly)) { all = false; break; }
+    const out = new Set();
+    for (const L of loopSubtree(loop)) {
+      if (L !== loop) {
+        for (const id of loopEntities(L)) if (!own.has(+id)) out.add(+id);
       }
-      if (any && all) out.push(id);
+      for (const id of t.leaves.get(L) || []) if (!own.has(+id)) out.add(+id);
     }
-    return out;
+    return Array.from(out);
   }
 
   // All loops containing the point, editable (active-layer) ones first, then
@@ -7511,7 +8121,7 @@
   }
 
   function selectLoopBelow(ev) {
-    if (ui.tool !== 'select') return;
+    if (!isSelectLikeTool()) return;
     if (!pickFilter.loop) return;   // pick filter: loops locked
     const pos = pointerPos(ev);
     const world = s2w(pos.x, pos.y);
@@ -8226,6 +8836,10 @@
         const b = P(e.b);
         if (!a || !b) continue;
         out.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, kind: 'mid' });
+      }
+      // closed-loop centres: a part can land on them too (like drafting)
+      for (const [, c] of loopCentroids()) {
+        out.push({ x: c.mx, y: c.my, kind: 'loop' });
       }
     }
     return out;
@@ -8954,7 +9568,12 @@
       sameEnds.add(Math.min(a, b) + ':' + Math.max(a, b));
     }
     const ids = Array.from(usedPoints);
-    const cell = Math.max(JOIN_TOL, 1e-4);
+    // Loop closure gets its own, wider tolerance: CAD exports leave rounding
+    // cracks (0.1-0.2 mm) at junctions that the CNC join tolerance refuses to
+    // bridge, and the shape then never reads as a loop. Topology only — no
+    // point is moved by this weld.
+    const closeTol = Math.max(JOIN_TOL, LOOP_CLOSE_TOL || 0);
+    const cell = Math.max(closeTol, 1e-4);
     const grid = new Map();
     for (const pid of ids) {
       const p = P(pid);
@@ -8975,7 +9594,7 @@
             if (+q <= +pid) continue;
             const pq = P(q);
             if (!pq) continue;
-            if (Math.hypot(p.x - pq.x, p.y - pq.y) >= JOIN_TOL) continue;
+            if (Math.hypot(p.x - pq.x, p.y - pq.y) >= closeTol) continue;
             if (!sameLayer(pid, q)) continue;
             if (sameEnds.has(Math.min(+pid, +q) + ':' + Math.max(+pid, +q))) continue;
             union(pid, q);
@@ -9059,14 +9678,30 @@
       }
     }
 
+    const normColor = (c) => String(c == null ? '' : c).toLowerCase();
     const usedEdges = new Set();
-    const bfs = (start, goal, skipKey) => {
+    // Loop extraction is colour-aware: between all cycles through the start edge
+    // we pick the one that stays monochrome, so segments of the same colour are
+    // grouped into one loop before a mixed-colour cycle (e.g. a different-colour
+    // arc bridging two corners) gets a chance to consume them. Same-colour edges
+    // cost 0, any other colour costs 1, so Dijkstra returns the most
+    // colour-consistent cycle — a pure BFS would happily take the first, shortest
+    // path whatever its colours, and merge e.g. a black arc with one green edge
+    // into a loop, destroying the green rectangle it spans.
+    const bfs = (start, goal, skipKey, startColor) => {
+      const dist = {};
       const prevEdge = {};
       const prevNode = {};
-      const q = [start];
-      const seen = new Set([start]);
-      for (let qi = 0; qi < q.length; qi++) {
-        const u = q[qi];
+      dist[start] = 0;
+      let frontier = [[0, start]];
+      const seen = new Set();
+      while (frontier.length) {
+        let best = 0;
+        for (let i = 1; i < frontier.length; i++) if (frontier[i][0] < frontier[best][0]) best = i;
+        const [d, u] = frontier[best];
+        frontier.splice(best, 1);
+        if (seen.has(u)) continue;
+        seen.add(u);
         if (u === goal) {
           const path = [];
           let cur = goal;
@@ -9082,10 +9717,16 @@
           const eg = edges[ek];
           const v = eg.aNode === u ? eg.bNode : eg.aNode;
           if (seen.has(v)) continue;
-          seen.add(v);
-          prevEdge[v] = ek;
-          prevNode[v] = u;
-          q.push(v);
+          const ent = state.entities[eg.entity];
+          const ec = normColor(ent && ent.color);
+          const w = (startColor && ec && ec === startColor) ? 0 : 1;
+          const nd = d + w;
+          if (dist[v] === undefined || nd < dist[v]) {
+            dist[v] = nd;
+            prevEdge[v] = ek;
+            prevNode[v] = u;
+            frontier.push([nd, v]);
+          }
         }
       }
       return null;
@@ -9116,7 +9757,9 @@
         if (guardLeft-- <= 0) break;
         if (usedEdges.has(startKey) || noLoop.has(startKey)) continue;
         const startEdge = edges[startKey];
-        const path = bfs(startEdge.bNode, startEdge.aNode, startKey);
+        const startEnt = state.entities[startEdge.entity];
+        const startColor = normColor(startEnt && startEnt.color);
+        const path = bfs(startEdge.bNode, startEdge.aNode, startKey, startColor);
         if (!path) { noLoop.add(startKey); continue; }
         const found = { key: startKey, eg: startEdge, path };
         const steps = [];
@@ -9470,35 +10113,181 @@
   let loopFillLayer = null;
   let loopFillLayerCtx = null;
   let loopFillLayerKey = null;
-
-  // Containment depth of a loop: how many other loops (strictly) contain it.
-  // This is a TOPOLOGY property, so it is cached per the EXACT loops array
-  // from getLoops() — a drag only moves vertices, it does not change who
-  // contains whom, so the O(loops²) containment pass must not rerun every
-  // drag frame. Keying by the array reference (instead of a structural string)
-  // guarantees the cache always matches the loops currently being drawn.
-  let loopDepthCache = null;
-  let loopDepthFor = null;
-  function loopDepthOf(loop) {
+  // Rigid whole-scene drag: every loop translates by the SAME delta, so the
+  // cached fill bitmap stays valid — blit it shifted instead of re-filling
+  // thousands of contours per pointermove. Base key excludes the geometry
+  // epoch; the delta the bitmap was baked at is remembered so the blit offset
+  // is (now - baked).
+  let loopFillLayerBase = null;
+  let loopFillLayerLoops = null;
+  let loopFillLayerSel = null;
+  let loopFillLayerDelta = { x: 0, y: 0 };
+  let rigidForDrag = null;
+  let rigidForLoops = null;
+  let rigidAll = false;
+  function dragRigidDelta() {
+    const d = ui.drag;
+    if (!d || d.kind !== 'entity' || !d.moved || !d.ids || !d.ids.length) return null;
     const loops = getLoops();
-    if (loopDepthFor !== loops || !loopDepthCache) {
-      loopDepthFor = loops;
-      const map = new Map();
+    if (!loops.length) return null;
+    if (rigidForDrag !== d || rigidForLoops !== loops) {
+      rigidForDrag = d;
+      rigidForLoops = loops;
+      rigidAll = true;
+      let common = null;
       for (const L of loops) {
-        let d = 0;
-        for (const O of loops) {
-          if (O !== L && loopContainedIn(L, O)) d++;
-        }
-        map.set(L, d);
+        const del = loopDragDelta(L);
+        if (!del.x && !del.y) { rigidAll = false; break; }
+        if (!common) common = del;
+        else if (Math.abs(del.x - common.x) > 1e-9 || Math.abs(del.y - common.y) > 1e-9) { rigidAll = false; break; }
       }
-      loopDepthCache = map;
     }
-    return loopDepthCache.get(loop) || 0;
+    if (!rigidAll) return null;
+    return loopDragDelta(loops[0]);
+  }
+
+  // ---- Global loop hierarchy (LoopTree) --------------------------------
+  // One tree, built once per loops-array identity (same lifetime as loopCache,
+  // frozen during drags), shared by every consumer: fill depth, selection,
+  // arrange, wall obstacles and the Object Tree panel. Only loops can be
+  // parents; every other entity is a leaf child of the smallest loop that
+  // contains it, or a root when it sits outside all loops. Groups/clone links
+  // never change the tree — they only make entities travel together.
+  // Nesting is PER LAYER: a loop on layer 2 sitting geometrically inside a
+  // layer-1 loop is still a root of its own layer's hierarchy — layers are
+  // independent jobs, so their depth tinting must not mix.
+  let loopTreeFor = null;
+  let loopTreeData = null;
+  let loopTreeEpoch = 0;
+  function loopTree() {
+    const loops = getLoops();
+    if (loopTreeFor === loops && loopTreeData) return loopTreeData;
+    loopTreeFor = loops;
+    loopTreeEpoch++;
+    const boxes = new Map();
+    // A loop's layer = its outline's layer. Loop detection welds points only
+    // within one layer, so an outline never spans layers; the first boundary
+    // entity decides. Null (no entities) stays layer-agnostic.
+    const loopLayer = new Map();
+    for (const L of loops) {
+      boxes.set(L, loopBox(L));
+      let ly = null;
+      for (const id of loopEntities(L)) {
+        const e = state.entities[id];
+        if (e) { ly = layerOf(e); break; }
+      }
+      loopLayer.set(L, ly);
+    }
+    for (const L of loops) { L.parent = null; L.level = 0; L.children = []; }
+    // Area-descending order puts every possible container before its content,
+    // so the first container found scanning backwards IS the immediate parent
+    // (smallest area among containers) and parent links can never cycle — even
+    // for duplicate loops, where only the earlier index may adopt the later.
+    const order = loops.slice().sort((a, b) => b.area - a.area);
+    for (let i = 0; i < order.length; i++) {
+      const L = order[i];
+      const lb = boxes.get(L);
+      const ll = loopLayer.get(L);
+      for (let j = i - 1; j >= 0; j--) {
+        const O = order[j];
+        if (ll != null && loopLayer.get(O) != null && loopLayer.get(O) !== ll) continue;
+        const ob = boxes.get(O);
+        if (ob.x0 > lb.x0 || ob.y0 > lb.y0 || ob.x1 < lb.x1 || ob.y1 < lb.y1) continue;
+        if (!loopContainedIn(L, O, lb, ob)) continue;
+        L.parent = O;
+        L.level = O.level + 1;
+        O.children.push(L);
+        break;
+      }
+    }
+    const roots = order.filter(L => !L.parent);
+    // Leaf ownership: an entity that forms a loop's outline belongs to that
+    // loop as its boundary (loopEntities), never as a leaf. Everything else
+    // joins the smallest loop whose polygon holds ALL of its points (bbox
+    // corners for point-less containers: art, arrays, parts, pictures).
+    const boundary = new Set();
+    const boundaryLoop = new Map();
+    const leaves = new Map();
+    for (const L of loops) {
+      leaves.set(L, []);
+      for (const id of loopEntities(L)) {
+        boundary.add(+id);
+        if (!boundaryLoop.has(+id)) boundaryLoop.set(+id, L);
+      }
+    }
+    const owner = new Map();
+    const asc = order.slice().reverse();   // smallest first: first hit wins
+    for (const eid in state.entities) {
+      const id = +eid;
+      if (boundary.has(id)) continue;
+      const e = state.entities[eid];
+      const ely = layerOf(e);
+      const pids = entityPointIds(e);
+      let pts;
+      if (pids.length) {
+        pts = [];
+        for (const pid of pids) { const p = P(pid); if (p) pts.push(p); }
+        if (!pts.length) continue;
+      } else {
+        const b = entityBounds(e);
+        if (!b) continue;
+        pts = [
+          { x: b.minX, y: b.minY }, { x: b.maxX, y: b.minY },
+          { x: b.maxX, y: b.maxY }, { x: b.minX, y: b.maxY }
+        ];
+      }
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const p of pts) {
+        if (p.x < x0) x0 = p.x;
+        if (p.y < y0) y0 = p.y;
+        if (p.x > x1) x1 = p.x;
+        if (p.y > y1) y1 = p.y;
+      }
+      for (const L of asc) {
+        const ll = loopLayer.get(L);
+        if (ll != null && ll !== ely) continue;
+        const lb = boxes.get(L);
+        if (lb.x0 > x0 || lb.y0 > y0 || lb.x1 < x1 || lb.y1 < y1) continue;
+        if (!L.poly || L.poly.length < 3) continue;
+        let all = true;
+        for (const p of pts) { if (!pointInPoly(p, L.poly)) { all = false; break; } }
+        if (all) {
+          owner.set(id, L);
+          leaves.get(L).push(id);
+          break;
+        }
+      }
+    }
+    loopTreeData = { loops, roots, leaves, owner, boxes, boundary, boundaryLoop };
+    return loopTreeData;
+  }
+
+  // The loop plus every loop nested inside it, parents before children.
+  function loopSubtree(loop) {
+    loopTree();
+    const out = [];
+    const stack = [loop];
+    while (stack.length) {
+      const L = stack.pop();
+      out.push(L);
+      const kids = L.children || [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+    return out;
+  }
+
+  // Containment depth = the loop's level in the tree (0 = outermost).
+  function loopDepthOf(loop) {
+    loopTree();
+    return loop.level || 0;
   }
 
   function drawLoopFills() {
+    const visFlags = (loopFillCurrentVisible ? 1 : 0) + '' + (loopFillOthersVisible ? 1 : 0) + (ui.dimOthers ? 'd' : '');
     const key = geometryEpoch + '|' + themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
-      DPR + '|' + loopFillScale + '|' + (ui.dimOthers ? 1 : 0) + '|' + ui.activeLayer + '|' + W + 'x' + H;
+      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H;
+    const baseKey = themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
+      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H;
     if (!loopFillLayer) {
       loopFillLayer = document.createElement('canvas');
       loopFillLayerCtx = loopFillLayer.getContext('2d');
@@ -9510,6 +10299,14 @@
       loopFillLayer.height = ph;
       loopFillLayerKey = null;
     }
+    const rigid = dragRigidDelta();
+    if (rigid && loopFillLayerKey !== null && loopFillLayerBase === baseKey &&
+      loopFillLayerLoops === getLoops() && loopFillLayerSel === selectionIndex()) {
+      const ox = (rigid.x - loopFillLayerDelta.x) * view.zoom;
+      const oy = (rigid.y - loopFillLayerDelta.y) * view.zoom;
+      ctx.drawImage(loopFillLayer, 0, 0, pw, ph, ox, oy, W, H);
+      return;
+    }
     if (loopFillLayerKey !== key) {
       const lc = loopFillLayerCtx;
       lc.setTransform(DPR * loopFillScale, 0, 0, DPR * loopFillScale, 0, 0);
@@ -9518,11 +10315,15 @@
       // merging them into one path is safe (they share edges, not interiors); a
       // single opaque fill per group colours them all. Deep (brighter) groups
       // are painted after shallow ones so the inner contour covers its parent.
+      // Per-layer switches hide fills whole; Dim other layers fades the
+      // other-layer groups with alpha in the SAME pass (no extra layer/pass).
       const groups = new Map();
       for (const loop of getLoops()) {
         const d = loopFrameData(loop);
         if (d.fill === 'none' || !d.visible || !d.path) continue;
-        const fade = ui.dimOthers && loopLayerId(loop) !== ui.activeLayer;
+        const onActive = loopLayerId(loop) === ui.activeLayer;
+        if (onActive ? !loopFillCurrentVisible : !loopFillOthersVisible) continue;
+        const fade = ui.dimOthers && !onActive;
         const depth = loopDepthOf(loop);
         const style = d.fill + '|' + depth + (fade ? '|dim' : '');
         let g = groups.get(style);
@@ -9540,13 +10341,16 @@
         +a[0].split('|')[1] - +b[0].split('|')[1]
       );
       for (const [, g] of ordered) {
-        lc.save();
         if (g.fade) lc.globalAlpha = 0.5;
         lc.fillStyle = g.fill;
         lc.fill(g.path);
-        lc.restore();
+        if (g.fade) lc.globalAlpha = 1;
       }
       loopFillLayerKey = key;
+      loopFillLayerBase = baseKey;
+      loopFillLayerLoops = getLoops();
+      loopFillLayerSel = selectionIndex();
+      loopFillLayerDelta = rigid ? { x: rigid.x, y: rigid.y } : { x: 0, y: 0 };
     }
     ctx.drawImage(loopFillLayer, 0, 0, W, H);
   }
@@ -9575,16 +10379,36 @@
   // actually moving. When EVERY point of a loop is part of the drag, the loop
   // translates rigidly by the current press->now delta, and we can reuse the
   // cached polygon shifted by that delta instead of rebuilding all loops.
+  let loopDragDeltaDragIds = null;
+  let loopDragDeltaDragSet = null;
+  let loopDragPtsLoops = null;
+  let loopDragPts = new Map();
   function loopDragDelta(loop) {
     const d = ui.drag;
     if (!d || d.kind !== 'entity' || !d.ids || !d.ids.length || !d.moved) return { x: 0, y: 0 };
-    const ids = new Set();
-    const collect = (ent) => { if (ent) for (const pid of entityPointIds(ent)) ids.add(+pid); };
-    if (loop.circle) collect(state.entities[loop.entity]);
-    if (loop.splineEntity != null) collect(state.entities[loop.splineEntity]);
-    for (const st of (loop.steps || [])) collect(state.entities[st.edge.entity]);
+    // The drag id set and each loop's point ids are drag-lifetime constants:
+    // rebuilding them per loop per frame was O(loops × dragIds) — a whole-
+    // document drag spent ~10M Set insertions per frame here.
+    if (loopDragDeltaDragIds !== d.ids) {
+      loopDragDeltaDragIds = d.ids;
+      loopDragDeltaDragSet = new Set(d.ids.map(Number));
+    }
+    const dragSet = loopDragDeltaDragSet;
+    const loops = getLoops();
+    if (loopDragPtsLoops !== loops) {
+      loopDragPtsLoops = loops;
+      loopDragPts = new Map();
+    }
+    let ids = loopDragPts.get(loop);
+    if (!ids) {
+      ids = new Set();
+      const collect = (ent) => { if (ent) for (const pid of entityPointIds(ent)) ids.add(+pid); };
+      if (loop.circle) collect(state.entities[loop.entity]);
+      if (loop.splineEntity != null) collect(state.entities[loop.splineEntity]);
+      for (const st of (loop.steps || [])) collect(state.entities[st.edge.entity]);
+      loopDragPts.set(loop, ids);
+    }
     if (!ids.size) return { x: 0, y: 0 };
-    const dragSet = new Set(d.ids.map(Number));
     for (const pid of ids) if (!dragSet.has(pid)) return { x: 0, y: 0 };
     // all of the loop's points are dragged: use the first one's start->now delta
     for (const pid of ids) {
@@ -9617,14 +10441,21 @@
       const loop = loops[i];
       const d = loopFrameData(loop);
       if (!d.visible || !d.path || d.fill !== 'none') continue;
+      // Same per-layer switches as drawLoopFills: this pass paints the plain /
+      // selection tint straight onto the main canvas, so it must honour them
+      // too — otherwise "other layers off" still showed the default tint.
+      const onActive = loopLayerId(loop) === ui.activeLayer;
+      if (onActive ? !loopFillCurrentVisible : !loopFillOthersVisible) continue;
+      const fade = ui.dimOthers && !onActive;
       const depth = loopDepthOf(loop);
-      const key = (d.sel ? 'sel' : 'plain') + '|' + depth;
+      const key = (d.sel ? 'sel' : 'plain') + '|' + depth + (fade ? '|dim' : '');
       let g = groups.get(key);
       if (!g) {
         const base = loopTintBase(d.sel ? 'sel' : 'plain');
         g = {
           path: new Path2D(),
-          fill: brightenAdd(base, depth * LOOP_FILL_DEPTH_ADD)
+          fill: brightenAdd(base, depth * LOOP_FILL_DEPTH_ADD),
+          fade
         };
         groups.set(key, g);
       }
@@ -9634,8 +10465,10 @@
       +a[0].split('|')[1] - +b[0].split('|')[1]
     );
     for (const [, g] of ordered) {
+      if (g.fade) ctx.globalAlpha = 0.5;
       ctx.fillStyle = g.fill;
       ctx.fill(g.path);
+      if (g.fade) ctx.globalAlpha = 1;
     }
   }
 
@@ -9781,11 +10614,21 @@
     } else if (e.type === 'spline') {
       const samples = splineSamplesOf(e);
       if (samples.length < 2) return;
-      const p0 = w2s(samples[0].x, samples[0].y);
-      path.moveTo(p0.x, p0.y);
-      for (let i = 1; i < samples.length; i++) {
+      // Realtime LOD: at zoom-out consecutive samples land on the same pixel;
+      // emitting them all only bloats the Path2D. Skip a sample that is closer
+      // than ~0.75 px to the last emitted one (no cache, no pre-pass).
+      let lx = 0, ly = 0, has = false;
+      const tol2 = 0.75 * 0.75;
+      for (let i = 0; i < samples.length; i++) {
         const q = w2s(samples[i].x, samples[i].y);
-        path.lineTo(q.x, q.y);
+        if (has) {
+          const dx = q.x - lx, dy = q.y - ly;
+          if (dx * dx + dy * dy < tol2) continue;
+          path.lineTo(q.x, q.y);
+        } else {
+          path.moveTo(q.x, q.y);
+        }
+        lx = q.x; ly = q.y; has = true;
       }
     } else if (e.type === 'arc') {
       const ad = arcData(e);
@@ -9817,11 +10660,18 @@
       const s = splineSamplesOf(e);
       if (s.length < 2) return;
       ctx.beginPath();
-      const p0 = w2s(s[0].x, s[0].y);
-      ctx.moveTo(p0.x, p0.y);
-      for (let i = 1; i < s.length; i++) {
+      let lx = 0, ly = 0, has = false;
+      const tol2 = 0.75 * 0.75;
+      for (let i = 0; i < s.length; i++) {
         const p = w2s(s[i].x, s[i].y);
-        ctx.lineTo(p.x, p.y);
+        if (has) {
+          const dx = p.x - lx, dy = p.y - ly;
+          if (dx * dx + dy * dy < tol2) continue;
+          ctx.lineTo(p.x, p.y);
+        } else {
+          ctx.moveTo(p.x, p.y);
+        }
+        lx = p.x; ly = p.y; has = true;
       }
       ctx.stroke();
     } else if (e.type === 'arc') {
@@ -9983,8 +10833,12 @@
   // below call ensureTextAspect again once every wanted face has landed.
   function ensureTextAspect(e, keepRatio) {
     if (!e || (e.type !== 'text' && e.type !== 'art' && e.type !== 'image')) return null;
+    // `registered` is keyed per MEMBER: a family with Regular + Bold reports
+    // false for a Bold text even when the family's Regular file is in, and the
+    // saved ratio would then never be re-measured.
     const fontPending = keepRatio && e.type === 'text' && window.MiniSketchFonts &&
-      !window.MiniSketchFonts.registered(e.font || 'sans-serif');
+      !window.MiniSketchFonts.registered(e.font || 'sans-serif', e.weight || 400,
+        e.italic ? 'italic' : 'normal');
     const ratio = fontPending ? null : framedNativeRatio(e);
     for (const cid in state.constraints) {
       const c = state.constraints[cid];
@@ -10454,6 +11308,7 @@
     if (hit) return hit;
     if (typeof document === 'undefined' || !document.createElement) return [];
     const m = textMetricsOf(e);
+    if (!m) return []; // font still loading: no metrics this frame
     const span = Math.max(m.width, m.height);
     if (!(span > 0) || !String(e.text || '').trim()) return [];
     const scale = Math.max(1, Math.min(32, TEXT_TRACE_PX / span));
@@ -10498,7 +11353,8 @@
   // Open polylines in the text's local reference pixels (origin = box
   // top-left, y down), mirroring the contour convention above.
   function textLocalStrokes(e, mNow) {
-    const m = mNow || textMetricsOf(e);
+    let m = mNow || textMetricsOf(e);
+    if (!m) return []; // font still loading: no stroke layout this frame
     const lay = window.MiniSketchHershey
       ? window.MiniSketchHershey.layout(e.text, TEXT_REF, m.lineHeight, e.align)
       : { strokes: [], width: 1, height: m.height };
@@ -10513,8 +11369,8 @@
   // simplification: glyph polylines are already minimal.
   function textStrokesWorld(e) {
     const gg = textGeom(e);
-    if (!gg) return [];
     const m = textMetricsOf(e);
+    if (!gg || !m) return []; // font still loading: frame-only this frame
     const ax = gg.A.x / m.width, ay = gg.A.y / m.width;
     const bx = gg.B.x / m.height, by = gg.B.y / m.height;
     return textLocalStrokes(e, m).map(st => ({
@@ -10587,6 +11443,7 @@
     const gg = textGeom(e);
     if (!gg) { textExactWhy = 'no-frame'; return null; }
     const m = textMetricsOf(e);
+    if (!m) { textExactWhy = 'no-metrics'; return null; }
     // Design units -> reference px. The canvas sets the font at TEXT_REF px, so
     // one em (upem units) is TEXT_REF px. The reference box is the measured
     // text box in those same px, and the frame maps that box into the world.
@@ -10696,8 +11553,11 @@
   // the raster resolution: enlarging a text no longer multiplies its nodes.
   function textContoursWorld(e) {
     const gg = textGeom(e);
-    if (!gg) return [];
+    // A webfont that is still loading has no metrics yet (textMetricsOf returns
+    // null): the render path skips the frame, the nesting path must too, or
+    // creating/updating a text crashes the whole UI.
     const m = textMetricsOf(e);
+    if (!gg || !m) return [];
     const ax = gg.A.x / m.width, ay = gg.A.y / m.width;
     const bx = gg.B.x / m.height, by = gg.B.y / m.height;
     const refPerMm = m.width / Math.max(1e-9, Math.hypot(gg.A.x, gg.A.y));
@@ -11356,8 +12216,12 @@
         out.push({ pts: sampleArc(ad.c, ad.r, ad.a0, ad.sweep, false), closed: false });
       }
     } else if (e.type === 'text') {
-      const out = textOutlineWorld(e);
-      for (const loop of out.loops) out.push({ pts: loop, closed: out.closed });
+      // textOutlineWorld returns { loops, closed } — do NOT shadow the `out`
+      // accumulator here (that used to crash: out.push is not a function).
+      const ol = textOutlineWorld(e);
+      for (const loop of (ol.loops || [])) {
+        if (loop && loop.length >= 3) out.push({ pts: loop, closed: !!ol.closed });
+      }
     } else if (e.type === 'array') {
       // every virtual instance contributes geometry (CNC, offset, groups)
       for (const t of arrayInstanceOffsets(e)) {
@@ -11756,8 +12620,8 @@
       toast('Group broken apart \u2014 the objects stay, they just no longer select together');
       return;
     }
-    if (!ents.some(e => e.type === 'art' || e.type === 'text')) {
-      toast('Select a text or a grouped object to break apart');
+    if (!ents.some(e => e.type === 'art' || e.type === 'text' || e.type === 'array')) {
+      toast('Select a text, a grouped object or an array/clone to break apart');
       return;
     }
     cmdConvertToCurve();
@@ -12064,6 +12928,43 @@
     if (e.shapes && e.shapesEpoch === geometryEpoch) return;
     e.shapes = arrayBuildShapes(e.masters);
     e.shapesEpoch = geometryEpoch;
+    arrayReanchorGuide(e);
+  }
+
+  // The grid array's guide (the two green construction lines) exists only to
+  // show the dx/dy spacing, anchored at the master's bounding-box TOP-LEFT
+  // (minX, maxY in world coords — Y is down, so maxY is the top edge). The
+  // anchor is a private point with no geometric link to the master, so when
+  // the master moves or reshapes the guide would stay behind (or drift when
+  // the solver runs). Every time the master geometry changes we translate the
+  // three guide points together by the delta to the master's current top-left,
+  // preserving the spacing vectors exactly — the clone layout is unaffected.
+  function arrayReanchorGuide(e) {
+    if (e.kind !== 'grid') return;
+    if (e.p0 == null || e.pw == null || e.ph == null) return;
+    const p0 = P(e.p0), pw = P(e.pw), ph = P(e.ph);
+    if (!p0 || !pw || !ph) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let any = false;
+    for (const mid of (e.masters || [])) {
+      const m = state.entities[mid];
+      if (!m) continue;
+      for (const sh of arrayShapesOf(m)) {
+        for (const p of sh.pts) {
+          if (p[0] < minX) minX = p[0];
+          if (p[0] > maxX) maxX = p[0];
+          if (p[1] < minY) minY = p[1];
+          if (p[1] > maxY) maxY = p[1];
+          any = true;
+        }
+      }
+    }
+    if (!any || !isFinite(minX)) return;
+    const tx = minX - p0.x, ty = maxY - p0.y;
+    if (Math.abs(tx) < 1e-9 && Math.abs(ty) < 1e-9) return;
+    p0.x += tx; p0.y += ty;
+    pw.x += tx; pw.y += ty;
+    ph.x += tx; ph.y += ty;
   }
 
   function arrayBuildShapes(masters) {
@@ -12088,6 +12989,63 @@
     return out;
   }
 
+  // Explode an array/clone into independent curves: every instance becomes a
+  // real spline (Bezier handles included) with its own points. The caller
+  // removes the array entity, which is the live link to the masters — the
+  // masters themselves stay untouched.
+  function arrayMasterCurveSources(m) {
+    if (m.type === 'text') {
+      const fill = (m.fill === 'gray' || m.fill === 'yellow') ? m.fill : null;
+      if (isSingleLineFont(m)) {
+        const out = [];
+        for (const st of textStrokesWorld(m)) {
+          if (st.pts && st.pts.length >= 2) out.push({
+            closed: false, curved: false, color: colorOf(m), fill,
+            nodes: st.pts.map(p => ({ x: p.x, y: p.y, o: null, i: null }))
+          });
+        }
+        if (out.length) return out;
+      } else {
+        const exact = textExactLoopsWorld(m);
+        if (exact && exact.length) return exact.map(loop => ({
+          closed: true, curved: true, color: colorOf(m), fill, nodes: loop.nodes
+        }));
+      }
+    }
+    return collectCurveSources([m]);
+  }
+
+  function explodeArrayToCurves(e) {
+    const created = [];
+    const sources = [];
+    for (const mid of (e.masters || [])) {
+      const m = state.entities[mid];
+      if (m) for (const sub of arrayMasterCurveSources(m)) sources.push(sub);
+    }
+    if (!sources.length) return created;
+    for (const t of arrayInstanceOffsets(e)) {
+      for (const sub of sources) {
+        if (!sub.nodes || sub.nodes.length < 2) continue;
+        const nodes = sub.nodes.map(n => {
+          const p = arrayXformPoint(t, n.x, n.y);
+          return {
+            x: p.x, y: p.y,
+            o: n.o ? arrayXformPoint(t, n.o.x, n.o.y) : null,
+            i: n.i ? arrayXformPoint(t, n.i.x, n.i.y) : null
+          };
+        });
+        const nid = addFittedSpline(null, sub.color || colorOf(e), {
+          nodes, closed: !!sub.closed, fill: sub.fill
+        });
+        if (nid) {
+          state.entities[nid].layer = layerOf(e);
+          created.push(nid);
+        }
+      }
+    }
+    return created;
+  }
+
   // ---- Nesting (local GA + NFP2, output = clone) -----------------------
   // Port of KaryaCNC nestjs2/frontend (tools/nest.js). The user selects the
   // loops to nest plus ONE green (#00ff00) loop marking the sheet; Start runs
@@ -12096,7 +13054,7 @@
   // that do not fit stack to the right of the result block. Masters never
   // move; every result is a clone (`type:'array', kind:'clone'`), so undo
   // removes the whole layout in one step and edits to masters reshape it.
-  const NEST_OUT_GAP = 10; // mm between the sheet and the result block
+  const NEST_OUT_GAP = 50; // mm between the sheet and the result block
   const NEST_PREFS_KEY = 'minisketch.v1.nestPrefs';
   // Debug logging gate: set false (or strip the nestLog calls) once nesting is
   // verified end to end — the logs exist to diagnose layout bugs fast.
@@ -12145,7 +13103,9 @@
 
   // The loops worth nesting: fully selected, not owned guide lines. Returns
   // { sheetLoops, partLoops } — green loops (all entities #00ff00) are sheet
-  // candidates, everything else is a part.
+  // candidates, everything else is a part. A TEXT object is a part too: it is
+  // atomic (one object = the whole string), so it is added here as a synthetic
+  // "loop" whose polygon is the convex hull of its glyph outlines.
   function nestCollectLoops() {
     const loops = getLoops();
     const guides = ownedGuideIds();
@@ -12161,12 +13121,73 @@
       });
       (allGreen ? sheetLoops : partLoops).push({ loop, entityIds: eids });
     }
+    // Text never comes out of getLoops() (it owns no points), but it IS real
+    // cut geometry. A text is one rigid part — the hull keeps the letters
+    // together — and the clone that lands in the layout draws the real glyphs
+    // (arrayShapesOf traces them, exactly like a cloned group).
+    for (const id in state.entities) {
+      const e = state.entities[id];
+      if (!e || e.type !== 'text') continue;
+      if (guides.has(+id) || !entityEditable(e)) continue;
+      if (!selected('entity', +id) && !entityFullySelectedByPoints(+id)) continue;
+      const rec = nestTextRec(e);
+      if (rec) partLoops.push(rec);
+    }
     return { sheetLoops, partLoops };
+  }
+
+  // Convex hull (monotone chain) of a point cloud, world mm. Used for text:
+  // the glyph outlines are many rings (letters plus counters), while the engine
+  // packs ONE outer ring per part — the hull is that ring.
+  function nestHull(points) {
+    const pts = points.slice().sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
+    if (pts.length < 3) return null;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const lower = [];
+    for (const p of pts) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+      lower.push(p);
+    }
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+      upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    const hull = lower.concat(upper);
+    return hull.length >= 3 ? hull : null;
+  }
+
+  // A text as a nestable part: { loop, entityIds, isText }. The polygon is the
+  // hull of every glyph outline point; the clone later draws the true glyphs.
+  function nestTextRec(e) {
+    if (!e || e.type !== 'text') return null;
+    const out = textOutlineWorld(e);
+    if (!out || !Array.isArray(out.loops) || !out.loops.length) return null;
+    const pts = [];
+    for (const loop of out.loops) {
+      if (!loop) continue;
+      for (const p of loop) {
+        if (p && isFinite(p.x) && isFinite(p.y)) pts.push({ x: p.x, y: p.y });
+      }
+    }
+    const hull = nestHull(pts);
+    if (!hull) return null;
+    return {
+      loop: { poly: hull, area: Math.abs(signedAreaPts(hull)), circle: null },
+      entityIds: [+e.id],
+      isText: true
+    };
   }
 
   // Group part loops into objects: a loop fully inside another loop becomes
   // that loop's hole (compound part = one object). Uses the sampled loop
   // polygon and pointInPoly from core.js.
+  //
+  // A TEXT follows exactly the same rule: a string engraved inside a plate is
+  // part of THAT part (one compound object), not a piece of its own — the
+  // clone that lands carries the text master and the two move together.
   function nestGroupParts(partLoops) {
     const items = partLoops.map(rec => ({ rec, area: rec.loop.area }));
     items.sort((a, b) => b.area - a.area); // outer candidates first
@@ -12259,6 +13280,10 @@
         const paths = [nestEnginePoly(rec.loop.poly, GEOM)];
         const outerArea = MiniSketchNest.Path.getSignedArea(paths[0]);
         for (const h of holes) {
+          // A text carried by a part is ENGRAVING, not a void: it stays out of
+          // the packed ring (the clone draws it from the text master anyway),
+          // so the plate is still offset/packed as a solid plate.
+          if (h.isText) continue;
           const hp = nestEnginePoly(h.loop.poly, GEOM);
           if (Math.sign(MiniSketchNest.Path.getSignedArea(hp)) === Math.sign(outerArea)) hp.reverse();
           paths.push(hp);
@@ -12437,7 +13462,9 @@
       sheetIds: (spec.sheetLoops[0].entityIds || []).slice(),
       objects: spec.objects.map(o => ({
         outerIds: (o.outer.entityIds || []).slice(),
-        holeIds: o.holeRecs.map(h => (h.entityIds || []).slice())
+        holeIds: o.holeRecs.map(h => (h.entityIds || []).slice()),
+        // a text part is resolved through its entity id, not through getLoops()
+        ...(o.outer.isText ? { text: true } : {})
       })),
       params: {
         spacing: spec.spacing, gridMm: spec.gridMm, rotation: spec.rotation,
@@ -12459,6 +13486,26 @@
     return null;
   }
 
+  // Text part by entity id: the hull is rebuilt from the CURRENT glyph
+  // outlines, so a re-nest follows an edited string (Re-nest keeps the id).
+  function nestTextRecById(id) {
+    const e = state.entities[id];
+    if (!e || e.type !== 'text') return null;
+    return nestTextRec(e);
+  }
+
+  // Resolve one remembered rec: a text id rebuilds its hull from the CURRENT
+  // glyphs, anything else is looked up in the loop graph. Both the outer and
+  // the holes go through here — a text is a normal compound member (engraving
+  // on the part), and resolving holes through nestFindLoop() alone silently
+  // DROPPED it on every Re-nest (the layout lost the lettering).
+  function nestEntityRec(ids) {
+    if (!ids || !ids.length) return null;
+    const e = state.entities[+ids[0]];
+    if (e && e.type === 'text') return nestTextRecById(+ids[0]);
+    return nestFindLoop(ids);
+  }
+
   // Rebuild a runnable spec from the remembered ids. null means the geometry it
   // referred to is gone (deleted, merged or redrawn).
   function nestResolveSpec() {
@@ -12468,11 +13515,11 @@
     if (!sheet) return null;
     const objects = [];
     for (const o of mem.objects) {
-      const outer = nestFindLoop(o.outerIds);
+      const outer = o.text ? nestTextRecById(o.outerIds[0]) : nestEntityRec(o.outerIds);
       if (!outer) return null;
       const holeRecs = [];
       for (const h of o.holeIds) {
-        const hr = nestFindLoop(h);
+        const hr = nestEntityRec(h);
         if (hr) holeRecs.push(hr);
       }
       objects.push({ outer, holeRecs });
@@ -12986,12 +14033,23 @@
     job._prog = {};
     for (let i = 0; i < nw; i++) {
       let w;
-      try { w = new Worker('tools/nest_worker.js'); } catch (err) { break; }
+      try { w = new Worker(SCRIPT_BASE + 'tools/nest_worker.js'); } catch (err) { break; }
       job.workers.push(w);
       const wid = String(i);
       w.postMessage({ jobId: wid, input });
       w.onmessage = (e) => nestWorkerOnMessage(job, wid, e.data);
-      w.onerror = (e) => { console.error('[nest][worker] error', e); };
+      w.onerror = (e) => {
+        console.error('[nest][worker] error', e);
+        try { w.terminate(); } catch (err) { /* ignore */ }
+        const at = job.workers.indexOf(w);
+        if (at >= 0) job.workers.splice(at, 1);
+        // every worker failed to load (subpath 404, file:// policy): nest
+        // synchronously instead of hanging with zero results
+        if (!job.workers.length && !job.workerDone && !job._syncFallback) {
+          job._syncFallback = true;
+          nestRunIteration(job);
+        }
+      };
     }
     if (!job.workers.length) { nestRunIteration(job); return; }
     job.running = true;
@@ -13595,7 +14653,7 @@
     const cPerp = newId();
     state.constraints[cPerp] = { id: cPerp, type: 'perpendicular', line1: idW, line2: idH };
     const cHdim = newId();
-    state.constraints[cHdim] = { id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 26 };
+    state.constraints[cHdim] = { id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 10 };
     const id = newId();
     state.entities[id] = {
       id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
@@ -13644,7 +14702,7 @@
       // and the result can be fitted back to real curves
       pathChainsOf, flattenSpline, fitPolylineCurve, addFittedCurve: addFittedSpline,
       rdpSimplify,
-      offsetClosedChains, clipperLib, polyBoolOp, signedAreaPts, pointInPoly,
+      offsetClosedChains, clipperLib, polyBoolOp, boolLoopsExact, signedAreaPts, pointInPoly,
       offsetScale: OFFSET_SCALE,
       offsetPrecision: OFFSET_PRECISION,
       offsetMiter: () => OFFSET_MITER,
@@ -13657,7 +14715,7 @@
       addLine: toolAddLine, addCircle: toolAddCircle, addArc: toolAddArc,
       addSpline: toolAddSpline, addConstraint: toolAddConstraint,
       addNote: toolAddNote, addText: toolAddText,
-      requestSolve, solveNow, getLoops, loopEntities,
+      requestSolve, solveNow, getLoops, loopEntities, loopDepthOf,
       addPanelEntity, addPolylineEntity, cmdGroupSelection,
       watchGen: genWatchAdd,
       // SVG out, for the AI: a trained model knows SVG far better than our
@@ -13775,6 +14833,8 @@
     const kindEl = document.getElementById('arr-kind');
     if (kindEl) kindEl.value = ex ? (ex.kind === 'polar' ? 'guide' : ex.kind) : 'grid';
     updateArrayDialogKind();
+    const toCurveBtn = document.getElementById('arr-to-curve');
+    if (toCurveBtn) toCurveBtn.style.display = existingId ? '' : 'none';
     modal.classList.remove('hidden');
   }
 
@@ -14416,16 +15476,114 @@
     return insertArt(paths, opts);
   }
 
+  // Markup that merely contains an <svg> (a copied web page) is not an SVG
+  // document: the prolog is stepped over and the root tag alone decides.
+  function looksLikeSvgDoc(text) {
+    let s = String(text == null ? '' : text);
+    for (let k = 0; k < 8; k++) {
+      const m = /^\s*(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE[^>]*>)?/i.exec(s);
+      if (!m || !m[0]) break;
+      s = s.slice(m[0].length);
+    }
+    return /^<svg[\s>]/i.test(s);
+  }
+
+  // Console trace for the clipboard route: every decision the paste handler makes
+  // is printed to the developer console as `[paste]` lines, so a paste that
+  // silently does nothing can be traced end-to-end. Trace is ON by default so
+  // a paste gone wrong is immediately diagnosable; set
+  // window.MINISKETCH_PASTE_DEBUG = false in the console to silence it.
+  function pasteTrace() {
+    if (window.MINISKETCH_PASTE_DEBUG === false) return;
+    console.log.apply(console, ['[paste]'].concat(Array.prototype.slice.call(arguments)));
+  }
+
+  // A desktop vector editor hands over a real SVG document (groups carrying
+  // transforms, primitives, millimetres), so clipboard paste goes through the
+  // file importer instead of the flat path reader. Unlike File > Import a
+  // paste keeps every shape editable and selects them as one group: what you
+  // copied is meant to be worked on, not just cut. Returns true when the
+  // payload was handled, false when the caller should fall back; a refusal
+  // says why, because a paste that silently does nothing cannot be reported.
+  function svgClipboardToSketch(text, report) {
+    const why = typeof report === 'function' ? report : function () {};
+    pasteTrace('importer sees', String(text == null ? '' : text).length, 'chars');
+    let ir = null;
+    try {
+      ir = svgImportParse(text, { prefix: 'clip-' + Date.now().toString(36) + '-' });
+    } catch (err) {
+      pasteTrace('parse threw:', err);
+      why(err && err.message ? err.message : 'the markup did not parse');
+      return false;
+    }
+    pasteTrace('parsed:', ir && ir.items.length, 'shapes · scale', ir && ir.scale, '·', ir && fmt(ir.mmW) + ' x ' + fmt(ir.mmH) + ' mm');
+    if (!ir || !ir.items.length) { why('no shapes the importer reads'); return false; }
+
+    const colorMap = {};
+    for (const entry of ir.colorList) colorMap[entry.hex] = nearestCncColor(entry.hex);
+    const wasEmpty = !Object.keys(state.entities).length;
+    pushHistory();
+    let made = null;
+    try {
+      made = svgImportInsert(ir, {
+        center: ui.lastWorld ? { x: ui.lastWorld.x, y: ui.lastWorld.y } : s2w(W / 2, H / 2),
+        fillMode: 'gray',
+        colorMap,
+        textMode: 'comment'
+      });
+    } catch (err) {
+      // the pushed snapshot stays: the insert may have written geometry before it
+      // threw, and Ctrl+Z has to be able to take it back
+      pasteTrace('insert threw:', err);
+      invalidateLoops();
+      commit();
+      toast('That SVG could not be pasted (' + (err && err.message ? err.message : 'unknown error') + ')');
+      return true;
+    }
+    pasteTrace('inserted', made.entities.length, 'entities ·', made.lines, 'lines ·', made.splines, 'curves ·', made.circles, 'circles');
+
+    ui.selection = made.entities.map(id => ({ kind: 'entity', id }));
+    invalidateLoops();
+    commit();
+    if (wasEmpty) fitView();
+
+    const parts = [fmt(ir.mmW) + ' \u00d7 ' + fmt(ir.mmH) + ' mm'];
+    if (made.lines) parts.push(made.lines + ' line' + (made.lines === 1 ? '' : 's'));
+    if (made.splines) parts.push(made.splines + ' curve' + (made.splines === 1 ? '' : 's'));
+    if (made.circles) parts.push(made.circles + ' circle' + (made.circles === 1 ? '' : 's'));
+    if (made.framed) parts.push(made.framed + ' framed object' + (made.framed === 1 ? '' : 's'));
+    const sk = [];
+    if (ir.skipped.text) sk.push(ir.skipped.text + ' text');
+    if (ir.skipped.image) sk.push(ir.skipped.image + ' image');
+    if (ir.skipped.use) sk.push(ir.skipped.use + ' unresolved use');
+    toast('Pasted ' + parts.join(' \u00b7 ') + (sk.length ? ' \u00b7 skipped ' + sk.join(', ') : ''));
+    return true;
+  }
+
   // DXF carries real coordinates (mm): keep them 1:1 and just frame the view.
   // Primitives become native objects (lines / circles / arcs / splines), so
   // they can be edited, constrained and sent to the CNC afterwards.
-  function importDxfText(text) {
+  let pendingDxf = null;
+  function openDxfImport(text, name) {
+    pendingDxf = text;
+    const modal = document.getElementById('dxf-import-modal');
+    const nameEl = document.getElementById('dxf-imp-file');
+    if (nameEl) nameEl.textContent = name || '';
+    fillJoinDefaults('dxf');
+    if (modal) modal.classList.remove('hidden');
+  }
+
+  function importDxfText(text, opts) {
+    const o = opts || {};
     const prims = parseDxf(text);
     if (!prims.length) {
       toast('No supported geometry in that DXF (binary DXF must be re-saved as ASCII DXF)');
       return null;
     }
     pushHistory();
+    // only frame the view when the sketch was empty — an import into existing
+    // work must not move the camera
+    const wasEmpty = !Object.keys(state.entities).length;
     // DXF is AutoCAD Y-up: mirror Y (and swap the arc endpoints, since the
     // sketch arc runs the other way) so the drawing arrives upright.
     const addPoint = (x, y) => {
@@ -14465,7 +15623,12 @@
       toast('No supported geometry in that DXF');
       return null;
     }
-    fitView();
+    // connect same-colour open segments (DXF arrives as loose LINE entities);
+    // the import dialog's join switch / distance override the Settings default
+    const joinOn = o.join != null ? o.join : settings.joinImportAuto !== 'off';
+    const joinTol = isFinite(+o.joinTol) && +o.joinTol > 0 ? +o.joinTol : settings.joinImportTol;
+    if (joinOn && made.length >= 2) joinImportedSegments(made, joinTol);
+    if (wasEmpty) fitView();
     // commit (not just render): without scheduleSave the import vanishes on a
     // refresh before the next edit triggers an autosave
     commit();
@@ -14473,12 +15636,185 @@
     return made.length;
   }
 
+  // One editable text object for an imported label. x/y are world mm (Y down),
+  // sizeMm is the PDF font's em size in mm, dir carries the text's baseline and
+  // up vectors in world coordinates (defaults: horizontal). The frame is fitted
+  // to the real font metrics so the glyphs keep the PDF's size instead of being
+  // stretched to a guessed box. Callers load the face first (importPrimsIntoDocument
+  // awaits it) so the glyphs are on the first render.
+  function addImportedTextObject(x, y, text, sizeMm, dir) {
+    const d = dir || {};
+    const ux = isFinite(d.ux) ? d.ux : 1, uy = isFinite(d.uy) ? d.uy : 0;
+    const vx = isFinite(d.vx) ? d.vx : 0, vy = isFinite(d.vy) ? d.vy : 1;
+    const h = clamp(sizeMm, 0.5, 500);
+    const w = Math.max(h, String(text).length * h * 0.55);
+    const p0 = newId();
+    state.points[p0] = { id: p0, x, y };
+    const pwId = newId();
+    state.points[pwId] = { id: pwId, x: x + ux * w, y: y + uy * w };
+    const phId = newId();
+    state.points[phId] = { id: phId, x: x - vx * h, y: y - vy * h };
+    const idW = newId();
+    state.entities[idW] = { id: idW, type: 'line', a: p0, b: pwId, color: '#00ff00' };
+    const idH = newId();
+    state.entities[idH] = { id: idH, type: 'line', a: p0, b: phId, color: '#00ff00' };
+    // Same construction as a text object drawn with the Text tool: the two
+    // guides are constrained square. Without this, changing the font (which
+    // re-fits the aspect ratio) lets the solver shear the frame and the green
+    // guides go slanted. A rotated PDF label keeps its own baseline, so it only
+    // gets the perpendicular constraint, not horizontal.
+    const cPerp = newId();
+    state.constraints[cPerp] = { id: cPerp, type: 'perpendicular', line1: idW, line2: idH };
+    if (Math.abs(uy) < 1e-9) {
+      const cH = newId();
+      state.constraints[cH] = { id: cH, type: 'horizontal', entity: idW };
+    } else if (Math.abs(vy) < 1e-9) {
+      // 90°-rotated label: its height guide runs horizontally, pin that one
+      const cH = newId();
+      state.constraints[cH] = { id: cH, type: 'horizontal', entity: idH };
+    }
+    const id = newId();
+    const ent = {
+      id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
+      text: String(text), font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0,
+      color: ui.color
+    };
+    state.entities[id] = ent;
+    const fit = () => {
+      const m = textMetricsOf(ent);
+      const q0 = P(ent.p0), qw = P(ent.pw), qh = P(ent.ph);
+      if (!m || !q0 || !qw || !qh) return;
+      const ww = sizeMm * (m.width / TEXT_REF);
+      const hh = sizeMm * (m.height / TEXT_REF);
+      const dx = qw.x - q0.x, dy = qw.y - q0.y;
+      const dl = Math.hypot(dx, dy) || 1;
+      qw.x = q0.x + dx / dl * ww;
+      qw.y = q0.y + dy / dl * ww;
+      const ex = qh.x - q0.x, ey = qh.y - q0.y;
+      const el = Math.hypot(ex, ey) || 1;
+      qh.x = q0.x + ex / el * hh;
+      qh.y = q0.y + ey / el * hh;
+      ensureTextAspect(ent);
+      requestSolve();
+    };
+    fit();
+    return id;
+  }
+
+  // ---- multi-page import selection (PDF/CDR) ---------------------------
+  // "1-2,4" -> Set{1,2,4}; blank or "all" -> null (= keep every page).
+  // Numbers outside 1..maxPage are ignored, so an empty Set means the user
+  // asked for pages the file does not have.
+  function parsePageSpec(str, maxPage) {
+    const s = (str || '').trim();
+    if (!s || /^all$/i.test(s)) return null;
+    const set = new Set();
+    for (const part of s.split(',')) {
+      const t = part.trim();
+      const m = t.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (m) {
+        let a = +m[1], b = +m[2];
+        if (a > b) { const tmp = a; a = b; b = tmp; }
+        for (let p = a; p <= b; p++) if (p >= 1 && p <= maxPage) set.add(p);
+      } else if (/^\d+$/.test(t)) {
+        const p = +t;
+        if (p >= 1 && p <= maxPage) set.add(p);
+      }
+    }
+    return set;
+  }
+
+  function importPageCount(prims) {
+    return prims.reduce((m, pr) => Math.max(m, pr.page || 0), 0);
+  }
+
+  // Keep only the selected pages and close the horizontal gaps the dropped
+  // pages left behind (gap is in the prim's own units: pt for PDF, mm for CDR).
+  function filterImportPages(prims, pages, gap) {
+    if (!pages) return prims;
+    const kept = prims.filter(pr => pages.has(pr.page));
+    const byPage = new Map();
+    for (const pr of kept) {
+      if (!byPage.has(pr.page)) byPage.set(pr.page, []);
+      byPage.get(pr.page).push(pr);
+    }
+    const shiftX = (pr, dx) => {
+      if (pr.kind === 'note') { pr.x += dx; return; }
+      if (pr.kind === 'circle') { pr.cx += dx; return; }
+      for (const nd of pr.nodes) {
+        nd.p[0] += dx;
+        if (nd.o) nd.o[0] += dx;
+        if (nd.i) nd.i[0] += dx;
+      }
+    };
+    let cursor = -Infinity;
+    for (const n of [...byPage.keys()].sort((a, b) => a - b)) {
+      const list = byPage.get(n);
+      let minX = Infinity, maxX = -Infinity;
+      for (const pr of list) {
+        if (pr.kind === 'note') {
+          if (Number.isFinite(pr.x)) { minX = Math.min(minX, pr.x); maxX = Math.max(maxX, pr.x); }
+          continue;
+        }
+        if (pr.kind === 'circle') {
+          if (Number.isFinite(pr.cx) && Number.isFinite(pr.r)) {
+            minX = Math.min(minX, pr.cx - pr.r); maxX = Math.max(maxX, pr.cx + pr.r);
+          }
+          continue;
+        }
+        for (const nd of pr.nodes) {
+          if (!Number.isFinite(nd.p[0])) continue;
+          if (nd.p[0] < minX) minX = nd.p[0];
+          if (nd.p[0] > maxX) maxX = nd.p[0];
+        }
+      }
+      if (!isFinite(minX)) continue;
+      if (isFinite(cursor)) {
+        const dx = cursor + gap - minX;
+        for (const pr of list) shiftX(pr, dx);
+        maxX += dx;
+      }
+      cursor = maxX;
+    }
+    return kept;
+  }
+
+  // Per-import join controls (PDF / CDR / DXF dialogs): the weld that chains
+  // same-colour ends is also the step that can swallow short segments when the
+  // distance is too big for the file, so it is a choice per import, not only a
+  // global setting.
+  function fillJoinDefaults(prefix) {
+    const cb = document.getElementById(prefix + '-join');
+    const tolEl = document.getElementById(prefix + '-join-tol');
+    if (cb) cb.checked = settings.joinImportAuto !== 'off';
+    if (tolEl) tolEl.value = String(settings.joinImportTol);
+  }
+  function importJoinOpts(prefix) {
+    const cb = document.getElementById(prefix + '-join');
+    const tolEl = document.getElementById(prefix + '-join-tol');
+    const t = tolEl ? parseFloat(tolEl.value) : NaN;
+    return {
+      join: cb ? cb.checked : settings.joinImportAuto !== 'off',
+      joinTol: isFinite(t) && t > 0 ? t : settings.joinImportTol
+    };
+  }
+
   // Shared entity builder for vector imports (PDF, CDR): prims are
   // { color, closed, nodes } with coordinates in `scale` mm per unit. Straight
   // paths become line chains, anything with a curve becomes a spline with
   // handles. The toast carries the measured size as a health check.
-  function importPrimsIntoDocument(prims, scale, label, opts) {
+  async function importPrimsIntoDocument(prims, scale, label, opts) {
     const o = opts || {};
+    // Bundled faces load on demand: a text import into a sketch that never
+    // used text would otherwise create frames whose glyphs only appear once
+    // the face lands (and only after some later repaint). Wait for the face
+    // here, before the first render.
+    if (o.textMode === 'text' && window.MiniSketchFonts) {
+      await window.MiniSketchFonts.load(TEXT_DEFAULT_FONT, 400, 'normal');
+    }
+    // only frame the view when the sketch was empty — an import into existing
+    // work must not move the camera
+    const wasEmpty = !Object.keys(state.entities).length;
     // source formats (PDF/CDR) are Y-up; o.flipY mirrors them into the Y-down
     // sketch so vector imports and editable text arrive upright
     const sy = o.flipY ? -1 : 1;
@@ -14489,28 +15825,23 @@
     };
     pushHistory();
     let made = 0;
+    const lineIds = [];
     for (const pr of prims) {
       if (pr.kind === 'note') {
-        if (o.textMode === 'skip') continue;
+        // page markers ("=== Page N ===") are importer annotation, not page
+        // text: they always arrive as comments, whatever the text mode says
+        const pageLabel = pr.pageLabel === true;
+        if (o.textMode === 'skip' && !pageLabel) continue;
         const text = String(pr.text || '').slice(0, 500);
-        if (o.textMode === 'text') {
-          // keep it editable text: a framed text object at the anchor
-          const p0 = addPoint([pr.x, pr.y]);
-          const w = Math.max(20, text.length * 12);
-          const pwId = newId();
-          state.points[pwId] = { id: pwId, x: state.points[p0].x + w, y: state.points[p0].y };
-          const phId = newId();
-          state.points[phId] = { id: phId, x: state.points[p0].x, y: state.points[p0].y + w / 3 };
-          const idW = newId();
-          state.entities[idW] = { id: idW, type: 'line', a: p0, b: pwId, color: '#00ff00' };
-          const idH = newId();
-          state.entities[idH] = { id: idH, type: 'line', a: p0, b: phId, color: '#00ff00' };
-          const id = newId();
-          state.entities[id] = {
-            id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
-            text, font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0,
-            color: ui.color
-          };
+        if (o.textMode === 'text' && !pageLabel) {
+          // keep it editable text: a framed text object at the anchor, fitted
+          // to the PDF font's own size and proportions
+          const ux = isFinite(pr.ux) ? pr.ux : 1;
+          const uy = isFinite(pr.uy) ? -pr.uy : 0;
+          const vx = isFinite(pr.vx) ? pr.vx : 0;
+          const vy = isFinite(pr.vy) ? -pr.vy : -1;
+          const sizeMm = (isFinite(pr.size) && pr.size > 0 ? pr.size : 10) * scale;
+          addImportedTextObject(pr.x * scale, pr.y * scale * sy, text, sizeMm, { ux, uy, vx, vy });
           made++;
           continue;
         }
@@ -14542,6 +15873,7 @@
           if (a === b) continue;
           const id = newId();
           state.entities[id] = { id, type: 'line', a, b, color };
+          lineIds.push(id);
           made++;
         }
       } else {
@@ -14558,8 +15890,16 @@
         made++;
       }
     }
+    // connect same-colour segments that meet within the join tolerance, so the
+    // imported contours arrive chained and machine-ready. The import dialog
+    // can override the Settings default per file: a tolerance above half the
+    // shortest segment welds its ends into the neighbours and LOSES segments,
+    // so a reference import may want joining off entirely.
+    const joinOn = o.join != null ? o.join : settings.joinImportAuto !== 'off';
+    const joinTol = isFinite(+o.joinTol) && +o.joinTol > 0 ? +o.joinTol : settings.joinImportTol;
+    if (joinOn && lineIds.length >= 2) joinImportedSegments(lineIds, joinTol);
     if (!made) return 0;
-    fitView();
+    if (wasEmpty) fitView();
     commit();
     // measure the points that really exist in the document (ground truth, not
     // a running tally): the size in the toast is the health check. Comments
@@ -14628,6 +15968,9 @@
       modal.id = 'pdf-import-modal';
       modal.className = 'modal hidden';
       modal.innerHTML = '<div class="modal-box"><h3>Import PDF</h3>' +
+        '<label class="opt" id="pdf-pages-row" style="display:none">Pages ' +
+        '<input type="text" id="pdf-pages" size="12" placeholder="all"></label>' +
+        '<div class="opt-col" id="pdf-layers" style="display:none"></div>' +
         '<div class="opt-col" id="pdf-colors"></div>' +
         '<label class="opt">Text objects &rarr; ' +
         '<select id="pdf-text-mode">' +
@@ -14636,6 +15979,8 @@
         '<option value="skip">skip</option>' +
         '</select></label>' +
         '<label class="opt"><input type="checkbox" id="pdf-drop-tiny"> Drop tiny shapes (&lt; 2 mm)</label>' +
+        '<label class="opt" title="Weld same-colour segment ends into one point so contours arrive chained. Off keeps every segment exactly as the file describes it."><input type="checkbox" id="pdf-join"> Join endpoints (weld)</label>' +
+        '<label class="opt" title="Keep below half the SHORTEST segment in the file, otherwise a short segment welds its own ends into the neighbours and disappears.">Join distance (mm) <input type="number" id="pdf-join-tol" step="0.01" min="0.001" style="width:70px"></label>' +
         '<div class="modal-actions"><button class="btn" id="pdf-cancel">Cancel</button>' +
         '<button class="btn primary" id="pdf-ok">Import</button></div></div>';
       document.body.appendChild(modal);
@@ -14666,6 +16011,44 @@
     }
     const textSel = document.getElementById('pdf-text-mode');
     if (textSel) textSel.value = 'text';   // every open starts from editable text
+    // PDF layers (optional content): same visibility choice a viewer's layers
+    // panel offers — AutoCAD exports carry construction layers the reference
+    // view hides, and importing them all draws geometry nobody asked for.
+    const layers = new Map();
+    for (const pr of prims) {
+      if (!pr.ocg) continue;
+      const e = layers.get(pr.ocg) || { count: 0, off: !!pr.ocgOff };
+      e.count++;
+      layers.set(pr.ocg, e);
+    }
+    const lbox = document.getElementById('pdf-layers');
+    if (lbox) {
+      lbox.innerHTML = '';
+      lbox.style.display = layers.size ? '' : 'none';
+      if (layers.size) {
+        const head = document.createElement('div');
+        head.className = 'opt';
+        head.textContent = 'PDF layers (optional content):';
+        lbox.appendChild(head);
+      }
+      for (const [name, info] of layers) {
+        const label = document.createElement('label');
+        label.className = 'opt';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.layer = name;
+        cb.checked = !info.off;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + name + ' \u00b7 ' + info.count + ' shapes' + (info.off ? ' \u00b7 off in file' : '')));
+        lbox.appendChild(label);
+      }
+    }
+    const maxPage = importPageCount(prims);
+    const pagesRow = document.getElementById('pdf-pages-row');
+    const pagesInp = document.getElementById('pdf-pages');
+    if (pagesRow) pagesRow.style.display = maxPage >= 2 ? '' : 'none';
+    if (pagesInp) { pagesInp.value = ''; pagesInp.placeholder = 'all (1-' + maxPage + ', e.g. 1-2,4)'; }
+    fillJoinDefaults('pdf');
     pendingPdf = prims;
     modal.classList.remove('hidden');
   }
@@ -14676,17 +16059,29 @@
     pendingPdf = null;
   }
 
-  function applyPdfImport() {
+  async function applyPdfImport() {
     const prims = pendingPdf;
+    if (!prims) { closePdfImport(); return; }
+    const pagesEl = document.getElementById('pdf-pages');
+    const pages = parsePageSpec(pagesEl ? pagesEl.value : '', importPageCount(prims));
+    if (pages && !pages.size) {
+      toast('No pages match that selection (file has pages 1-' + importPageCount(prims) + ')');
+      return;
+    }
     closePdfImport();
-    if (!prims) return;
+    const keepLayers = new Set();
+    document.querySelectorAll('#pdf-layers input[type=checkbox]').forEach(cb => {
+      if (cb.checked) keepLayers.add(cb.dataset.layer);
+    });
+    const layered = prims.filter(pr => !pr.ocg || keepLayers.has(pr.ocg));
+    const src = filterImportPages(layered, pages, 283.4646);
     const keep = new Set();
     document.querySelectorAll('#pdf-colors input[type=checkbox]').forEach(cb => {
       if (cb.checked) keep.add(cb.dataset.color);
     });
     const dropTinyEl = document.getElementById('pdf-drop-tiny');
     const dropTiny = !!(dropTinyEl && dropTinyEl.checked);
-    const kept = prims.filter(pr => {
+    const kept = src.filter(pr => {
       if (pr.kind === 'note') return true;
       const b = pdfPrimBox(pr);
       // zero-size loops (no width or no height) and fully collapsed shapes are
@@ -14703,15 +16098,16 @@
       toast('Everything was filtered out \u2014 nothing imported');
       return;
     }
-    importPrimsIntoDocument(kept, 25.4 / 72, 'PDF', {
+    await importPrimsIntoDocument(kept, 25.4 / 72, 'PDF', {
       textMode: (document.getElementById('pdf-text-mode') || {}).value || 'text',
-      flipY: true
+      flipY: true,
+      ...importJoinOpts('pdf')
     });
-    toast('PDF: ' + kept.length + ' of ' + prims.length + ' objects imported');
+    toast('PDF: ' + kept.length + ' of ' + src.length + ' objects imported');
   }
 
   // Ctrl+Shift+A: select every object that shares the colour of the pick
-  // Alt+3: junction points — the points more than two lines run through.
+  // F3 / Alt+3: junction points — points used by 3 or more lines.
   // With a selection only the selection is examined, so picking the wanted
   // points first and pressing Alt+3 leaves exactly those junctions selected.
   function cmdSelectJunctionPoints() {
@@ -14730,12 +16126,15 @@
       let lines = 0;
       for (const u of uses) {
         const e = state.entities[+u.id];
-        if (e && e.type !== 'note' && e.type !== 'array') lines++;
+        // line-like geometry only: text frames / images / arrays / notes that
+        // happen to reuse the point are not lines through a junction
+        if (e && (e.type === 'line' || e.type === 'arc' ||
+          e.type === 'circle' || e.type === 'spline')) lines++;
       }
-      if (lines > 3) out.push({ kind: 'point', id: pid });
+      if (lines >= 3) out.push({ kind: 'point', id: pid });
     }
     if (!out.length) {
-      toast('No junction points (used by more than 3 lines)');
+      toast('No junction points (no point used by 3+ lines)');
       return;
     }
     ui.selection = out;
@@ -14834,6 +16233,29 @@
     return picked;
   }
 
+  // pickedLoops() yields ascending loop-index order, which ignores the order
+  // the user clicked. For a boolean the FIRST picked loop is the tool and the
+  // rest are targets, so that role must follow selection order — otherwise
+  // "select the tool first" is a lie and cut/intersect feel random. Reorder by
+  // the earliest selection position of each loop's boundary entities. With no
+  // entity selection (a point marquee) there is no click order: keep loop order.
+  function orderLoopsBySelection(loops) {
+    const pos = new Map();
+    ui.selection.forEach((s, idx) => {
+      if (s && s.kind === 'entity' && !pos.has(+s.id)) pos.set(+s.id, idx);
+    });
+    if (!pos.size) return loops;
+    const key = (L) => {
+      let best = Infinity;
+      for (const eid of loopEntities(L)) {
+        const p = pos.get(+eid);
+        if (p != null && p < best) best = p;
+      }
+      return best;
+    };
+    return loops.slice().sort((a, b) => key(a) - key(b));
+  }
+
   // --- Exact bezier boolean (PathBool) ---------------------------------------
   // tools/path-bool.js (vendored, MIT — github.com/r-flash/PathBool.js) runs
   // the boolean straight on lines, arcs and cubics: no flatten to a polygon,
@@ -14892,7 +16314,10 @@
       const a0 = Math.atan2(s.y - ad.c.y, s.x - ad.c.x);
       const a1 = Math.atan2(en.y - ad.c.y, en.x - ad.c.x);
       if (forward) segs.push({ k: 'A', c: ad.c, r: ad.r, sa: a0, ea: a0 + norm2pi(a1 - a0), ccw: true });
-      else segs.push({ k: 'A', c: ad.c, r: ad.r, sa: a1, ea: a1 - norm2pi(a0 - a1), ccw: false });
+      // backwards along the same arc = clockwise by the arc's OWN sweep
+      // (norm2pi(a1 - a0)); using norm2pi(a0 - a1) here swept the complement
+      // and landed the end point mirrored, leaving the ring open
+      else segs.push({ k: 'A', c: ad.c, r: ad.r, sa: a1, ea: a1 - norm2pi(a1 - a0), ccw: false });
       return true;
     };
     const cubicSegs = (e, forward, closed) => {
@@ -15038,7 +16463,10 @@
           Math.hypot(c2.x - lastOut.x, c2.y - lastOut.y) < 1e-9) continue;
       if (s.k === 'L') cmds.push(['L', [s.b.x, s.b.y]]);
       else if (s.k === 'C') cmds.push(['C', [s.c1.x, s.c1.y], [s.c2.x, s.c2.y], [s.b.x, s.b.y]]);
-      else cmds.push(['A', s.r, s.r, 0, Math.abs(s.ea - s.sa) > Math.PI + 1e-9, s.ccw ? 1 : 0,
+      // both flags NUMERIC: PathBool compares fA === fS strictly, so a boolean
+      // large-arc next to a numeric sweep never matches and every major arc
+      // reads as its mirrored minor
+      else cmds.push(['A', s.r, s.r, 0, Math.abs(s.ea - s.sa) > Math.PI + 1e-9 ? 1 : 0, s.ccw ? 1 : 0,
         [s.c.x + Math.cos(s.ea) * s.r, s.c.y + Math.sin(s.ea) * s.r]]);
       lastOut = end;
     }
@@ -15230,6 +16658,119 @@
       }
     }
     return madeIds;
+  }
+
+  // Exact boolean result paths -> curve loops ({nodes:[{x,y,o,i}], closed}),
+  // WITHOUT creating entities. Cubic/line/quadratic runs keep their true
+  // handles (curves preserved, no tessellation); arc runs become exact cubic
+  // nodes via arcCubicNodes. This is what a tool needs to emit a boolean result
+  // as smooth splines instead of a faceted polygon.
+  function boolPathsToCurveLoops(resultPaths) {
+    const loops = [];
+    const endOf = (seg) => seg[0] === 'L' ? seg[2] : seg[0] === 'C' ? seg[4] : seg[0] === 'Q' ? seg[3] : seg[7];
+    for (const path of resultPaths) {
+      const subs = [];
+      let cur = null;
+      for (const seg of path) {
+        const st = seg[1];
+        if (!cur || Math.hypot(cur.end[0] - st[0], cur.end[1] - st[1]) > BOOL_EPS) {
+          cur = { segs: [], end: st };
+          subs.push(cur);
+        }
+        cur.segs.push(seg);
+        cur.end = endOf(seg);
+      }
+      for (const sub of subs) {
+        if (sub.segs.length < 2) continue;
+        const closed = Math.hypot(sub.end[0] - sub.segs[0][1][0], sub.end[1] - sub.segs[0][1][1]) <= BOOL_EPS;
+        const nodes = [];
+        const push = (x, y, o, i) => nodes.push({ x, y, o: o || null, i: i || null });
+        for (const seg of sub.segs) {
+          const st = seg[1], k = seg[0];
+          if (!nodes.length) push(st[0], st[1], null, null);
+          const last = nodes[nodes.length - 1];
+          if (k === 'C') {
+            const en = seg[4];
+            if (Math.hypot(en[0] - last.x, en[1] - last.y) < 1e-12) continue;
+            last.o = { x: seg[2][0], y: seg[2][1] };
+            push(en[0], en[1], null, { x: seg[3][0], y: seg[3][1] });
+          } else if (k === 'Q') {
+            const en = seg[3], cp = seg[2];
+            last.o = { x: last.x + (cp[0] - last.x) * 2 / 3, y: last.y + (cp[1] - last.y) * 2 / 3 };
+            push(en[0], en[1], null, { x: en[0] + (cp[0] - en[0]) * 2 / 3, y: en[1] + (cp[1] - en[1]) * 2 / 3 });
+          } else if (k === 'L') {
+            const en = seg[2];
+            if (Math.hypot(en[0] - last.x, en[1] - last.y) < 1e-12) continue;
+            push(en[0], en[1], null, null);
+          } else {
+            const en = seg[7];
+            const cc = boolArcCenter(st[0], st[1], en[0], en[1], seg[2], seg[5], seg[6]);
+            if (!cc) { push(en[0], en[1], null, null); continue; }
+            const arc = arcCubicNodes({ x: cc.cx, y: cc.cy }, cc.r, cc.a0, cc.da, false);
+            for (let ni = 0; ni < arc.nodes.length; ni++) {
+              const nd = arc.nodes[ni];
+              if (ni === 0) { last.o = nd.o; continue; }   // first node == last, take its out handle
+              push(nd.x, nd.y, nd.o, nd.i);
+            }
+          }
+        }
+        if (nodes.length < 2) continue;
+        if (closed && nodes.length > 2) {
+          const f = nodes[0], l = nodes[nodes.length - 1];
+          if (Math.hypot(f.x - l.x, f.y - l.y) <= BOOL_EPS) { f.i = l.i || f.i; nodes.pop(); }
+        }
+        loops.push({ nodes, closed });
+      }
+    }
+    return loops;
+  }
+
+  // Exact bezier boolean on LOOPS (the Object Tree's loops), returning curve
+  // loops. Unlike api.polyBoolOp — which tessellates to polygons and is slow /
+  // fragile on dense spline outlines — this runs PathBool on the real cubic
+  // commands (loopToBoolCommands), so it is fast and keeps curves exact.
+  //   union:       fuse all subjectLoops
+  //   intersection: fuse(subjectLoops) ∩ fuse(clipLoops)
+  //   cut:         fuse(subjectLoops) − fuse(clipLoops)
+  // Returns null when the exact engine is unavailable or a loop cannot be read.
+  function boolLoopsExact(op, subjectLoops, clipLoops) {
+    const PB = pathBoolLib();
+    if (!PB) return null;
+    const inputsOf = (loops) => {
+      const out = [];
+      for (const loop of loops || []) {
+        const c = loopToBoolCommands(loop);
+        if (!c) return null;
+        out.push({ path: [...PB.pathFromCommands(c)], fillRule: PB.FillRule.NonZero });
+      }
+      return out;
+    };
+    const fuse = (inputs) => inputs && inputs.length
+      ? new PB.PathBoolean(inputs).get(PB.PathBooleanOperation.Union).flat() : [];
+    const subj = inputsOf(subjectLoops);
+    if (!subj) return null;
+    let resultPaths;
+    try {
+      if (op === 'union') {
+        resultPaths = new PB.PathBoolean(subj).get(PB.PathBooleanOperation.Union);
+      } else {
+        const clip = inputsOf(clipLoops);
+        if (!clip) return null;
+        const sU = fuse(subj), cU = fuse(clip);
+        if (!sU.length) return [];
+        if (!cU.length) return op === 'cut' ? boolPathsToCurveLoops([sU]) : [];
+        const pair = [
+          { path: sU, fillRule: PB.FillRule.NonZero },
+          { path: cU, fillRule: PB.FillRule.NonZero }
+        ];
+        resultPaths = new PB.PathBoolean(pair).get(op === 'cut'
+          ? PB.PathBooleanOperation.Difference : PB.PathBooleanOperation.Intersection);
+      }
+    } catch (err) {
+      console.warn('boolLoopsExact failed:', err);
+      return null;
+    }
+    return boolPathsToCurveLoops(resultPaths);
   }
 
   // The exact engine: PathBoolean on the picked loops, result rebuilt as real
@@ -15460,7 +17001,7 @@
   }
 
   function cmdBoolean(mode) {
-    const picked = pickedLoops();
+    const picked = orderLoopsBySelection(pickedLoops());
     const isUnion = mode === 'union';
     if (picked.length < 2) {
       toast(isUnion ? 'Select two or more loops, then press Ctrl++'
@@ -15578,6 +17119,12 @@
     const modal = document.getElementById('cdr-import-modal');
     const nameEl = document.getElementById('cdr-imp-file');
     if (nameEl) nameEl.textContent = name || '';
+    const maxPage = importPageCount(prims);
+    const pagesRow = document.getElementById('cdr-pages-row');
+    const pagesInp = document.getElementById('cdr-pages');
+    if (pagesRow) pagesRow.style.display = maxPage >= 2 ? '' : 'none';
+    if (pagesInp) { pagesInp.value = ''; pagesInp.placeholder = 'all (1-' + maxPage + ', e.g. 1-2,4)'; }
+    fillJoinDefaults('cdr');
     if (modal) modal.classList.remove('hidden');
   }
 
@@ -15631,20 +17178,32 @@
     return true;
   }
 
+  // The three guards above return before the counter on purpose: an ignored
+  // paste must not look like a paste that happened, or the Ctrl+V fallback in
+  // the key handler would be skipped for nothing.
   function onPasteEvent(ev) {
-    if (Date.now() < ignorePasteUntil) return;      // middle-click (primary selection)
-    if (clipboardEventInTextWidget(ev)) return;     // a field pasting its own text:
-    pasteEventSeq++;                                // must NOT suppress the Ctrl+V fallback
+    if (Date.now() < ignorePasteUntil) { pasteTrace('ignored: right after a middle click'); return; }
+    if (clipboardEventInTextWidget(ev)) { pasteTrace('ignored: a text field is the target'); return; }
+    pasteEventSeq++;
     const dt = ev.clipboardData;
-    if (!dt) return;
+    if (!dt) { pasteTrace('ignored: the event carries no clipboardData'); return; }
     let text = '';
     try {
       text = dt.getData('text/plain') || '';
     } catch (err) { text = ''; }
+    pasteTrace('event', ev.type, {
+      types: dt.types ? Array.from(dt.types) : null,
+      items: dt.items ? Array.from(dt.items).map(i => i.kind + ' ' + i.type) : null,
+      textChars: text.length,
+      textHead: text.slice(0, 70)
+    });
 
     // A paste already happened for this keystroke and the event arrived late
     // without a MiniSketch payload: skip, so nothing is pasted twice.
-    if (Date.now() - fallbackPasteAt < 400 && text.indexOf(CLIP_MARK) !== 0) return;
+    if (Date.now() - fallbackPasteAt < 400 && text.indexOf(CLIP_MARK) !== 0) {
+      pasteTrace('ignored: a paste for this keystroke already ran');
+      return;
+    }
 
     // 1. objects copied in another MiniSketch window
     if (text.indexOf(CLIP_MARK) === 0) {
@@ -15672,33 +17231,72 @@
 
     const items = dt.items ? Array.from(dt.items) : [];
 
-    // 2. SVG on the clipboard (Inkscape, Illustrator, another CAD)
+    // 2. SVG on the clipboard (Inkscape, Illustrator, another CAD). The type
+    // is matched loosely: Inkscape on macOS advertises the misspelled
+    // "image/svg-xml", and some browsers hand the markup over as a file.
+    // An SVG clipboard *item* can answer empty even though the real markup sits on
+    // the clipboard as text/plain (a browser async/format quirk). So when an item
+    // gives us nothing, fall back to the plain-text payload before giving up.
+    const svgTextOf = (str) => {
+      pasteTrace('the svg item answered with', str == null ? 'nothing' : String(str).length + ' chars');
+      let src = str && str.trim() ? str : '';
+      if (!src) {
+        if (text && looksLikeSvgDoc(text)) {
+          src = text;
+          pasteTrace('route: item empty — using the text/plain payload instead (' + src.length + ' chars)');
+        } else {
+          pasteTrace('route: item empty and no SVG in text/plain — nothing to import');
+          return;
+        }
+      }
+      // the reason the importer declined rides along in the note: a paste that
+      // does nothing and says nothing cannot be reported
+      let why = '';
+      if (!svgClipboardToSketch(src, (m) => { why = m; })) {
+        pasteTrace('route: vector importer declined (' + (why || 'unknown') + ') — trying the flat art reader');
+        if (!artFromSvgText(src))
+          toast('No paths in that SVG (' + (why || 'nothing to import') + ')');
+      }
+    };
     for (const item of items) {
-      if (item.kind === 'string' && item.type === 'image/svg+xml') {
+      if (!/svg/i.test(item.type || '')) continue;
+      if (item.kind === 'string') {
+        pasteTrace('route: svg clipboard item', item.type);
         ev.preventDefault();
-        item.getAsString(str => {
-          if (str && !artFromSvgText(str)) toast('No paths in that SVG');
-        });
+        item.getAsString(svgTextOf);
+        return;
+      }
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (!file || typeof file.text !== 'function') continue;
+        pasteTrace('route: svg clipboard file', item.type);
+        ev.preventDefault();
+        file.text().then(svgTextOf, () => toast('That SVG could not be read'));
         return;
       }
     }
 
-    // 3. raster image: ask trace or keep-as-image first
+    // 3. the same markup handed over as plain text, and checked BEFORE the
+    // raster: Inkscape also puts a PNG preview on the clipboard, so a browser
+    // that offers both would otherwise lose the vectors.
+    if (text && looksLikeSvgDoc(text)) {
+      pasteTrace('route: svg in plain text');
+      ev.preventDefault();
+      svgTextOf(text);
+      return;
+    }
+    pasteTrace('no svg item; the text is', text ? 'not an SVG document' : 'empty');
+
+    // 4. raster image: ask trace or keep-as-image first
     for (const item of items) {
       if (item.kind === 'file' && /^image\//.test(item.type) && item.type !== 'image/svg+xml') {
         const blob = item.getAsFile();
         if (!blob) continue;
+        pasteTrace('route: raster image', item.type);
         ev.preventDefault();
         openImageDialog(blob);
         return;
       }
-    }
-
-    // 4. plain text that is really SVG markup
-    if (text && text.indexOf('<') >= 0 && /<svg[\s>]/i.test(text)) {
-      ev.preventDefault();
-      if (!artFromSvgText(text)) toast('No paths in that SVG');
-      return;
     }
 
     // 5. the browser handed us nothing at all (clipboard write was blocked
@@ -15707,8 +17305,12 @@
     // our objects over it.
     const declared = dt.types ? dt.types.length : 0;
     if (!text && !declared && clipboard && (clipboard.entities.length || clipboard.points.length)) {
+      pasteTrace('route: in-memory fallback');
       ev.preventDefault();
       pasteClipboard();
+    } else {
+      pasteTrace('nothing matched: text', text ? 'present' : 'empty', '· declared types', declared,
+        '· this tab copied', !!(clipboard && (clipboard.entities.length || clipboard.points.length)));
     }
   }
 
@@ -16157,6 +17759,7 @@
       o.value = value;
       o.textContent = label;
       (group || sel).appendChild(o);
+      return o;
     };
     // single-line first: it is the engrave path, not a look
     const gSingle = document.createElement('optgroup');
@@ -16164,14 +17767,20 @@
     sel.appendChild(gSingle);
     for (const f of HERSHEY_FAMILIES) addOpt(gSingle, f, f);
     if (reg) {
+      // ONE option per FAMILY, not per face. A face is (family, weight, style);
+      // listing members separately made "Liberation Serif" and
+      // "Liberation Serif · Bold" two different fonts and left Italic
+      // unreachable. Weight and Style in the row below pick the face.
       for (const cat of reg.categories()) {
         if (cat === 'Imported' && !reg.imported().length) continue;
         const g = document.createElement('optgroup');
         g.label = cat;
         sel.appendChild(g);
-        for (const f of reg.index()) {
-          if (f.category !== cat) continue;
-          addOpt(g, f.family, f.family + (f.weight >= 700 ? ' · Bold' : ''));
+        const index = reg.index();
+        const families = [];
+        for (const f of index) if (f.category === cat && !families.includes(f.family)) families.push(f.family);
+        for (const fam of families) {
+          addOpt(g, fam, fam);
         }
         if (cat === 'Imported') {
           for (const f of reg.imported()) addOpt(g, f.family, f.family);
@@ -16208,17 +17817,25 @@
   // A bundled family must have its bytes registered before the canvas may
   // trace with it (otherwise the trace caches fallback-font contours). The
   // await keeps Apply from racing the load.
-  async function ensureFontLoaded(family, btn) {
+  //
+  // `weight`/`style` matter: `registered(family)` is keyed per MEMBER, so a
+  // Bold-only check let a Regular text through while its Bold face was still
+  // missing — and the outline path then reported "no outline data" for a font
+  // the registry insisted was loaded.
+  async function ensureFontLoaded(family, btn, weight, style) {
     const reg = window.MiniSketchFonts;
-    if (!reg || reg.registered(family)) return true;
+    const w = weight || 400;
+    const st = style || 'normal';
+    if (!reg) return true;
+    if (reg.registered(family, w, st)) return true;
     const prev = btn ? btn.textContent : null;
     if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
     try {
-      await reg.load(family);
+      await reg.load(family, w, st);
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = prev; }
     }
-    return reg.registered(family);
+    return reg.registered(family, w, st);
   }
 
   const HELP_LANG_KEY = 'minisketch.help.lang';
@@ -16264,12 +17881,12 @@
   // Help keeps its hand-written prose; only the key reference regenerates.
   function renderHelpKeyGrid() {
     const groups = [
-      { title: { en: 'Tools', id: 'Alat' }, keys: ['L', 'K', 'Y', 'A', 'C', 'B', 'W', 'I', 'E', 'R'] },
-      { title: { en: 'Dimensions', id: 'Dimensi' }, keys: ['D', 'Shift+D', 'Shift+E'] },
-      { title: { en: 'Constraints', id: 'Constraint' }, keys: ['T', 'O', 'H', 'V', 'P', '[', 'Q', '.', 'M', 'F', 'J', 'Alt+T'] },
-      { title: { en: 'Edit', id: 'Edit' }, keys: ['Z', 'N', 'Ctrl+O', 'Ctrl+M', 'Ctrl+G', 'Ctrl+U', 'Ctrl+L'] },
+      { title: { en: 'Tools', id: 'Alat' }, keys: ['Shift+B', 'B', '*', 'A', 'E', 'R', 'T', 'I', 'Shift+E', 'Ctrl+M'] },
+      { title: { en: 'Dimensions', id: 'Dimensi' }, keys: ['D', 'Shift+D'] },
+      { title: { en: 'Constraints', id: 'Constraint' }, keys: ['G', 'O', 'H', 'V', 'P', '[', 'Q', '.', 'M', 'F', 'J', '\\', 'Alt+T'] },
+      { title: { en: 'Edit', id: 'Edit' }, keys: ['Z', 'N', 'Shift+L', 'Alt+W', 'Ctrl+J', 'Ctrl+K', 'Ctrl+Shift+M', 'Ctrl+G', 'Ctrl+U', 'Ctrl+L'] },
       { title: { en: 'Boolean', id: 'Boolean' }, keys: ['Ctrl++', 'Ctrl+-', 'Ctrl+0'] },
-      { title: { en: 'View & solve', id: 'Tampilan' }, keys: ['G', 'S', 'Shift+F', 'F9', '?', 'Shift+Z'] },
+      { title: { en: 'View & solve', id: 'Tampilan' }, keys: ['#', '%', '3', 'F1', 'F2', 'F3', 'Alt+1', 'Alt+2', 'Alt+3', 'Shift+F', 'F9', '?', 'Shift+Z'] },
       { title: { en: 'Machine', id: 'Mesin' }, keys: ['Alt+Q', 'Alt+C'] },
       { title: { en: 'Frame', id: 'Bingkai' }, keys: ['Alt+R'] },
     ];
@@ -16326,6 +17943,27 @@
   function saveTextHeight(v) {
     try { localStorage.setItem(TEXT_HEIGHT_KEY, String(v)); } catch (err) {}
   }
+  // Remembered text style (font + weight/italic/tracking): a NEW text opens
+  // with the last-used styling instead of the hardcoded default, so the font
+  // you picked stays picked across sessions.
+  const TEXT_STYLE_KEY = 'minisketch.textStyle.v1';
+  function loadTextStyle() {
+    try {
+      const s = JSON.parse(localStorage.getItem(TEXT_STYLE_KEY) || 'null');
+      if (s && typeof s === 'object') return s;
+    } catch (err) {}
+    return { font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0 };
+  }
+  function saveTextStyle(s) {
+    try {
+      localStorage.setItem(TEXT_STYLE_KEY, JSON.stringify({
+        font: (s.font && typeof s.font === 'string') ? s.font : TEXT_DEFAULT_FONT,
+        weight: isFinite(+s.weight) ? +s.weight : 400,
+        italic: !!s.italic,
+        tracking: isFinite(+s.tracking) ? clamp(+s.tracking, -30, 60) : 0
+      }));
+    } catch (err) {}
+  }
   // The driven dimension on the vertical guide (p0 -> ph). Replaces the
   // previous p0-ph distance so re-applying a height never stacks dimensions.
   function applyTextHeightDimension(e, hMm) {
@@ -16345,7 +17983,7 @@
       const a = +c.p1, b = +c.p2;
       if ((a === +e.p0 && b === +e.ph) || (a === +e.ph && b === +e.p0)) delete state.constraints[cid];
     }
-    const c = { type: 'distance', p1: +e.p0, p2: +e.ph, value: hMm, offset: 26 };
+    const c = { type: 'distance', p1: +e.p0, p2: +e.ph, value: hMm, offset: 10 };
     c.id = newId();
     state.constraints[c.id] = c;
   }
@@ -16379,12 +18017,14 @@
     ctx.fillStyle = ink;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
     if (!text) return;
-    if (!single && window.MiniSketchFonts && !window.MiniSketchFonts.registered(family)) {
+    if (!single && window.MiniSketchFonts &&
+      !window.MiniSketchFonts.registered(family, +wt || 400, it === '1' ? 'italic' : 'normal')) {
       // An imported / bundled face may still be arriving: paint the fallback
       // now, then repaint once it lands. Only repaint when the load actually
       // registered the face — otherwise an unknown family would re-schedule
-      // itself forever.
-      window.MiniSketchFonts.load(family).then((ok) => {
+      // itself forever. The member matters: a Bold-only family would report
+      // itself unregistered for a Regular request and repaint in a loop.
+      window.MiniSketchFonts.load(family, +wt || 400, it === '1' ? 'italic' : 'normal').then((ok) => {
         if (!ok) return;
         const f2 = document.getElementById('text-font');
         if (f2 && f2.value === family && ui.textEdit) renderTextPreview();
@@ -16512,7 +18152,8 @@
     const applyBtn = document.querySelector('#text-modal .modal-actions .btn.primary');
     const family = fontEl ? fontEl.value : (e.font || 'sans-serif');
     const single = HERSHEY_FAMILIES.includes(family);
-    if (!single) await ensureFontLoaded(family, applyBtn);
+    if (!single) await ensureFontLoaded(family, applyBtn, weightEl ? +weightEl.value || 400 : 400,
+      italicEl && italicEl.value === '1' ? 'italic' : 'normal');
     const trackRaw = trackEl ? parseFloat(trackEl.value) : 0;
     const tracking = isFinite(trackRaw) ? clamp(trackRaw, -30, 60) : 0;
     const leadRaw = leadEl ? parseFloat(leadEl.value) : 125;
@@ -16526,6 +18167,8 @@
     e.tracking = tracking;
     e.leading = leading;
     e.align = alignEl && ['left', 'center', 'right'].includes(alignEl.value) ? alignEl.value : 'left';
+    // Remember the font/style so a new text opens with the same look.
+    saveTextStyle({ font: family, weight: e.weight, italic: e.italic, tracking });
     const tolEl = document.getElementById('text-tol');
     if (tolEl) {
       const t = parseFloat(tolEl.value);
@@ -16552,9 +18195,12 @@
     closeTextEditor();
   }
 
-  // per-epoch grouping cache for drawEntities (see above)
+  // per-epoch grouping cache for drawEntities (see above). guideIdCache holds
+  // the owned construction lines (text/frame/array guides) so the renderer can
+  // paint them in a faint transparent pass instead of over the text.
   let byLayerCache = null;
   let byLayerEpoch = -1;
+  let guideIdCache = null;
 
   function drawEntities() {
     const bulk = bulkActive();
@@ -16594,16 +18240,26 @@
     const byLayer = new Map();
     for (const l of (state.layers || [])) byLayer.set(l.id, []);
     const fallbackLayer0 = state.layers && state.layers[0] ? state.layers[0].id : null;
+    const guideIds = new Set();
     for (const id in state.entities) {
       const e = state.entities[id];
+      if (!e) continue;
+      if (Array.isArray(e.guide)) for (const gid of e.guide) guideIds.add(+gid);
+      if (e.type === 'array' && e.guideId != null) guideIds.add(+e.guideId);
+    }
+    for (const id in state.entities) {
+      const e = state.entities[id];
+      if (!e || guideIds.has(+id)) continue;   // guides draw in the faint pass
       const lid = layerOf(e);
       let bucket = byLayer.get(lid);
       if (!bucket) bucket = byLayer.get(fallbackLayer0) || null;
       if (bucket) bucket.push(e);
     }
     byLayerCache = byLayer;
+    guideIdCache = guideIds;
     }
     const byLayer = byLayerCache;
+    const guideIds = guideIdCache || new Set();
     const layers = state.layers || [];
     for (let li = layers.length - 1; li >= 0; li--) {
       const l = layers[li];
@@ -16621,6 +18277,20 @@
       batch.clear();
       selBatch.clear();
       if (dim) ctx.restore();
+    }
+    // Owned construction lines (text/frame/array guides): faint (25%), so a
+    // green guide over red text reads as a guide, not as a stroke on top of it.
+    if (guideIds.size) {
+      ctx.save();
+      ctx.globalAlpha = 0.25;
+      const gbatch = new Map();
+      for (const id in state.entities) {
+        const e = state.entities[id];
+        if (!e || !guideIds.has(+id)) continue;
+        drawOneEntity(e, bulk, manySelected, lw, selLw, gbatch, gbatch);
+      }
+      flushEntityBatch(gbatch, lw, manySelected);
+      ctx.restore();
     }
   }
 
@@ -16878,19 +18548,25 @@
     // entities the generic selected colour is the honest signal.
     const selEnts = selectionIndex().entity;
     const entityHighlight = selEnts.size > 0 && selEnts.size <= 200;
-    const SEG_COLOR = 'rgba(245, 158, 11, 0.9)';
     // The amber band is THE selection stroke for lines: drawOneEntity's
     // brightened pass sits under it and reads as a white rim, which is why
     // turning the Selected line width down never slimmed a picked line. One
     // stroke, one width — the setting drives it, with the same zoom clamp the
-    // other strokes use.
+    // other strokes use. The band colour is now per-entity: the object's own
+    // colour mixed toward amber (selectMixColor), so a picked line keeps its
+    // hue instead of flattening to pure amber.
     const SEG_WIDTH = Math.max(2, SEL_WIDTH * clamp(view.zoom, LINE_ZOOM_MIN, LINE_ZOOM_MAX));
-    // one batched path for every highlighted segment: the old loop issued a
-    // beginPath/stroke pair PER segment — 9k selected lines meant 18k draw
-    // calls where one stroke of one path answers the same picture
-    let segPath = null;
-    const segMoveTo = (x, y) => { if (!segPath) segPath = new Path2D(); segPath.moveTo(x, y); };
-    const segLineTo = (x, y) => segPath.lineTo(x, y);
+    // one batched path per band colour: the old loop issued a beginPath/stroke
+    // pair PER segment — 9k selected lines meant 18k draw calls where one stroke
+    // of one path answered the same picture
+    const segPaths = new Map();
+    const segPathFor = (color) => {
+      let p = segPaths.get(color);
+      if (!p) { p = new Path2D(); segPaths.set(color, p); }
+      return p;
+    };
+    const segMoveTo = (x, y, color) => segPathFor(color).moveTo(x, y);
+    const segLineTo = (x, y, color) => segPathFor(color).lineTo(x, y);
 
     if (entityHighlight) {
       for (const eid of selEnts) {
@@ -16905,22 +18581,25 @@
           const a = P(e.a), b = P(e.b);
           if (!a || !b) continue;
           const sa = w2s(a.x, a.y), sb = w2s(b.x, b.y);
-          segMoveTo(sa.x, sa.y);
-          segLineTo(sb.x, sb.y);
+          const col = selectMixColor(themedCanvasColor(colorOf(e)));
+          segMoveTo(sa.x, sa.y, col);
+          segLineTo(sb.x, sb.y, col);
         } else if (e.type === 'circle') {
           const c = P(e.c);
           if (!c) continue;
           const cs = w2s(c.x, c.y);
           const r = Math.max(0.01, e.r) * view.zoom;
-          segMoveTo(cs.x + r, cs.y);
-          segPath.arc(cs.x, cs.y, r, 0, TAU);
+          const col = selectMixColor(themedCanvasColor(colorOf(e)));
+          segMoveTo(cs.x + r, cs.y, col);
+          segPathFor(col).arc(cs.x, cs.y, r, 0, TAU);
         } else if (e.type === 'arc') {
           const ad = arcData(e);
           if (!ad || ad.sweep < 1e-6) continue;
           const cs = w2s(ad.c.x, ad.c.y);
           const r = ad.r * view.zoom;
-          segMoveTo(cs.x + Math.cos(ad.a0) * r, cs.y + Math.sin(ad.a0) * r);
-          segPath.arc(cs.x, cs.y, r, ad.a0, ad.a0 + ad.sweep, false);
+          const col = selectMixColor(themedCanvasColor(colorOf(e)));
+          segMoveTo(cs.x + Math.cos(ad.a0) * r, cs.y + Math.sin(ad.a0) * r, col);
+          segPathFor(col).arc(cs.x, cs.y, r, ad.a0, ad.a0 + ad.sweep, false);
         }
       }
     }
@@ -16935,8 +18614,9 @@
         const a = P(e.a), b = P(e.b);
         if (!a || !b) continue;
         const sa = w2s(a.x, a.y), sb = w2s(b.x, b.y);
-        segMoveTo(sa.x, sa.y);
-        segLineTo(sb.x, sb.y);
+        const col = selectMixColor(themedCanvasColor(colorOf(e)));
+        segMoveTo(sa.x, sa.y, col);
+        segLineTo(sb.x, sb.y, col);
       }
     }
 
@@ -16948,6 +18628,7 @@
       ensureSplineHandles(e);
       if (!e.hs) continue;
       const wholeSplineSel = entityHighlight && selEnts.has(+eid);
+      const col = selectMixColor(themedCanvasColor(colorOf(e)));
       const nsegs = e.closed ? ids.length : ids.length - 1;
       for (let seg = 0; seg < nsegs; seg++) {
         const nxt = (seg + 1) % ids.length;
@@ -16956,29 +18637,29 @@
         const P3 = P(ids[nxt]);
         if (!P0 || !P3) continue;
         const s0 = w2s(P0.x, P0.y);
-        segMoveTo(s0.x, s0.y);
+        segMoveTo(s0.x, s0.y, col);
         // a span with no handles on either side IS a straight chord: draw the
         // line instead of sampling a degenerate cubic 18 times
         if (!e.hs.o[seg] && !e.hs.i[nxt]) {
           const s3 = w2s(P3.x, P3.y);
-          segLineTo(s3.x, s3.y);
+          segLineTo(s3.x, s3.y, col);
         } else {
           // the exact cubic, drawn natively: the old path sampled cubicAt 18
           // times per span per frame
           const P1 = e.hs.o[seg] || P0;
           const P2 = e.hs.i[nxt] || P3;
           const s1 = w2s(P1.x, P1.y), s2 = w2s(P2.x, P2.y), s3 = w2s(P3.x, P3.y);
-          segPath.bezierCurveTo(s1.x, s1.y, s2.x, s2.y, s3.x, s3.y);
+          segPathFor(col).bezierCurveTo(s1.x, s1.y, s2.x, s2.y, s3.x, s3.y);
         }
       }
     }
 
-    if (segPath) {
+    for (const [color, path] of segPaths) {
       ctx.save();
-      ctx.strokeStyle = SEG_COLOR;
+      ctx.strokeStyle = color;
       ctx.lineWidth = SEG_WIDTH;
       ctx.lineCap = 'round';
-      ctx.stroke(segPath);
+      ctx.stroke(path);
       ctx.restore();
     }
   }
@@ -17168,10 +18849,67 @@
     return out;
   }
 
+  // The selection band colour: the object's DISPLAYED colour (themed, so it
+  // matches what is on screen) mixed toward the amber selection tint — a picked
+  // line keeps its hue instead of flattening to pure amber. Non-hex colours
+  // fall back to the flat amber band.
+  const AMBER_RGB = [245, 158, 11];
+  const AMBER_MIX = 0.3;              // amber share of the mix (0..1); kept low
+                                        // so the object's own hue stays readable
+                                        // (a high share collapses green/blue to khaki)
+  const SEG_COLOR_FLAT = 'rgba(245, 158, 11, 0.9)';
+  const mixCache = new Map();
+  function selectMixColor(hex) {
+    const key = String(hex || '');
+    const hit = mixCache.get(key);
+    if (hit) return hit;
+    const m = /^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$/.exec(key);
+    const out = m
+      ? 'rgb(' + [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)]
+          .map((v, i) => Math.round(v + (AMBER_RGB[i] - v) * AMBER_MIX)).join(',') + ')'
+      : SEG_COLOR_FLAT;
+    mixCache.set(key, out);
+    return out;
+  }
+
+  // Points shared by 2+ line-like entities form a chain/polyline. A chain's
+  // tiny segments must NOT be dropped just because each is sub-pixel — that is
+  // what punched the dashed gaps when zoomed out. The set is per geometry epoch
+  // (one scan per edit), so the per-entity test stays O(1).
+  let chainPointCache = null;
+  let chainPointEpoch = -1;
+  function chainPointIds() {
+    if (chainPointCache && chainPointEpoch === geometryEpoch) return chainPointCache;
+    const uses = new Map();
+    for (const id in state.entities) {
+      const e = state.entities[id];
+      if (!e) continue;
+      let ids = null;
+      if (e.type === 'line') ids = [e.a, e.b];
+      else if (e.type === 'spline') ids = e.pts;
+      else if (e.type === 'arc' || e.type === 'circle') ids = [e.c, e.s, e.e].filter(v => v != null);
+      if (!ids) continue;
+      for (const pid of ids) {
+        if (pid == null) continue;
+        uses.set(+pid, (uses.get(+pid) || 0) + 1);
+      }
+    }
+    const out = new Set();
+    for (const [pid, n] of uses) if (n >= 2) out.add(pid);
+    chainPointCache = out;
+    chainPointEpoch = geometryEpoch;
+    return out;
+  }
   function entitySubPixel(e) {
     const b = entityQuickBounds(e);
     if (!b) return false;
-    return (b.maxX - b.minX) * view.zoom < 1 && (b.maxY - b.minY) * view.zoom < 1;
+    if ((b.maxX - b.minX) * view.zoom >= 1 || (b.maxY - b.minY) * view.zoom >= 1) return false;
+    // keep tiny segments that belong to a chain (see above)
+    if (e.type === 'line') {
+      const ch = chainPointIds();
+      if (ch.has(+e.a) || ch.has(+e.b)) return false;
+    }
+    return true;
   }
 
   // A part is visualisation only: green stroke (dark on the light theme, light
@@ -17187,12 +18925,19 @@
     ctx.strokeStyle = isSel ? themedCanvasColor(e.color || PART_COLOR) : dimColor(themedCanvasColor(e.color || PART_COLOR));
     if (isHover && !isSel) ctx.lineWidth = width * 1.4;
     ctx.beginPath();
+    const tol2 = 0.75 * 0.75;
     for (const pl of (e.polylines || [])) {
+      let lx = 0, ly = 0, has = false;
       for (let i = 0; i < pl.length; i++) {
         const w = matApply(t, { x: pl[i][0], y: pl[i][1] });
         const s = w2s(w.x, w.y);
-        if (i === 0) ctx.moveTo(s.x, s.y);
-        else ctx.lineTo(s.x, s.y);
+        if (!has) { ctx.moveTo(s.x, s.y); has = true; }
+        else {
+          const dx = s.x - lx, dy = s.y - ly;
+          if (dx * dx + dy * dy < tol2) continue;   // realtime LOD
+          ctx.lineTo(s.x, s.y);
+        }
+        lx = s.x; ly = s.y;
       }
     }
     ctx.stroke();
@@ -17543,23 +19288,24 @@
   let selEntPointsCacheFor = null;
   const EMPTY_SET = new Set();
   function drawPoints() {
-    // The Points toggle shows the handles of the whole drawing: a point is drawn
-    // when its layer is VISIBLE, whatever layer is active. Grabbing is the
-    // narrower rule (pointEditable, active layer only) and is applied at the
-    // hit-test, not here — using it here hid every point outside the active
-    // layer.
-    // With the Points toggle off the points of a selected object still show,
-    // so a selection can still be fine-tuned point by point.
     const selIdx = selectionIndex();
     const selEnts = selIdx.entity;
     const selPts = selIdx.point;
-    if (!ui.showPoints && !selEnts.size && !selPts.size) return;
-    // fast zoom mode: plain markers carry almost no information per pixel at
-    // 24k points; selected/hover markers (decimated when bulk) still show
-    if (fastMode && !ui.showPoints) return;
-    // in fast mode plain markers drop only when the user did not explicitly
-    // turn Points on; selected/hover markers (decimated when bulk) still show
-    const skipPlain = fastMode && !ui.showPoints;
+    // Visibility rule:
+    //  - an explicit point selection (F3 junction points, a point picked in
+    //    node edit) always shows;
+    //  - in F1 (select/move) nothing else shows;
+    //  - in F2 (node edit) the points of a selected line/loop/frame show, and
+    //    the Points menu toggle is the "show all points" override.
+    const showAll = !!ui.showPoints && ui.mode === 'node';
+    // In F2 with nothing selected, a point still reveals itself on hover:
+    // the hit-test can find it, so draw the hover marker without running the
+    // full point scan on every idle frame.
+    const hoverPoint = !!(ui.hover && ui.hover.kind === 'point');
+    if (ui.mode === 'select' && !selPts.size) return;
+    if (ui.mode === 'node' && !showAll && !selEnts.size && !selPts.size && !hoverPoint) return;
+    if (fastMode && !showAll && !selPts.size && !selEnts.size && !hoverPoint) return;
+    const skipPlain = fastMode && !showAll;
     // Every marker goes into one of three batched paths (plain, selected,
     // hovered) with a single fill + stroke each, and off-screen markers are
     // culled — so thousands of handles stay visible and selectable without a
@@ -17584,16 +19330,19 @@
     // points owned by selected entities, computed once per SELECTION (not per
     // frame): the cache key is the selection index object, which rebuilds
     // exactly when the selection changes
-    let selEntPoints = selEntPointsCache || EMPTY_SET;
-    if (selEnts.size && selEntPointsCacheFor !== selIdx) {
-      selEntPoints = new Set();
-      for (const eid of selEnts) {
-        const e = state.entities[eid];
-        if (!e) continue;
-        for (const pid of entityPointIds(e)) selEntPoints.add(+pid);
+    let selEntPoints = EMPTY_SET;
+    if (selEnts.size) {
+      if (selEntPointsCacheFor !== selIdx) {
+        selEntPoints = new Set();
+        for (const eid of selEnts) {
+          const e = state.entities[eid];
+          if (!e) continue;
+          for (const pid of entityPointIds(e)) selEntPoints.add(+pid);
+        }
+        selEntPointsCache = selEntPoints;
+        selEntPointsCacheFor = selIdx;
       }
-      selEntPointsCache = selEntPoints;
-      selEntPointsCacheFor = selIdx;
+      selEntPoints = selEntPointsCache || EMPTY_SET;
     }
     // marker density: at most one plain marker per 8px screen cell — at low
     // zoom thousands of them overlap into one blob anyway. Selected points are
@@ -17623,7 +19372,7 @@
       // grab: it keeps the plain style and skips the selection/hover emphasis,
       // which belongs to the active layer only.
       const grabbable = pointEditable(id);
-      let show = ui.showPoints || isSel || isHover || selEntPoints.has(id);
+      const show = isSel || (ui.mode === 'node' && (isHover || showAll || selEntPoints.has(id)));
       if (!show) continue;
       // inline screen math: w2s() allocates an object per call, and ten
       // thousand markers per frame is what pushed the garbage collector into
@@ -17786,7 +19535,8 @@
     return { x: Math.round(sx), y: Math.round(sy) };
   }
 
-  // A badge is clickable — plain click deletes (undoable), Shift/Ctrl+click
+  // A badge is clickable — double-click deletes (undoable), a single click or
+  // Shift/Ctrl+click selects
   // selects. A conflicting badge (P1-9) draws red; deleting one side of the
   // fight resolves it.
   function drawBadge(text, sx, sy, id, conflict) {
@@ -17817,8 +19567,9 @@
     if (id != null) ui.badgeHits.push({ id, x: sx - w / 2, y: sy - h / 2, w, h });
   }
 
-  // Badge -> constraint: delete with a left click, undoable via history.
-  // Shift+click (or Ctrl) keeps the old select behaviour for multi-select.
+  // Badge -> constraint: a DOUBLE-click deletes (undoable via history); a
+  // single click only selects, so a stray click can no longer remove a
+  // constraint. Shift+click (or Ctrl) keeps the select behaviour too.
   function deleteConstraintById(id) {
     id = +id;
     const c = state.constraints[id];
@@ -17870,24 +19621,41 @@
     return g ? { nx: g.nx, ny: g.ny } : null;
   }
 
+  // The angle a dimension arc spans: from the vertex to each line's far
+  // endpoint — the ray the visible segment actually occupies. The raw a→b
+  // direction can point *into* the vertex; using it put the arc on the wrong
+  // side of the lines and made it rotate backwards when a line was dragged
+  // (the visible ray is the negative of a→b).
+  function angleRays(a, b, c, d) {
+    if (!a || !b || !c || !d) return null;
+    const r = { x: b.x - a.x, y: b.y - a.y };
+    const s = { x: d.x - c.x, y: d.y - c.y };
+    if (Math.hypot(r.x, r.y) < 1e-9 || Math.hypot(s.x, s.y) < 1e-9) return null;
+    const denom = r.x * s.y - r.y * s.x;
+    if (Math.abs(denom) < 1e-9) {
+      // Parallel: no vertex, fall back to the a→b directions as before.
+      const a1 = Math.atan2(r.y, r.x);
+      const a2 = Math.atan2(s.y, s.x);
+      return { v: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, a1, a2, delta: wrapPi(a2 - a1) };
+    }
+    const t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / denom;
+    const v = { x: a.x + r.x * t, y: a.y + r.y * t };
+    const ray = (p, q) => (Math.hypot(q.x - v.x, q.y - v.y) >= Math.hypot(p.x - v.x, p.y - v.y)
+      ? Math.atan2(q.y - v.y, q.x - v.x)
+      : Math.atan2(p.y - v.y, p.x - v.x));
+    const a1 = ray(a, b);
+    const a2 = ray(c, d);
+    return { v, a1, a2, delta: wrapPi(a2 - a1) };
+  }
+
   function angleGeom(c) {
     const e1 = state.entities[c.line1];
     const e2 = state.entities[c.line2];
     if (!e1 || !e2 || e1.type !== 'line' || e2.type !== 'line') return null;
-    const d1 = dirOf(e1);
-    const d2 = dirOf(e2);
-    if (d1.len < 1e-9 || d2.len < 1e-9) return null;
-    let v = lineIntersectionPoint(e1, e2);
-    if (!v) {
-      const a = P(e1.a), b = P(e1.b);
-      if (!a || !b) return null;
-      v = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    }
-    const a1 = Math.atan2(d1.y, d1.x);
-    const a2 = Math.atan2(d2.y, d2.x);
-    const delta = wrapPi(a2 - a1);
+    const g = angleRays(P(e1.a), P(e1.b), P(e2.a), P(e2.b));
+    if (!g) return null;
     const radius = c.radius == null ? 46 : c.radius;
-    return { v, a1, a2, delta, radius };
+    return { v: g.v, a1: g.a1, a2: g.a2, delta: g.delta, radius };
   }
 
   function drawArrow(sx, sy, angle, size) {
@@ -18114,7 +19882,11 @@
     drawArrow(rs.x, rs.y, Math.atan2(rs.y - cs.y, rs.x - cs.x), 6);
     const mx = (cs.x + rs.x) / 2;
     const my = (cs.y + rs.y) / 2;
-    drawLabel('R ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value)), mx, my - 14, c.id, isSel);
+    // Circles read as diameters (⌀ = 2×r); arcs keep the radius R.
+    const isCircle = e.type === 'circle';
+    const prefix = isCircle ? '⌀ ' : 'R ';
+    const shown = isCircle ? c.value * 2 : c.value;
+    drawLabel(prefix + (c.reference ? '(' + fmt(shown) + ')' : fmt(shown)), mx, my - 14, c.id, isSel);
   }
 
   function drawAngleDim(c, isSel) {
@@ -18125,12 +19897,15 @@
     const color = dimToneColor(c, isSel);
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
+    // The world is Y-down (w2s does not flip), so a world angle IS the canvas
+    // angle: positive delta sweeps visually clockwise. Negating the angles was
+    // a Y-up leftover that mirrored the arc across the vertex.
     ctx.beginPath();
-    ctx.arc(vs.x, vs.y, Math.max(8, rs), -g.a1, -(g.a1 + g.delta), g.delta > 0);
+    ctx.arc(vs.x, vs.y, Math.max(8, rs), g.a1, g.a1 + g.delta, g.delta < 0);
     ctx.stroke();
 
-    const dir1 = { x: Math.cos(g.a1), y: -Math.sin(g.a1) };
-    const dir2 = { x: Math.cos(g.a1 + g.delta), y: -Math.sin(g.a1 + g.delta) };
+    const dir1 = { x: Math.cos(g.a1), y: Math.sin(g.a1) };
+    const dir2 = { x: Math.cos(g.a1 + g.delta), y: Math.sin(g.a1 + g.delta) };
     ctx.beginPath();
     ctx.moveTo(vs.x + dir1.x * (rs - 7), vs.y + dir1.y * (rs - 7));
     ctx.lineTo(vs.x + dir1.x * (rs + 6), vs.y + dir1.y * (rs + 6));
@@ -18242,6 +20017,62 @@
         drawBadge(glyph, mid.x + 14 + count * 17, mid.y - 14, bid, conflictSet.has(bid));
       }
     }
+    // Cluster badges: one marker per connected cluster of entities carrying a
+    // per-entity numeric property (W = sortWeight, Z = depth override). A loop
+    // of several lines shows a single badge at its centre. A cluster is the
+    // transitive closure over shared points — the same connectivity the CNC
+    // chain uses — so the badge count matches the cut loops the user will see.
+    // The cluster value is the max member value, mirroring cncChains. The badge
+    // is decoration only (id null: never hits, selects or deletes).
+    const clusterBadge = (prop, glyph) => {
+      const list = [];
+      for (const id in state.entities) {
+        const e = state.entities[id];
+        if (e && e[prop] && layerVisible(e)) list.push(e);
+      }
+      if (!list.length) return;
+      const parent = new Map();
+      const find = (x) => {
+        while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); }
+        return x;
+      };
+      const union = (a, b) => {
+        const ra = find(a), rb = find(b);
+        if (ra !== rb) parent.set(rb, ra);
+      };
+      const ptEnts = new Map();
+      list.forEach(w => { parent.set(w.id, w.id); });
+      for (const w of list) {
+        for (const pid of entityPointIds(w)) {
+          if (!ptEnts.has(pid)) ptEnts.set(pid, []);
+          ptEnts.get(pid).push(w);
+        }
+      }
+      for (const list of ptEnts.values()) {
+        for (let i = 1; i < list.length; i++) union(list[0].id, list[i].id);
+      }
+      const groups = new Map();
+      for (const w of list) {
+        const root = find(w.id);
+        if (!groups.has(root)) groups.set(root, { max: 0, sx: 0, sy: 0, n: 0 });
+        const g = groups.get(root);
+        g.max = Math.max(g.max, w[prop] || 0);
+        const bb = entityBounds(w);
+        if (bb) { g.sx += (bb.minX + bb.maxX) / 2; g.sy += (bb.minY + bb.maxY) / 2; g.n++; }
+      }
+      for (const g of groups.values()) {
+        if (!g.max) continue;
+        if (g.n) {
+          const s = w2s(g.sx / g.n, g.sy / g.n);
+          // The badge carries the value itself (W 100, Z 2.5): the point of
+          // the marker is to read the override without opening the strip.
+          const val = Math.round(g.max * 100) / 100;
+          drawBadge(glyph + ' ' + val, s.x, s.y - 14, null);
+        }
+      }
+    };
+    clusterBadge('sortWeight', 'W');
+    clusterBadge('depth', 'Z');
     ui.badgeHits = ui.badgeHits.filter(h => {
       const c = state.constraints[h.id];
       return c && constraintAnnotationActive(c);
@@ -18372,17 +20203,31 @@
     ctx.lineWidth = 1.4;
     ctx.fillStyle = 'rgba(37, 99, 235, 0.08)';
 
-    if (d.type === 'line' && d.a) {
-      const start = d.a.id != null ? P(d.a.id) : d.a;
+    if (d.type === 'line') {
+      const start = d.a ? (d.a.id != null ? P(d.a.id) : d.a) : null;
       if (start) {
         const s = w2s(start.x, start.y);
         const e = w2s(end.x, end.y);
+        // the draft anchor (placed point) indicator
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, 4.5, 0, TAU);
+        ctx.fillStyle = '#2563eb';
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([6, 4]);
         ctx.beginPath();
         ctx.moveTo(s.x, s.y);
         ctx.lineTo(e.x, e.y);
         ctx.stroke();
-        drawSnapMarker(end, snapped && end.snapped !== false);
       }
+      // live pending-point indicator (also before the first point is locked) —
+      // snaps to grid / other points like a hover marker
+      drawSnapMarker(end, snapped && end.snapped !== false);
     } else if (d.type === 'circle' && d.c) {
       const c = d.c.id != null ? P(d.c.id) : d.c;
       if (c) {
@@ -18422,41 +20267,122 @@
         drawSnapMarker(end, snapped && end.snapped !== false);
       }
     } else if (d.type === 'arc') {
-      if (d.stage === 1 && d.c) {
-        const c = d.c.id != null ? P(d.c.id) : d.c;
-        if (c) {
-          const r = Math.max(1e-6, dist(c, end));
-          const cs = w2s(c.x, c.y);
+      const A = d.a ? (d.a.id != null ? P(d.a.id) : d.a) : null;
+      const B = d.b ? (d.b.id != null ? P(d.b.id) : d.b) : null;
+      if (d.stage === 1 && A) {
+        // only the first endpoint is locked — no connecting line yet, a long
+        // rubber-band to the cursor reads as noise before the arc exists
+        const as = w2s(A.x, A.y);
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(as.x, as.y, 4.5, 0, TAU);
+        ctx.fillStyle = '#2563eb';
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        drawSnapMarker(end, snapped && end.snapped !== false);
+      } else if (d.stage === 2 && A && B) {
+        // both endpoints locked; the through point rides the cursor. The
+        // candidate arc stays valid only while the three points are not
+        // collinear — otherwise a red indicator replaces it.
+        const as = w2s(A.x, A.y);
+        const bs = w2s(B.x, B.y);
+        // the chord is only a guide: thin and light, clearly not geometry
+        ctx.setLineDash([6, 4]);
+        ctx.strokeStyle = 'rgba(37, 99, 235, 0.35)';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(as.x, as.y);
+        ctx.lineTo(bs.x, bs.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (const p of [as, bs]) {
           ctx.beginPath();
-          ctx.arc(cs.x, cs.y, r * view.zoom, 0, TAU);
+          ctx.arc(p.x, p.y, 3.6, 0, TAU);
+          ctx.fillStyle = '#2563eb';
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.2;
           ctx.stroke();
-          const rim = w2s(c.x + r, c.y);
-          ctx.setLineDash([]);
-          ctx.beginPath();
-          ctx.moveTo(cs.x, cs.y);
-          ctx.lineTo(rim.x, rim.y);
-          ctx.stroke();
-          drawSnapMarker(end, snapped && end.snapped !== false);
         }
-      } else if (d.stage === 2 && d.c && d.s) {
-        const c = d.c.id != null ? P(d.c.id) : d.c;
-        const sPt = d.s.id != null ? P(d.s.id) : d.s;
-        if (c && sPt) {
-          const r = Math.max(1e-6, dist(c, sPt));
-          let a0 = Math.atan2(sPt.y - c.y, sPt.x - c.x);
-          let a1 = Math.atan2(end.y - c.y, end.x - c.x);
-          if (ui.shiftDown) {
-            const step = Math.PI / 12;
-            a1 = Math.round(a1 / step) * step;
+        const res = threePointArcCenter(A, B, end);
+        const ok = res && dist(res.c, A) >= 1e-7;
+        const ms = w2s(end.x, end.y);
+        if (ok) {
+          const cs = w2s(res.c.x, res.c.y);
+          const r = dist(res.c, A);
+          const Rpx = r * view.zoom;
+          // faint full construction circle: when the through point sits close to
+          // the chord the arc radius explodes and the arc looks almost straight
+          // — the circle makes the intended curvature legible
+          if (Rpx < 50000) {
+            ctx.beginPath();
+            ctx.arc(cs.x, cs.y, Rpx, 0, TAU);
+            ctx.strokeStyle = 'rgba(37, 99, 235, 0.16)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([]);
+            ctx.stroke();
           }
-          const sweep = norm2pi(a1 - a0);
-          const cs = w2s(c.x, c.y);
+          if (d.fullCircle) {
+            // Space: a FULL circle through the three points
+            ctx.beginPath();
+            ctx.arc(cs.x, cs.y, Rpx, 0, TAU);
+            ctx.strokeStyle = '#2563eb';
+            ctx.lineWidth = 1.8;
+            ctx.setLineDash([6, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+            ctx.fillStyle = '#2563eb';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('circle — Space toggles arc', ms.x + 8, ms.y - 6);
+          } else {
+            const sPt = res.start;
+            const ePt = res.end;
+            const a0 = Math.atan2(sPt.y - res.c.y, sPt.x - res.c.x);
+            const a1 = Math.atan2(ePt.y - res.c.y, ePt.x - res.c.x);
+            const sweep = norm2pi(a1 - a0);
+            // the candidate arc — dashed, matching every other draft preview
+            ctx.beginPath();
+            ctx.arc(cs.x, cs.y, Rpx, a0, a0 + sweep, false);
+            ctx.strokeStyle = '#2563eb';
+            ctx.lineWidth = 1.8;
+            ctx.setLineDash([6, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+            ctx.fillStyle = '#2563eb';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('arc — Space toggles circle', ms.x + 8, ms.y - 6);
+          }
           ctx.beginPath();
-          ctx.arc(cs.x, cs.y, r * view.zoom, a0, a0 + sweep, false);
+          ctx.arc(ms.x, ms.y, 3, 0, TAU);
+          ctx.fillStyle = '#2563eb';
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1;
           ctx.stroke();
-          const endPt = w2s(c.x + Math.cos(a0 + sweep) * r, c.y + Math.sin(a0 + sweep) * r);
-          drawSnapMarker(endPt);
+        } else {
+          // collinear / degenerate: no arc is drawn, show the failure instead
+          ctx.save();
+          ctx.strokeStyle = '#dc2626';
+          ctx.lineWidth = 1.8;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.arc(ms.x, ms.y, 8, 0, TAU);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+          ctx.fillStyle = '#dc2626';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'bottom';
+          ctx.fillText('collinear — move the point', ms.x + 10, ms.y - 6);
+          ctx.restore();
         }
+        drawSnapMarker(end, snapped && end.snapped !== false);
       }
     }
 
@@ -18584,6 +20510,28 @@
       ctx.textAlign = 'left';
       ctx.textBaseline = 'bottom';
       ctx.fillText('origin', s.x + 9, s.y - 6);
+      return;
+    }
+    if (p && p.grid) {
+      // grid snap: a small square pin on a ring — distinct from the round
+      // point target and the dashed loop-centre ring.
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 7, 0, TAU);
+      ctx.fillStyle = 'rgba(37, 99, 235, 0.12)';
+      ctx.fill();
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.rect(s.x - 3, s.y - 3, 6, 6);
+      ctx.fillStyle = '#2563eb';
+      ctx.fill();
+      ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillStyle = '#2563eb';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('grid', s.x + 9, s.y - 6);
       return;
     }
     const kind = p && p.midId != null ? 'midpoint' : (p && p.lineId != null ? 'online' : null);
@@ -18763,7 +20711,7 @@
     if (ui.hoverProbe) {
       const p = ui.hoverProbe;
       ui.hoverProbe = null;
-      if (!ui.drag && !ui.pan && !pinch && ui.tool === 'select') runHoverProbe(p.x, p.y);
+      if (!ui.drag && !ui.pan && !pinch && isSelectLikeTool()) runHoverProbe(p.x, p.y);
     }
     // one layer-state check per frame (see pointCachesValid), not per marker
     pointSigTick++;
@@ -18793,6 +20741,10 @@
     ctx.save();
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, W, H);
+    // camera lift while dragging a single point on touch: the whole scene
+    // renders a little higher so the grabbed point (and its snap target) stay
+    // above the finger. Interaction math stays on the real pointer.
+    if (ui._dragLift) ctx.translate(0, -TOUCH_LIFT_PX);
     drawGrid();
     drawAxes();
     // A reference picture is a backdrop: its bitmap goes under the fills and the
@@ -18803,7 +20755,7 @@
     // paints large numbers of low-information pixels — loop fills/tints,
     // notes, dimension/badge annotations — the full scene follows right after
     // the window closes (see scheduleZoomSettle)
-    if (!fastMode && loopFillVisible) {
+    if (!fastMode && (loopFillCurrentVisible || loopFillOthersVisible)) {
       prof('loopfills', () => { drawLoopFills(); drawLoops(); });
     }
     prof('entities', () => drawEntities());
@@ -18811,6 +20763,8 @@
     prof('partMarkers', () => drawPartMarkers());
     prof('mates', () => drawMates());
     prof('partHighlight', () => drawPartHighlight());
+    prof('wallBarriers', () => drawWallBarriers());
+    prof('wallDrag', () => drawWallDrag());
     if (!fastMode) prof('notes', () => drawNotes());
     prof('offsetPreview', () => drawOffsetPreview());
     prof('segmentHighlight', () => drawSegmentHighlight());
@@ -18853,7 +20807,7 @@
     if (!ui.rubber) {
       const snapTop = (ui.drag && ui.drag.snap) ? ui.drag.snap
         : (ui.moveJob && ui.moveJob.snap) ? ui.moveJob.snap
-        : (ui.raw && (ui.draft || ui.tool !== 'select')) ? snapFor(ui.tool, ui.raw) : null;
+        : (ui.raw && (ui.draft || !isSelectLikeTool())) ? snapFor(ui.tool, ui.raw) : null;
       if (snapTop && snapTop.id != null) drawSnapMarker(snapTop, true);
     }
     drawTransformOverlay();
@@ -18953,7 +20907,16 @@
         ? 'Move: click the reference point. Esc cancels.'
         : 'Move: click the destination point. Esc cancels.';
     }
-    if (ui.tool === 'select') return selectHintText();
+    if (ui.tool === 'dragwall') {
+      const w = ui.drag && ui.drag.wall;
+      const wall = fmt(WALL_DRAG_MM) + ' mm';
+      const barriers = w && w.barrierLoops != null ? ' · ' + w.barrierLoops + ' barrier loop' + (w.barrierLoops === 1 ? '' : 's') : '';
+      if (w && w.blocked) return 'Drag wall ' + wall + ' — collision; holding the last valid position' + barriers + '.';
+      if (w) return 'Drag wall ' + wall + ' — clear' + barriers + '. The amber outline is the collision wall, not cut geometry.';
+      if (ui.drag && ui.drag.wallDisabled) return 'Drag wall ' + wall + ' — no closed loop in this drag; the selection moves freely.';
+      return 'Drag wall ' + wall + ' — select a closed shape, a group or several objects, then drag. The amber outline is generated from the outer contour and is never added to the drawing.';
+    }
+    if (isSelectLikeTool()) return selectHintText();
     switch (ui.tool) {
       case 'line': return 'Click start point, then end point. Keep clicking to chain; click the first point again to close the loop and finish. Enter finishes, Esc takes the last line back, Esc again stops. Shift = 15° polar, Alt = inverse of the Snap toggle while held. With exactly two points selected, L creates the line between them.';
       case 'arc': return 'Click center, then start point, then end point. Shift snaps angles.';
@@ -18989,6 +20952,38 @@
     return base + ' Frame: Alt+R jumps to L/T/W/H (+20 = move +20, Tab = next box). Dimension: select 2 points / 1–2 lines / circle, then D (driving) or Shift+D (measure). Constraints: H V P Q O T M . [ F J on a selection.';
   }
 
+  function syncWallInput() {
+    const el = document.getElementById('wall-mm');
+    if (!el) return;
+    if (document.activeElement === el) return;   // never overwrite what is being typed
+    const v = String(Math.round(clamp(+settings.wallDragMm || 0, 0, 50) * 100) / 100);
+    if (el.value !== v) el.value = v;
+  }
+
+  // The mode has to be visible even when the Arrange ribbon is on another page
+  // or the panels are collapsed: a top-right pill plus an amber stage frame.
+  function syncWallIndicator() {
+    const el = document.getElementById('wall-indicator');
+    const active = ui.tool === 'dragwall';
+    document.body.classList.toggle('wall-drag-active', active);
+    if (!el) return;
+    el.classList.toggle('hidden', !active);
+    if (!active) return;
+    const valueEl = document.getElementById('wall-indicator-value');
+    const stateEl = document.getElementById('wall-indicator-state');
+    const wall = fmt(WALL_DRAG_MM) + ' mm';
+    if (valueEl && valueEl.textContent !== wall) valueEl.textContent = wall;
+    const w = ui.drag && ui.drag.wall;
+    let state = 'armed';
+    let label = 'ON';
+    if (ui.drag && ui.drag.wallDisabled) { state = 'disabled'; label = 'NO LOOP'; }
+    else if (w && w.blocked) { state = 'blocked'; label = 'BLOCKED'; }
+    else if (w) { state = 'clear'; label = 'CLEAR'; }
+    else if (ui.drag && ui.drag.kind === 'entity') { state = 'armed'; label = 'BUILDING'; }
+    if (el.dataset.state !== state) el.dataset.state = state;
+    if (stateEl && stateEl.textContent !== label) stateEl.textContent = label;
+  }
+
   function updateUI() {
     // quickbar (tablet toolbar): flip / rotate / boolean need a selection;
     // the L T W H fields follow updateTransformPanel's own disabled logic
@@ -19004,6 +20999,8 @@
     document.querySelectorAll('.tool-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.tool === ui.tool);
     });
+    syncWallInput();
+    syncWallIndicator();
     // Every line colour used by the selection gets a dot, not just the first:
     // a selection mixing red and black has to show both, since both are real
     // machine operations.
@@ -19021,6 +21018,7 @@
     updateConstraintList();
     updateArrayList();
     updatePartsList();
+    updateObjectTree();
     updateNestPanel();
     updateLayers();
     const hintEl = document.getElementById('status-hint');
@@ -19129,14 +21127,21 @@
     const toCurve = document.getElementById('btn-to-curve');
     if (toCurve) {
       toCurve.disabled = !ents.some(e => e.type === 'circle' || e.type === 'arc' ||
-        e.type === 'text' || e.type === 'art');
+        e.type === 'text' || e.type === 'art' || e.type === 'array');
     }
   }
 
   function constraintName(c) {
     if (!c) return 'Constraint';
     if (c.type === 'distance') return (c.kind === 'radius' ? 'Radius ' : 'Distance ') + fmt(c.value) + (c.reference ? ' (ref)' : '');
-    if (c.type === 'radius') return 'Radius ' + fmt(c.value) + (c.reference ? ' (ref)' : '');
+    if (c.type === 'radius') {
+      // Circles read as diameters in the UI; arcs stay radius.
+      const e = c.entity != null ? state.entities[c.entity] : null;
+      if (e && e.type === 'circle') {
+        return '⌀ ' + fmt(c.value * 2) + (c.reference ? ' (ref)' : '');
+      }
+      return 'Radius ' + fmt(c.value) + (c.reference ? ' (ref)' : '');
+    }
     if (c.type === 'angle') return 'Angle ' + fmt(c.value) + '\u00b0' + (c.reference ? ' (ref)' : '');
     if (c.type === 'pointOn') {
       const e = state.entities[c.entity];
@@ -19384,7 +21389,7 @@
         (conflicts.has(id) ? ' conflict' : '');
       const why = conflicts.has(id) ? conflictOf(c, id) : null;
       li.title = (why ? '⚠ ' + why + ' · ' : '') +
-        'Hover highlights the badge on canvas · click selects · × deletes';
+        'Hover highlights the badge on canvas · click selects · double-click deletes · × deletes';
       // auto-cleanup affordance: an exact-duplicate row offers one-click dedupe
       const dup = !why ? duplicateOf(c, id) : null;
       if (dup) li.title = 'Exact duplicate of #' + dup + ' · click × to remove it';
@@ -19427,6 +21432,210 @@
       list.appendChild(li);
     }
     list.dataset.empty = 'No constraints on this selection — click geometry, then press a constraint key (H/V/P/Q/…)';
+  }
+
+  // Object Tree panel: a live view of the LoopTree — loop nodes badged with
+  // their level, leaf entities under the loop that owns them, loose objects
+  // (outside every loop) at the bottom. Nodes start COLLAPSED; the caret opens
+  // one level at a time so a big document stays a short list. Click a loop row
+  // to select its whole subtree (the Ctrl+click pool); click a leaf row to
+  // select that entity. Ancestors of the current selection auto-expand so the
+  // highlighted rows are never hidden inside a closed node.
+  let otSelArr = null;
+  let otSelLen = -1;
+  const otExpanded = new Set();
+  const otLoopKey = (L) => loopEntities(L).map(Number).sort((a, b) => a - b).join(',');
+  const OT_LAYER_KEY = 'minisketch.otCurrentLayer.v1';
+  function otCurrentLayerOnly() {
+    const cb = document.getElementById('ot-current-layer');
+    return cb ? cb.checked : true;
+  }
+  function updateObjectTree() {
+    const panel = document.getElementById('tree-panel');
+    const list = document.getElementById('object-tree');
+    if (!panel || !list) return;
+    if (!panel.__otBound) {
+      panel.__otBound = true;
+      panel.addEventListener('toggle', () => updateObjectTree());
+      const cb = document.getElementById('ot-current-layer');
+      if (cb) {
+        try { cb.checked = localStorage.getItem(OT_LAYER_KEY) !== '0'; } catch (err) { /* default on */ }
+        cb.addEventListener('change', () => {
+          try { localStorage.setItem(OT_LAYER_KEY, cb.checked ? '1' : '0'); } catch (err) { /* ignore */ }
+          updateObjectTree();
+        });
+      }
+    }
+    const t = loopTree();
+    // Layers are independent hierarchies (the tree nests per layer), so the
+    // panel can show just the active one: roots and loose objects filtered by
+    // layer, children inherit their root's layer.
+    const onlyCur = otCurrentLayerOnly();
+    const layerOk = (L) => !onlyCur || loopLayerId(L) === ui.activeLayer;
+    const roots = t.roots.filter(layerOk);
+    const countEl = document.getElementById('tree-count');
+    if (countEl) countEl.textContent = String(onlyCur ? t.loops.filter(layerOk).length : t.loops.length);
+    if (!panel.open) { list.__lastSig = null; return; }
+    // Rebuild only when the tree, the selection or the open/closed state
+    // changed — the tree epoch is stable during a drag (frozen loops), so drag
+    // frames cost nothing here.
+    const sig = 't' + loopTreeEpoch + '|' + (onlyCur ? 1 : 0) + '|' + ui.activeLayer + '|' + Array.from(otExpanded).sort().join(',');
+    if (otSelArr === ui.selection && otSelLen === ui.selection.length && listUnchanged(list, sig)) return;
+    otSelArr = ui.selection;
+    otSelLen = ui.selection.length;
+    // The cascade (points -> entities they cover), so a marquee selection
+    // highlights and reveals exactly what the Selection panel reports.
+    const selEnts = new Set();
+    for (const e of selectedEntitiesForExport()) selEnts.add(+e.id);
+    // Effective open state = user's carets + the ancestor chains of everything
+    // selected, so a canvas selection reveals itself in the tree.
+    const eff = new Set(otExpanded);
+    const expandChain = (L, includeSelf) => {
+      for (let p = includeSelf ? L : L.parent; p; p = p.parent) eff.add(otLoopKey(p));
+    };
+    for (const L of t.loops) if (loopShapeSelected(L)) expandChain(L, false);
+    for (const id of selEnts) {
+      const own = t.owner.get(+id);
+      if (own) expandChain(own, true);
+      else {
+        const bl = t.boundaryLoop.get(+id);
+        if (bl) expandChain(bl, false);
+        else eff.add('__loose');
+      }
+    }
+    const MAX_LEAVES = 40;
+    list.innerHTML = '';
+    const caret = (key, hasKids) => {
+      const c = document.createElement('span');
+      c.className = 'ot-caret' + (hasKids ? '' : ' none');
+      c.textContent = hasKids ? (eff.has(key) ? '▾' : '▸') : '';
+      if (hasKids) {
+        c.title = eff.has(key) ? 'Collapse' : 'Expand';
+        c.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (otExpanded.has(key)) otExpanded.delete(key);
+          else otExpanded.add(key);
+          updateObjectTree();
+        });
+      }
+      return c;
+    };
+    const leafRow = (id) => {
+      const e = state.entities[id];
+      if (!e) return null;
+      const li = document.createElement('li');
+      const row = document.createElement('div');
+      row.className = 'ot-row' + (selEnts.has(+id) ? ' active' : '');
+      row.title = 'Click to select this object';
+      row.appendChild(caret('', false));
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = (e.name || '').trim() || (e.type + ' ' + id);
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = e.type;
+      row.appendChild(name);
+      row.appendChild(meta);
+      row.addEventListener('click', () => {
+        selectOnly('entity', +id);
+        updateUI();
+        render();
+      });
+      li.appendChild(row);
+      return li;
+    };
+    const moreRow = (n) => {
+      const li = document.createElement('li');
+      const div = document.createElement('div');
+      div.className = 'ot-more';
+      div.textContent = '+' + n + ' more…';
+      li.appendChild(div);
+      return li;
+    };
+    const loopNode = (L) => {
+      const key = otLoopKey(L);
+      const kids = L.children || [];
+      const leaves = t.leaves.get(L) || [];
+      const hasKids = !!(kids.length || leaves.length);
+      const open = eff.has(key);
+      const li = document.createElement('li');
+      const row = document.createElement('div');
+      row.className = 'ot-row' + (loopShapeSelected(L) ? ' active' : '');
+      row.title = 'Click to select this loop and everything inside it';
+      row.appendChild(caret(key, hasKids));
+      const lvl = document.createElement('span');
+      lvl.className = 'ot-lvl';
+      lvl.textContent = 'L' + (L.level || 0);
+      const name = document.createElement('span');
+      name.className = 'name';
+      const kind = L.circle ? 'Circle' : (L.splineEntity != null ? 'Curve' : 'Loop');
+      name.textContent = kind + ' ' + t.loops.indexOf(L);
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = round2(L.area) + ' mm²';
+      row.appendChild(lvl);
+      row.appendChild(name);
+      row.appendChild(meta);
+      row.addEventListener('click', () => {
+        const ids = new Set(loopEntities(L).map(Number));
+        for (const id of entitiesInsideLoop(L)) ids.add(+id);
+        const pool = Array.from(ids).filter(id => state.entities[id] && entityEditable(state.entities[id]));
+        if (!pool.length) return;
+        ui.focusLoop = t.loops.indexOf(L);
+        ui.selection = pool.map(id => ({ kind: 'entity', id }));
+        markLastPicked('entity', pool[0]);
+        updateUI();
+        render();
+      });
+      li.appendChild(row);
+      if (hasKids && open) {
+        const ul = document.createElement('ul');
+        for (const c of kids) ul.appendChild(loopNode(c));
+        for (let i = 0; i < Math.min(leaves.length, MAX_LEAVES); i++) {
+          const r = leafRow(leaves[i]);
+          if (r) ul.appendChild(r);
+        }
+        if (leaves.length > MAX_LEAVES) ul.appendChild(moreRow(leaves.length - MAX_LEAVES));
+        li.appendChild(ul);
+      }
+      return li;
+    };
+    for (const L of roots) list.appendChild(loopNode(L));
+    // Loose objects: no loop owns them and they form no loop outline.
+    const loose = [];
+    for (const eid in state.entities) {
+      const id = +eid;
+      if (t.boundary.has(id) || t.owner.has(id)) continue;
+      if (onlyCur && layerOf(state.entities[eid]) !== ui.activeLayer) continue;
+      loose.push(id);
+    }
+    if (loose.length) {
+      const open = eff.has('__loose');
+      const li = document.createElement('li');
+      const row = document.createElement('div');
+      row.className = 'ot-row';
+      row.appendChild(caret('__loose', true));
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = 'Loose objects';
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = String(loose.length);
+      row.appendChild(name);
+      row.appendChild(meta);
+      li.appendChild(row);
+      if (open) {
+        const ul = document.createElement('ul');
+        for (let i = 0; i < Math.min(loose.length, MAX_LEAVES); i++) {
+          const r = leafRow(loose[i]);
+          if (r) ul.appendChild(r);
+        }
+        if (loose.length > MAX_LEAVES) ul.appendChild(moreRow(loose.length - MAX_LEAVES));
+        li.appendChild(ul);
+      }
+      list.appendChild(li);
+    }
+    list.dataset.empty = 'No loops yet — draw a closed shape to see the hierarchy';
   }
 
   // Parts panel: one row per part with select + delete, and the open mate-job
@@ -20132,6 +22341,579 @@
     commit();
   }
 
+  // ---- Drag wall -----------------------------------------------------------
+  // A live collision envelope for manual nesting. The wall is generated ONCE
+  // from the start pose of the dragged compound and then only translated with
+  // the drag delta, so a complex offset never runs per mouse move. It is never
+  // added to the document: it exists only for the preview and the collision
+  // test, and disappears on release.
+  //
+  // The obstacle cache is built on the first actual move (not on pointerdown),
+  // because a click that never moves must stay free. It contains:
+  //   - every OUTERMOST loop in the document (the same depth the loop fill
+  //     uses), as a polygon. Inner/hole loops are deliberately NOT obstacles:
+  //     the caller asked for the outermost loop of each object, and a hole
+  //     boundary must not be mistaken for the object's outer wall.
+  //   - every other visible non-dragged OPEN line/arc/circle/spline as-is
+  //     (sampled lazily, only when its box comes near the wall);
+  //   - every group / framed object (art, text, image, part, array, and every
+  //     entity that carries an SVG group tag) as its bounding box.
+  //
+  // Collision is BOUNDARY-only: a wall edge crossing an obstacle edge is a
+  // hit; one contour fully inside another is not. That is deliberate — a part
+  // placed inside a sheet outline is a valid nesting layout, and an area test
+  // would refuse it.
+  function wallAddEntityDeep(set, e) {
+    if (!e) return;
+    set.add(+e.id);
+    if (Array.isArray(e.guide)) {
+      for (const gid of e.guide) if (state.entities[gid]) set.add(+gid);
+    }
+    if (e.guideId != null && state.entities[e.guideId]) set.add(+e.guideId);
+  }
+
+  function wallEntityIdSet(d) {
+    const ids = new Set();
+    for (const e of selectedEntities()) wallAddEntityDeep(ids, e);
+    for (const pid of (d.ids || [])) {
+      const uses = pointUses(pid);
+      if (uses) for (const e of uses) wallAddEntityDeep(ids, e);
+    }
+    return ids;
+  }
+
+  function wallEntityFullyDragged(e, dragSet) {
+    if (!e) return false;
+    const ids = entityPointIds(e);
+    if (!ids.length) return true;   // parts / clones carry no points; their body is the drag
+    for (const pid of ids) {
+      if (!state.points[pid]) continue;
+      if (!dragSet.has(+pid)) return false;
+    }
+    return true;
+  }
+
+  // Closed contours of the dragged compound. A composite loop (rectangle made
+  // of four lines) comes from getLoops(); a framed object's contours come from
+  // entityWorldPolylines(). Holes are included here and then removed by the
+  // outer-contour pass: the wall is the compound's outer envelope.
+  function wallCompoundContours(movingIds, dragSet) {
+    const out = [];
+    const loopCovered = new Set();
+    const loops = getLoops();
+    for (const L of loops) {
+      // NOTE: do NOT filter by the renderer's GLOBAL depth here. A part being
+      // dragged inside an unselected sheet has global depth 1, but it is still
+      // the outermost loop of the SELECTION. wallOuterContours() below picks the
+      // outermost contour of the dragged compound (outer vs its own holes).
+      const own = loopEntities(L).map(Number);
+      if (!own.length) continue;
+      if (!own.every(id => movingIds.has(id))) continue;
+      let rigid = true;
+      for (const id of own) {
+        const e = state.entities[id];
+        if (!e || !wallEntityFullyDragged(e, dragSet)) { rigid = false; break; }
+      }
+      if (!rigid) continue;
+      if (L.poly && L.poly.length >= 3) out.push({ pts: L.poly, closed: true });
+      for (const id of own) loopCovered.add(id);
+    }
+    for (const id of movingIds) {
+      const e = state.entities[id];
+      if (!e || !layerVisible(e)) continue;
+      if (e.type === 'line' || e.type === 'arc' || e.type === 'part') continue;
+      if (!wallEntityFullyDragged(e, dragSet)) continue;
+      if ((e.type === 'circle' || e.type === 'spline') && loopCovered.has(+id)) continue;
+      if (e.type === 'array' && e.kind === 'clone') {
+        for (const t of cloneInstanceOffsets(e)) {
+          for (const pts of cloneInstanceLoopPolys(e, t)) out.push({ pts, closed: true });
+        }
+      }
+      for (const pl of entityWorldPolylines(e)) {
+        if (pl && pl.closed && pl.pts && pl.pts.length >= 3) {
+          out.push({ pts: pl.pts, closed: true });
+        }
+      }
+    }
+    return out;
+  }
+
+  // Keep only contours that are not inside another contour. This is the same
+  // containment rule as loopDepthOf(), but on plain point arrays so it also
+  // works for a group's stored contours.
+  function wallOuterContours(contours) {
+    const items = [];
+    for (const c of contours) {
+      const box = polyBBox(c.pts);
+      if (box) items.push({ c, box, area: (box.maxX - box.minX) * (box.maxY - box.minY) });
+    }
+    items.sort((a, b) => b.area - a.area);
+    const kept = [];
+    for (const it of items) {
+      let inside = false;
+      for (const k of kept) {
+        // A tiny epsilon on the bbox test: an imported contour can sit a few
+        // 1e-5 mm outside its container and the strict test would keep a hole
+        // as a second "outer" contour (the inner dashed wall in the report).
+        const eps = Math.max(1e-6, (k.box.maxX - k.box.minX + k.box.maxY - k.box.minY) * 1e-6);
+        if (k.box.minX > it.box.minX + eps || k.box.minY > it.box.minY + eps ||
+            k.box.maxX < it.box.maxX - eps || k.box.maxY < it.box.maxY - eps) continue;
+        // One robust interior probe beats testing every vertex: a single vertex
+        // that lands a hair outside the container used to make the whole hole
+        // look like an outer contour. interiorProbe() nudges toward the inside
+        // using the contour's own winding, so it works for CW and CCW loops.
+        const probe = interiorProbe(it.c.pts);
+        if (probe && pointInPoly(probe, k.c.pts)) { inside = true; break; }
+      }
+      if (!inside) kept.push(it);
+    }
+    return kept.map(x => x.c);
+  }
+
+  function wallBoxUnion(boxes) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const b of boxes) {
+      if (!b) continue;
+      if (b.minX < minX) minX = b.minX;
+      if (b.minY < minY) minY = b.minY;
+      if (b.maxX > maxX) maxX = b.maxX;
+      if (b.maxY > maxY) maxY = b.maxY;
+    }
+    return isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+  }
+
+  function wallAddObstacle(list, kind, box, entityId) {
+    if (!box) return;
+    list.push({ kind, box, entity: entityId == null ? null : +entityId, polys: null });
+  }
+
+  // Closed contours of one clone instance, taken from the MASTER's loops.
+  // entityWorldPolylines/arrayInstancePolylines only yield closed shapes when
+  // the master itself is a closed entity (circle/spline); a master built from
+  // separate lines flattens to open segments, which left a dragged clone with
+  // no wall envelope and a clone obstacle as a mere bounding box.
+  function cloneInstanceLoopPolys(e, t) {
+    const masterSet = new Set((e.masters || []).map(Number));
+    const out = [];
+    for (const L of getLoops()) {
+      const own = loopEntities(L);
+      if (!own.length || !own.every(id => masterSet.has(+id))) continue;
+      if (!L.poly || L.poly.length < 3) continue;
+      out.push(L.poly.map(p => arrayXformPoint(t, p.x, p.y)));
+    }
+    return out;
+  }
+
+  // Precise outer contours of every instance of a clone, for use as a collision
+  // obstacle. A clone used to block as one coarse bounding box; the real outer
+  // envelope of each instance lets the wall hug the actual shape (holes dropped,
+  // exactly like the dragged wall's own envelope).
+  function wallClonePolys(e) {
+    const polys = [];
+    for (const t of cloneInstanceOffsets(e)) {
+      const closed = arrayInstancePolylines(e, t)
+        .filter(pl => pl.closed && pl.pts && pl.pts.length >= 3);
+      for (const pts of cloneInstanceLoopPolys(e, t)) closed.push({ pts, closed: true });
+      if (!closed.length) continue;
+      for (const c of wallOuterContours(closed)) {
+        polys.push({ pts: c.pts, closed: true, box: polyBBox(c.pts) });
+      }
+    }
+    return polys;
+  }
+
+  function wallObstaclePolys(o) {
+    if (o.polys) return o.polys;
+    if (o.kind === 'lazy') {
+      const e = o.entity != null ? state.entities[o.entity] : null;
+      const polys = [];
+      if (e) {
+        for (const pl of entityWorldPolylines(e)) {
+          if (!pl || !pl.pts || pl.pts.length < 2) continue;
+          polys.push({ pts: pl.pts, closed: !!pl.closed && pl.pts.length >= 3, box: polyBBox(pl.pts) });
+        }
+      }
+      o.polys = polys;
+      return polys;
+    }
+    if (o.kind === 'box') {
+      // A clone blocks as its precise per-instance outer contours, not its bbox.
+      const e = o.entity != null ? state.entities[o.entity] : null;
+      if (e && e.type === 'array' && e.kind === 'clone') {
+        const cp = wallClonePolys(e);
+        if (cp.length) { o.polys = cp; return cp; }
+      }
+      const b = o.box;
+      const pts = [
+        { x: b.minX, y: b.minY }, { x: b.maxX, y: b.minY },
+        { x: b.maxX, y: b.maxY }, { x: b.minX, y: b.maxY }
+      ];
+      o.polys = [{ closed: true, pts, box: b }];
+      return o.polys;
+    }
+    // poly obstacle: the caller stores its polygon in o.pts
+    o.polys = o.pts ? [{ pts: o.pts, closed: true, box: polyBBox(o.pts) }] : [];
+    return o.polys;
+  }
+
+  // A sheet is a container drawn in the construction colour (green): the material
+  // parts are arranged on. Loops placed directly inside a sheet are separate
+  // objects (obstacles), NOT holes of the sheet — unlike a loop inside a regular
+  // part, which is that part's hole.
+  function wallLoopIsSheet(L) {
+    const own = loopEntities(L);
+    if (!own.length) return false;
+    return own.every(id => {
+      const e = state.entities[id];
+      return e && isConstructionColor(colorOf(e));
+    });
+  }
+
+  function wallBuildObstacles(excludeIds) {
+    const obstacles = [];
+    const covered = new Set();
+    const loopEntityIds = new Set();
+
+    // Every entity that belongs to ANY loop. A line/arc/circle/spline in an
+    // inner (hole) loop is still loop geometry, not a loose line: only the
+    // OUTERMOST loop becomes an obstacle. Without this set the individual pass
+    // below would add the hole boundary as-is and the wall would collide with
+    // the hole instead of the object's outer edge.
+    const loops = getLoops();
+    loopTree();
+    for (const L of loops) {
+      for (const id of loopEntities(L)) loopEntityIds.add(+id);
+    }
+
+    // 1) object outer boundaries: every top-level loop (level 0), PLUS any loop
+    // sitting directly inside a sheet (level 1, parent is the green material).
+    // The latter is what lets a part dragged inside the sheet collide with the
+    // other parts already placed on it. Deeper loops stay holes (not obstacles).
+    for (const L of loops) {
+      const depth = L.level || 0;
+      let isBoundary = depth === 0;
+      if (!isBoundary && depth === 1) {
+        isBoundary = !!(L.parent && wallLoopIsSheet(L.parent));
+      }
+      if (!isBoundary) continue;
+      const own = loopEntities(L).map(Number);
+      if (!own.length) continue;
+      if (own.some(id => excludeIds.has(id))) continue;
+      if (!own.some(id => {
+        const e = state.entities[id];
+        return e && layerVisible(e);
+      })) continue;
+      const o = {
+        kind: 'poly', box: polyBBox(L.poly), entity: null, polys: null, pts: L.poly,
+        entities: own, depth, area: L.area
+      };
+      obstacles.push(o);
+      for (const id of own) covered.add(id);
+    }
+
+    // 2) groups (SVG group tag) use ONE bounding box for the whole group
+    const groupBoxes = new Map();
+    for (const id in state.entities) {
+      const e = state.entities[id];
+      if (!e || !e.group || excludeIds.has(+id) || !layerVisible(e)) continue;
+      const b = entityBounds(e);
+      if (!b) continue;
+      let g = groupBoxes.get(e.group);
+      if (!g) groupBoxes.set(e.group, g = { minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY });
+      else {
+        if (b.minX < g.minX) g.minX = b.minX;
+        if (b.minY < g.minY) g.minY = b.minY;
+        if (b.maxX > g.maxX) g.maxX = b.maxX;
+        if (b.maxY > g.maxY) g.maxY = b.maxY;
+      }
+    }
+    for (const b of groupBoxes.values()) wallAddObstacle(obstacles, 'box', b, null);
+
+    // 3) everything else: framed objects by bbox, line-like objects as-is
+    for (const id in state.entities) {
+      const eid = +id;
+      if (excludeIds.has(eid) || covered.has(eid)) continue;
+      const e = state.entities[id];
+      if (!e || !layerVisible(e) || e.type === 'note') continue;
+      if (e.group) continue;   // already represented by its group box
+      // Inner/hole loop geometry is not a separate obstacle: the outer loop
+      // already represents this object. Loose geometry (not in any loop) still
+      // uses its own line/arc/curve as-is.
+      if (loopEntityIds.has(eid)) continue;
+      if (e.type === 'art' || e.type === 'text' || e.type === 'image' ||
+          e.type === 'part' || e.type === 'array') {
+        wallAddObstacle(obstacles, 'box', entityBounds(e), eid);
+        continue;
+      }
+      // line / arc / circle / spline: sample only when the wall comes near
+      wallAddObstacle(obstacles, 'lazy', entityBounds(e), eid);
+    }
+    return obstacles;
+  }
+
+  function wallBuildGrid(obstacles) {
+    const boxes = obstacles.map(o => o.box).filter(Boolean);
+    const all = wallBoxUnion(boxes);
+    if (!all) return { cell: 50, map: new Map(), big: [] };
+    const span = Math.max(all.maxX - all.minX, all.maxY - all.minY, 1);
+    const cell = clamp(span / 64, 10, 200);
+    const map = new Map();
+    const big = [];
+    const key = (cx, cy) => cx + ':' + cy;
+    for (let i = 0; i < obstacles.length; i++) {
+      const b = obstacles[i].box;
+      if (!b) continue;
+      const x0 = Math.floor((b.minX - all.minX) / cell);
+      const x1 = Math.floor((b.maxX - all.minX) / cell);
+      const y0 = Math.floor((b.minY - all.minY) / cell);
+      const y1 = Math.floor((b.maxY - all.minY) / cell);
+      if (x1 - x0 > 64 || y1 - y0 > 64) { big.push(i); continue; }
+      for (let cy = y0; cy <= y1; cy++) {
+        for (let cx = x0; cx <= x1; cx++) {
+          const k = key(cx, cy);
+          let arr = map.get(k);
+          if (!arr) map.set(k, arr = []);
+          arr.push(i);
+        }
+      }
+    }
+    return { cell, map, big, minX: all.minX, minY: all.minY };
+  }
+
+  function wallQueryObstacles(grid, box, obstacles) {
+    const out = [];
+    const seen = new Set();
+    const push = (i) => { if (!seen.has(i)) { seen.add(i); out.push(obstacles[i]); } };
+    for (const i of grid.big) push(i);
+    if (grid.map && grid.map.size) {
+      const x0 = Math.floor((box.minX - grid.minX) / grid.cell);
+      const x1 = Math.floor((box.maxX - grid.minX) / grid.cell);
+      const y0 = Math.floor((box.minY - grid.minY) / grid.cell);
+      const y1 = Math.floor((box.maxY - grid.minY) / grid.cell);
+      for (let cy = y0; cy <= y1; cy++) {
+        for (let cx = x0; cx <= x1; cx++) {
+          const arr = grid.map.get(cx + ':' + cy);
+          if (arr) for (const i of arr) push(i);
+        }
+      }
+    }
+    return out;
+  }
+
+  function wallBuildDrag(d) {
+    const dragSet = new Set((d.ids || []).map(Number));
+    const movingIds = wallEntityIdSet(d);
+    const excludeIds = new Set(movingIds);
+    // A clone has no points and no geometry of its own: its shape is the
+    // master's. The master sits exactly under the clone, so it must be excluded
+    // from the obstacle cache or the wall would collide with the clone's own
+    // source at the start pose. It is NOT a wall source: the clone's placed
+    // instances are.
+    for (const e of selectedEntities()) {
+      if (e.type === 'array' && e.kind === 'clone' && Array.isArray(e.masters)) {
+        for (const mid of e.masters) wallAddEntityDeep(excludeIds, state.entities[mid]);
+      }
+    }
+    const contours = wallCompoundContours(movingIds, dragSet);
+    const outer = wallOuterContours(contours);
+    if (!outer.length) {
+      d.wall = null;
+      d.wallDisabled = true;
+      return;
+    }
+    let polys = outer.map(c => c.pts);
+    if (WALL_DRAG_MM > 1e-9) {
+      let off = null;
+      try {
+        off = offsetChains(outer.map(c => ({ pts: c.pts, closed: true })), WALL_DRAG_MM, {
+          join: OFFSET_JOIN,
+          miterLimit: OFFSET_MITER,
+          arcTol: OFFSET_ARC_TOL,
+          tol: OFFSET_TOL
+        });
+      } catch (err) {
+        // A degenerate contour must not break the drag: the outline is still a
+        // usable (zero-clearance) wall.
+        console.warn('drag wall offset failed', err);
+      }
+      if (off && off.length) {
+        // Keep ONLY the outer contours of the offset result. If the source
+        // compound had a hole that slipped past wallOuterContours(), Clipper
+        // returns the hole as a separate depth-1 contour; treating that as a
+        // wall would draw/collide with the inner loop instead of the object's
+        // outer edge. offsetChains() normalises depth: 0 = outer island,
+        // 1 = hole, 2 = island inside a hole, and so on.
+        const outerOff = off.filter(c => (c.depth || 0) === 0 && c.pts && c.pts.length >= 3);
+        if (outerOff.length) polys = outerOff.map(c => c.pts);
+      }
+      // If Clipper collapsed a very thin shape, keep the original outline
+      // rather than pretending there is no wall at all.
+    }
+    const boxes = [];
+    for (const pts of polys) boxes.push(polyBBox(pts));
+    const box = wallBoxUnion(boxes);
+    if (!box) { d.wall = null; d.wallDisabled = true; return; }
+    const obstacles = wallBuildObstacles(excludeIds);
+    const barrierLoops = obstacles.filter(o => o.kind === 'poly');
+    d.wall = {
+      polys,
+      boxes,
+      box,
+      obstacles,
+      grid: wallBuildGrid(obstacles),
+      lastDx: 0,
+      lastDy: 0,
+      dx: 0,
+      dy: 0,
+      blocked: false,
+      movedAny: false,
+      hit: null,
+      barrierLoops: barrierLoops.length
+    };
+  }
+
+  // Returns the first obstacle whose boundary the translated wall crosses.
+  function wallCandidateHit(wall, dx, dy) {
+    if (!wall.obstacles.length) return null;
+    const wb = {
+      minX: wall.box.minX + dx, minY: wall.box.minY + dy,
+      maxX: wall.box.maxX + dx, maxY: wall.box.maxY + dy
+    };
+    const near = wallQueryObstacles(wall.grid, wb, wall.obstacles);
+    // Translate the wall once for this candidate, not once per obstacle pair.
+    const movedPolys = [];
+    for (let i = 0; i < wall.polys.length; i++) {
+      const wpts = wall.polys[i];
+      const moved = wpts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+      const pb = wall.boxes && wall.boxes[i];
+      movedPolys.push({
+        pts: moved,
+        box: pb ? {
+          minX: pb.minX + dx, minY: pb.minY + dy,
+          maxX: pb.maxX + dx, maxY: pb.maxY + dy
+        } : polyBBox(moved)
+      });
+    }
+    for (const o of near) {
+      if (!bboxOverlap(wb, o.box)) continue;
+      const ops = wallObstaclePolys(o);
+      for (const op of ops) {
+        const pts = op.pts;
+        if (!pts || pts.length < 2) continue;
+        const ob = op.box || (op.box = polyBBox(pts));
+        if (!ob || !bboxOverlap(wb, ob)) continue;
+        for (const mp of movedPolys) {
+          if (!mp.box || !bboxOverlap(mp.box, ob)) continue;
+          if (polylineIntersectsPolyline(mp.pts, true, pts, op.closed)) return o;
+        }
+      }
+    }
+    return null;
+  }
+
+  function wallResolve(d, dx, dy) {
+    const w = d.wall;
+    if (!w) return { dx, dy, blocked: false };
+    if (Math.abs(dx - w.lastDx) < 1e-12 && Math.abs(dy - w.lastDy) < 1e-12) {
+      // Back on the last valid pose: that pose is collision-free by definition.
+      w.blocked = false;
+      w.hit = null;
+      w.dx = dx;
+      w.dy = dy;
+      return { dx, dy, blocked: false };
+    }
+    const hit = wallCandidateHit(w, dx, dy);
+    if (hit) {
+      w.blocked = true;
+      w.hit = hit;
+      // remember the rejected cursor pose: the preview follows the hand while
+      // the object itself holds the last valid pose
+      w.candDx = dx;
+      w.candDy = dy;
+      w.dx = w.lastDx;
+      w.dy = w.lastDy;
+      return { dx: w.lastDx, dy: w.lastDy, blocked: true };
+    }
+    w.blocked = false;
+    w.hit = null;
+    w.candDx = dx;
+    w.candDy = dy;
+    w.lastDx = dx;
+    w.lastDy = dy;
+    w.dx = dx;
+    w.dy = dy;
+    if (Math.abs(dx) > 1e-9 || Math.abs(dy) > 1e-9) w.movedAny = true;
+    return { dx, dy, blocked: false };
+  }
+
+  // While dragging, faintly show the barrier list (all outermost loops of
+  // unselected objects, plus group bboxes). This is the exact geometry used by
+  // the collision test, so a "wall passed through" report can be compared with
+  // what the app thinks is an obstacle.
+  function drawWallBarriers() {
+    const d = ui.drag;
+    if (!d || !d.wall || !d.wall.obstacles) return;
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(220, 38, 38, 0.28)';
+    ctx.setLineDash([3, 5]);
+    for (const o of d.wall.obstacles) {
+      if (o.kind !== 'poly' && o.kind !== 'box') continue;
+      // A clone obstacle carries one contour per instance; draw them all.
+      const polys = o.kind === 'poly'
+        ? (o.pts ? [{ pts: o.pts }] : [])
+        : wallObstaclePolys(o);
+      for (const pl of polys) {
+        const pts = pl.pts;
+        if (!pts || pts.length < 2) continue;
+        ctx.beginPath();
+        for (let i = 0; i < pts.length; i++) {
+          const s = w2s(pts[i].x, pts[i].y);
+          if (i === 0) ctx.moveTo(s.x, s.y);
+          else ctx.lineTo(s.x, s.y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawWallDrag() {
+    const d = ui.drag;
+    if (!d || !d.wall || !d.wall.polys) return;
+    const w = d.wall;
+    const blocked = !!w.blocked;
+    const pass = (dx, dy, stroke, fill, dash, width) => {
+      ctx.lineWidth = width;
+      ctx.strokeStyle = stroke;
+      ctx.fillStyle = fill;
+      ctx.setLineDash(dash);
+      for (const pts of w.polys) {
+        if (!pts || pts.length < 3) continue;
+        ctx.beginPath();
+        for (let i = 0; i < pts.length; i++) {
+          const s = w2s(pts[i].x + dx, pts[i].y + dy);
+          if (i === 0) ctx.moveTo(s.x, s.y);
+          else ctx.lineTo(s.x, s.y);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+    };
+    ctx.save();
+    if (blocked) {
+      // the object holds the last valid pose: show it faint and dashed so the
+      // landing spot stays readable while the red preview follows the hand
+      pass(w.dx, w.dy, 'rgba(220,38,38,0.35)', 'rgba(220,38,38,0.03)', [4, 4], 1.2);
+      pass(w.candDx || 0, w.candDy || 0, '#dc2626', 'rgba(220,38,38,0.07)', [], 1.6);
+    } else {
+      pass(w.dx, w.dy, '#f59e0b', 'rgba(245,158,11,0.07)', [6, 4], 1.6);
+    }
+    ctx.restore();
+  }
+
   function bodyDragFor(e, pos, world, ids) {
     const single = selectedEntities().length === 1 && selectedPointIds().length === 0;
     let primary = null;
@@ -20182,35 +22964,45 @@
     }
     if (!grab) grab = { x: world.x, y: world.y };
     const dragSet = new Set(ids);
-    const cache = [];
-    const m = 60 / view.zoom;
-    const x0 = (0 - view.ox) / view.zoom - m;
-    const x1 = (W - view.ox) / view.zoom + m;
-    const y0 = (0 - view.oy) / view.zoom - m;
-    const y1 = (H - view.oy) / view.zoom + m;
-    for (const key in state.points) {
-      const p = state.points[key];
-      const id = +key;
-      if (dragSet.has(id)) continue;
-      if (p.x < x0 || p.x > x1 || p.y < y0 || p.y > y1) continue;
-      cache.push({ x: p.x, y: p.y });
+    // The body drag snaps through the SAME snapPoint machinery a single-point
+    // drag (and drafting) uses, so every point-snap feature applies here too:
+    // existing points, origin, on-line, line midpoints, closed-loop centres,
+    // and grid when it is on. What must be excluded is the selection itself:
+    //   - skip: the dragged points (a group never snaps to its own vertices)
+    //   - skipEntities: lines whose two ends are both dragged (their midpoints
+    //     / on-line positions are part of the moved geometry)
+    //   - skipLoops: loops sharing a vertex with the dragged selection (their
+    //     centroid would move with the drag)
+    // Lines/loops with a dragged vertex but an undragged mate stay valid
+    // targets: a chain dragged by one end can land on its free neighbour.
+    const dragCoords = new Set();
+    for (const pid of ids) {
+      const p = P(pid);
+      if (p) dragCoords.add(Math.round(p.x * 1e6) + ',' + Math.round(p.y * 1e6));
     }
+    const skipLoops = new Set();
+    for (const [loop] of loopCentroids()) {
+      for (const v of loop.poly) {
+        if (dragCoords.has(Math.round(v.x * 1e6) + ',' + Math.round(v.y * 1e6))) {
+          skipLoops.add(loop);
+          break;
+        }
+      }
+    }
+    const skipEntities = new Set();
     for (const id in state.entities) {
       const e = state.entities[id];
       if (e.type !== 'line' || !layerVisible(e)) continue;
-      const a = P(e.a);
-      const b = P(e.b);
-      if (!a || !b) continue;
-      if (!dragSet.has(+e.a) && !dragSet.has(+e.b)) {
-        cache.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-      }
+      if (dragSet.has(+e.a) && dragSet.has(+e.b)) skipEntities.add(+id);
     }
     return {
       kind: 'entity',
       ids,
       clones,
       grab,
-      snapCache: cache,
+      skip: dragSet,
+      skipEntities,
+      skipLoops,
       moved: false,
       startWorld: world
     };
@@ -20264,10 +23056,11 @@
       return;
     }
     if (ev.button === 1) {
-      // middle click = the loop below (Alt+click does the same, but many Linux
-      // desktops steal Alt+drag for moving the window)
+      // middle drag = pan (Inkscape-style). Alt+click still selects the loop
+      // below, so the old middle-click role is covered.
       ev.preventDefault();
-      selectBelow(ev);
+      startPan(pointerPos(ev));
+      canvas.setPointerCapture(ev.pointerId);
       return;
     }
     if (ev.button === 2) {
@@ -20288,17 +23081,21 @@
         render();
         return;
       }
-      if (ui.tool !== 'select') {
+      if (!isSelectLikeTool()) {
         setTool('select');
         return;
       }
       ev.preventDefault();
       startPan(pointerPos(ev));
+      // Right-click (no drag) in select mode cycles through the stacked
+      // objects at the spot — see onPointerUp. Right-DRAG stays pan.
+      ui.pan.cycleOnClick = true;
       canvas.setPointerCapture(ev.pointerId);
       return;
     }
     if (ev.button !== 0) return;
     const pos = pointerPos(ev);
+    if (ev.pointerType === 'touch') { ui._touchPress = { x: pos.x, y: pos.y }; ui._touching = true; }
     const world = s2w(pos.x, pos.y);
     if (ui.nestPlace) {
       ev.preventDefault();
@@ -20357,7 +23154,7 @@
       return;
     }
 
-    if (ui.tool === 'select') {
+    if (isSelectLikeTool()) {
       // Mate job: every click in this mode is a part-marker pick. Side B may
       // be the same part (clicking the same marker twice opens the dialog in
       // ground mode — that is how a part becomes the grounded base). Side B
@@ -20489,12 +23286,19 @@
       if (dimHit == null) {
         const badgeHit = hitBadge(pos.x, pos.y);
         if (badgeHit != null) {
-          // P0-2: a badge click deletes its constraint (undoable). The
-          // modifiers keep the old select gesture for multi-select.
-          if (!(addMod || subMod)) {
+          // A SINGLE click on a badge only selects (toggle) — deleting on a
+          // plain click was far too eager: a stray click near a value badge
+          // silently removed a constraint. DOUBLE-click on the same badge
+          // deletes it (undoable). Modifier clicks keep the select gesture.
+          const now = performance.now();
+          if (!(addMod || subMod) && ui.lastBadgeClick &&
+              ui.lastBadgeClick.id === +badgeHit &&
+              now - ui.lastBadgeClick.t < 400) {
+            ui.lastBadgeClick = null;
             deleteConstraintById(badgeHit);
             return;
           }
+          ui.lastBadgeClick = { id: +badgeHit, t: now };
           toggleSelect('constraint', badgeHit);
           updateUI();
           render();
@@ -20787,6 +23591,31 @@
     handleCreateClick(snap, ev);
   }
 
+  // Create the next segment of a line draft up to `end` (shared by the second
+  // tap and by the touch drag-release). Returns true when a segment was added.
+  function lineCommitToEnd(end) {
+    const d = ui.draft;
+    if (!d || d.type !== 'line' || !d.a) return false;
+    const start = d.a.id != null ? P(d.a.id) : d.a;
+    if (!start) { cancelDraft(); render(); return false; }
+    if (Math.hypot(end.x - start.x, end.y - start.y) < 1e-7) return false;
+    pushHistory();
+    const aId = materializePoint(d.a);
+    const bId = materializePoint(end);
+    if (aId === bId) { history.pop(); updateHistoryButtons(); return false; }
+    const id = newId();
+    state.entities[id] = { id, type: 'line', a: aId, b: bId, color: ui.color };
+    if (!d.chain) d.chain = [];
+    d.chain.push({ a: { x: start.x, y: start.y, id: aId }, seg: id });
+    d.a = { x: end.x, y: end.y, id: bId };
+    if (d.chain.length === 1) d.firstId = aId;
+    const closing = d.firstId != null && bId === d.firstId && d.chain.length >= 2;
+    requestSolve();
+    commit();
+    if (closing) { cancelDraft(); toast('Loop closed — the chain is done'); }
+    return true;
+  }
+
   function handleCreateClick(snap, ev) {
     const shift = ev.shiftKey;
 
@@ -20811,12 +23640,13 @@
       // The vertical guide is born dimensioned to the remembered text height
       const cHdim = newId();
       state.constraints[cHdim] = {
-        id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 26
+        id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 10
       };
       const id = newId();
+      const def = loadTextStyle();
       state.entities[id] = {
         id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
-        text: 'Text', font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0,
+        text: 'Text', font: def.font, weight: def.weight, italic: def.italic, tracking: def.tracking,
         color: ui.color, fitCurve: loadTextFit()
       };
       ensureTextAspect(state.entities[id]);
@@ -20829,45 +23659,23 @@
     }
 
     if (ui.tool === 'line') {
-      if (!ui.draft || ui.draft.type !== 'line') {
-        ui.draft = { type: 'line', a: snap, chain: [] };
+      if (ev.pointerType !== 'touch') {
+        if (!ui.draft || ui.draft.type !== 'line') {
+          ui.draft = { type: 'line', a: snap, chain: [] };
+        } else {
+          const start = ui.draft.a.id != null ? P(ui.draft.a.id) : ui.draft.a;
+          let end = { x: snap.x, y: snap.y, id: snap.id, midId: snap.midId, lineId: snap.lineId, weld: snap.weld };
+          if (shift && start) end = angleSnap(start, end);
+          lineCommitToEnd(end);
+        }
       } else {
-        const start = ui.draft.a.id != null ? P(ui.draft.a.id) : ui.draft.a;
-        if (!start) {
-          cancelDraft();
-          render();
-          return;
-        }
-        let end = { x: snap.x, y: snap.y, id: snap.id, midId: snap.midId, lineId: snap.lineId, weld: snap.weld };
-        if (shift) end = angleSnap(start, end);
-        if (Math.hypot(end.x - start.x, end.y - start.y) < 1e-7) return;
-        pushHistory();
-        const aId = materializePoint(ui.draft.a);
-        const bId = materializePoint(end);
-        if (aId === bId) {
-          history.pop();
-          updateHistoryButtons();
-          return;
-        }
-        const id = newId();
-        state.entities[id] = { id, type: 'line', a: aId, b: bId, color: ui.color };
-        // the vertex this segment started from, so Esc can take the segment
-        // back and continue from there (same undo-last-segment as the curve)
-        if (!ui.draft.chain) ui.draft.chain = [];
-        ui.draft.chain.push({ a: { x: start.x, y: start.y, id: aId }, seg: id });
-        ui.draft.a = { x: end.x, y: end.y, id: bId };
-        // remember the point the chain started from: landing back on it closes
-        // the loop and the draft is done (a third segment at least, so a
-        // two-point "closure" — which would only double the first line — still
-        // just continues the chain)
-        if (ui.draft.chain.length === 1) ui.draft.firstId = aId;
-        const closing = ui.draft.firstId != null && bId === ui.draft.firstId &&
-          ui.draft.chain.length >= 2;
-        requestSolve();
-        commit();
-        if (closing) {
-          cancelDraft();
-          toast('Loop closed — the chain is done');
+        // touch: the pending point is live during press-drag and locks/commits
+        // on release. A fresh draft starts with no locked anchor (first point).
+        if (!ui.draft || ui.draft.type !== 'line') {
+          ui.draft = { type: 'line', a: null, chain: [] };
+          ui._linePressHadDraft = false;
+        } else {
+          ui._linePressHadDraft = ui.draft.a != null;
         }
       }
       render();
@@ -20875,40 +23683,53 @@
     }
 
     if (ui.tool === 'arc') {
+      // 3-point arc: click the two endpoints on the arc first, then a point
+      // the arc passes through (the middle point). The arc is created the
+      // moment the third point lands, when it is valid. The third point fully
+      // determines the arc (it passes through it), so there is no direction
+      // choice to make.
       if (!ui.draft || ui.draft.type !== 'arc') {
-        ui.draft = { type: 'arc', stage: 1, c: snap };
+        ui.draft = { type: 'arc', stage: 1, a: snap, fullCircle: false };
       } else if (ui.draft.stage === 1) {
-        const c = ui.draft.c.id != null ? P(ui.draft.c.id) : ui.draft.c;
-        if (!c) {
-          cancelDraft();
-          return;
-        }
-        const end = shift ? angleSnap(c, snap) : snap;
-        const r = Math.hypot(end.x - c.x, end.y - c.y);
-        if (r < 1e-7) return;
-        const sPoint = { x: c.x + (end.x - c.x) / r * r, y: c.y + (end.y - c.y) / r * r, id: end.id };
-        ui.draft = { type: 'arc', stage: 2, c: ui.draft.c, s: sPoint };
+        const a = ui.draft.a.id != null ? P(ui.draft.a.id) : ui.draft.a;
+        if (!a) { cancelDraft(); render(); return; }
+        if (dist(a, snap) < 1e-7) { render(); return; }
+        ui.draft = { type: 'arc', stage: 2, a: ui.draft.a, b: snap, fullCircle: false };
       } else if (ui.draft.stage === 2) {
-        const c = ui.draft.c.id != null ? P(ui.draft.c.id) : ui.draft.c;
-        const sPt = ui.draft.s.id != null ? P(ui.draft.s.id) : ui.draft.s;
-        if (!c || !sPt) {
-          cancelDraft();
+        const a = ui.draft.a.id != null ? P(ui.draft.a.id) : ui.draft.a;
+        const b = ui.draft.b.id != null ? P(ui.draft.b.id) : ui.draft.b;
+        if (!a || !b) { cancelDraft(); render(); return; }
+        const res = threePointArcCenter(a, b, snap);
+        if (!res || dist(res.c, a) < 1e-7) {
+          toast('The three points must not be collinear');
+          render();
           return;
         }
-        const r = Math.hypot(sPt.x - c.x, sPt.y - c.y);
-        let angle = Math.atan2(snap.y - c.y, snap.x - c.x);
-        if (shift) angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12);
-        const a0 = Math.atan2(sPt.y - c.y, sPt.x - c.x);
-        if (Math.abs(wrapPi(angle - a0)) < 1e-7) return;
         pushHistory();
-        const cId = materializePoint(ui.draft.c);
-        const sId = materializePoint(ui.draft.s);
-        const eId = pointAtWorld(c.x + Math.cos(angle) * r, c.y + Math.sin(angle) * r);
+        if (ui.draft.fullCircle) {
+          // Space = full circle through the three points instead of an arc.
+          const cId = materializePoint(res.c);
+          const id = newId();
+          state.entities[id] = { id, type: 'circle', c: cId, r: dist(res.c, a), color: ui.color };
+          ui.draft = null;
+          ui.selection = [{ kind: 'entity', id }];
+          requestSolve();
+          commit();
+          render();
+          return;
+        }
+        const cId = materializePoint(res.c);
+        const sId = materializePoint(res.start);
+        const eId = materializePoint(res.end);
+        if (sId === eId) { history.pop(); updateHistoryButtons(); render(); return; }
         const id = newId();
         state.entities[id] = { id, type: 'arc', c: cId, s: sId, e: eId, color: ui.color };
         ui.draft = null;
+        ui.selection = [{ kind: 'entity', id }];
         requestSolve();
         commit();
+        render();
+        return;
       }
       render();
       return;
@@ -21285,6 +24106,7 @@
         return out;
       }
       const m = textMetricsOf(e);
+      if (!m) return out; // font still loading: skip this frame
       const ax = gg.A.x / m.width, ay = gg.A.y / m.width;
       const bx = gg.B.x / m.height, by = gg.B.y / m.height;
       for (const raw of textLocalContours(e)) {
@@ -21328,7 +24150,14 @@ function findSelectedCurveSegment() {
     const e = state.entities[key];
     if (!e || e.type !== 'spline' || !Array.isArray(e.pts)) continue;
     const a = e.pts.indexOf(pts[0]), b = e.pts.indexOf(pts[1]);
-    if (a >= 0 && b >= 0 && Math.abs(a - b) === 1) return { host: e, i: Math.min(a, b) };
+    if (a < 0 || b < 0) continue;
+    if (Math.abs(a - b) === 1) return { host: e, i: Math.min(a, b) };
+    // Closed curve: the closing segment runs from the last to the first point.
+    // Those indices are not adjacent (|a-b| = n-1), so the pair above misses
+    // it; the segment is still a real, deletable span.
+    const n = e.pts.length;
+    if (e.closed && ((a === 0 && b === n - 1) || (b === 0 && a === n - 1)))
+      return { host: e, i: n - 1 };
   }
   return null;
 }
@@ -21376,7 +24205,7 @@ function splitCurveSegment(host, i, withLine) {
   let lid = null;
   if (withLine) {
     lid = newId();
-    state.entities[lid] = { id: lid, type: 'line', a: host.pts[i], b: host.pts[i + 1],
+    state.entities[lid] = { id: lid, type: 'line', a: host.pts[i], b: host.pts[(i + 1) % n],
       color, layer: host.layer };
   }
   removeEntity(+host.id);
@@ -21386,14 +24215,122 @@ function splitCurveSegment(host, i, withLine) {
   return { newIds, lid };
 }
 
+// Maximal runs of consecutive indices from a sorted list; on a closed curve
+// the run touching n-1 and the run touching 0 are one cyclic run.
+function indexRuns(sorted, n, closed) {
+  const runs = [];
+  let cur = [];
+  for (const k of sorted) {
+    if (cur.length && k !== cur[cur.length - 1] + 1) { runs.push(cur); cur = []; }
+    cur.push(k);
+  }
+  if (cur.length) runs.push(cur);
+  if (closed && runs.length > 1 && runs[0][0] === 0 &&
+    runs[runs.length - 1][runs[runs.length - 1].length - 1] === n - 1) {
+    const last = runs.pop();
+    runs[0] = last.concat(runs[0]);
+  }
+  return runs;
+}
+
+// A contiguous span of >=3 selected nodes on ONE spline (the "detach this arc"
+// selection). Handles a wrapping span on a closed curve via its contiguous
+// complement. Returns null for the 2-point case, which keeps the old line path.
+function findSelectedCurveSpan() {
+  const pts = ui.selection.filter(s => s && s.kind === 'point').map(s => +s.id);
+  if (pts.length < 3) return null;
+  for (const key in state.entities) {
+    const e = state.entities[key];
+    if (!e || e.type !== 'spline' || !Array.isArray(e.pts)) continue;
+    const idx = pts.map(p => e.pts.indexOf(p));
+    if (idx.some(i => i < 0)) continue;
+    const n = e.pts.length;
+    const sel = idx.slice().sort((a, b) => a - b);
+    if (sel[sel.length - 1] - sel[0] + 1 === sel.length) {
+      const spanIdx = [];
+      for (let k = sel[0]; k <= sel[sel.length - 1]; k++) spanIdx.push(k);
+      return { host: e, spanIdx };
+    }
+    if (e.closed) {
+      const selSet = new Set(sel);
+      const rest = [];
+      for (let k = 0; k < n; k++) if (!selSet.has(k)) rest.push(k);
+      if (rest.length && rest[rest.length - 1] - rest[0] + 1 === rest.length) {
+        const a = (rest[rest.length - 1] + 1) % n;
+        const spanIdx = [];
+        for (let t = 0; t < sel.length; t++) spanIdx.push((a + t) % n);
+        return { host: e, spanIdx };
+      }
+    }
+  }
+  return null;
+}
+
+// Detach a node span as an independent spline (curvature preserved), splitting
+// the master at the span's two ends. The detached piece gets fresh copies of
+// its boundary points so recoloring / moving it never drags the master; the
+// remainder keeps the original points. The new piece is left selected.
+function splitCurveSpan(host, spanIdx) {
+  pushHistory();
+  ensureSplineHandles(host);
+  const n = host.pts.length;
+  const o = (host.hs && host.hs.o) ? host.hs.o : host.pts.map(() => null);
+  const io = (host.hs && host.hs.i) ? host.hs.i : host.pts.map(() => null);
+  const spanSet = new Set(spanIdx);
+  const dPts = [], dO = [], dI = [];
+  for (let t = 0; t < spanIdx.length; t++) {
+    const k = spanIdx[t];
+    const p = P(host.pts[k]);
+    dPts.push(privatePoint(p.x, p.y));
+    dO.push(o[k] ? { x: o[k].x, y: o[k].y } : null);
+    dI.push(io[k] ? { x: io[k].x, y: io[k].y } : null);
+  }
+  dI[0] = null;
+  dO[dO.length - 1] = null;
+  const did = newId();
+  state.entities[did] = {
+    id: did, type: 'spline', pts: dPts, hs: { o: dO, i: dI },
+    closed: false, color: host.color, layer: host.layer
+  };
+  const rest = [];
+  for (let k = 0; k < n; k++) if (!spanSet.has(k)) rest.push(k);
+  const runs = indexRuns(rest, n, !!host.closed);
+  const newIds = [];
+  for (const run of runs) {
+    if (run.length < 2) continue;
+    const rid = newId();
+    state.entities[rid] = {
+      id: rid, type: 'spline', pts: run.map(k => host.pts[k]),
+      hs: {
+        o: run.map((k, j) => (j < run.length - 1 ? (o[k] || null) : null)),
+        i: run.map((k, j) => (j > 0 ? (io[k] || null) : null))
+      },
+      closed: false, color: host.color, layer: host.layer
+    };
+    newIds.push(rid);
+  }
+  removeEntity(+host.id);
+  cleanupPoints();
+  ui.selection = [{ kind: 'entity', id: did }];
+  requestSolve();
+  commit();
+  return { did, newIds, segCount: spanIdx.length - 1 };
+}
+
 function cmdSplitCurve() {
   if (xfBlock()) return;
+  const span = findSelectedCurveSpan();
+  if (span) {
+    const res = splitCurveSpan(span.host, span.spanIdx);
+    toast('Split: ' + res.segCount + ' segmen kurva lepas jadi objek terpisah — bisa diganti warna');
+    return;
+  }
   const found = findSelectedCurveSegment();
   if (!found) {
     const pts = ui.selection.filter(s => s && s.kind === 'point').map(s => +s.id);
     toast(pts.length === 2
       ? 'Putus kurva: dua titik itu bukan sepasang titik bertetangga di satu kurva'
-      : 'Putus kurva: pilih dua titik bertetangga di satu kurva (klik segmennya)');
+      : 'Putus kurva: pilih run node berurutan (≥3) untuk melepas span, atau dua titik bertetangga untuk line');
     return;
   }
   const { host, i } = found;
@@ -21405,9 +24342,9 @@ function cmdSplitCurve() {
   function cmdConvertToCurve() {
     if (xfBlock()) return;
     const ents = selectedEntities().filter(e => e.type === 'circle' || e.type === 'arc' ||
-      e.type === 'text' || e.type === 'art');
+      e.type === 'text' || e.type === 'art' || e.type === 'array');
     if (!ents.length) {
-      toast('Select a circle, arc, text or pasted object to convert');
+      toast('Select a circle, arc, text, pasted object or array/clone to convert');
       return;
     }
     pushHistory();
@@ -21417,6 +24354,19 @@ function cmdSplitCurve() {
     let needFuse = false;
     const sharpAngle = isFinite(+settings.curveSharpAngle) ? +settings.curveSharpAngle : 25;
     for (const e of ents) {
+      // An array/clone explodes into independent curves: one spline per
+      // instance, link to the masters severed, masters kept.
+      if (e.type === 'array') {
+        const ids = explodeArrayToCurves(e);
+        if (!ids.length) {
+          toast('That array has no geometry to convert');
+          continue;
+        }
+        removeEntity(e.id);
+        fittedCount += ids.length;
+        for (const nid of ids) created.push(nid);
+        continue;
+      }
       // Exact source FIRST, regardless of the Fit flag: the flag chooses between
       // "curves" and "one straight line per segment", and a glyph outline is a
       // curve. Only a text whose exact source is unavailable falls through to
@@ -21464,7 +24414,11 @@ function cmdSplitCurve() {
       // A text or picture marked "fit curves" becomes real Bezier splines
       // instead of a line per contour segment. A grouped object that still
       // carries its own curve data ignores the flag: that is already a curve.
-      if ((e.type === 'text' || e.type === 'art') && e.fitCurve && !artCurveSource(e)) {
+      // Single-line fonts (Hershey) are stroke geometry and must never take
+      // this closed-loop path — they fall through to the dedicated open-stroke
+      // branch below.
+      if ((e.type === 'text' || e.type === 'art') && e.fitCurve && !artCurveSource(e) &&
+        !(e.type === 'text' && isSingleLineFont(e))) {
         const loops = framedLoopsWorld(e);
         const tol = framedFitTol(e);
         const ids = [];
@@ -21498,16 +24452,24 @@ function cmdSplitCurve() {
         for (const nid of ids) created.push(nid);
         continue;
       }
-      // A single-line text is stroke geometry: fit each stroke as an OPEN
-      // spline (no wrap-around segment), never a closed loop.
+      // A single-line text is stroke geometry: each stroke is a polyline, so
+      // it becomes an OPEN spline whose nodes are all sharp (no handles) — the
+      // letterform keeps its straight runs and corners. Never a smooth fit,
+      // never a closed loop.
       if (e.type === 'text' && isSingleLineFont(e)) {
         const strokes = textStrokesWorld(e);
-        const tol = framedFitTol(e);
         const ids = [];
         for (const st of strokes) {
           if (!st.pts || st.pts.length < 2) continue;
-          const nid = addFittedSpline(st.pts, colorOf(e), { tol, sharpAngle, closed: false });
-          if (nid) ids.push(nid);
+          // A spline's pts are POINT IDS into state.points, not coordinates.
+          const pts = st.pts.map(p => privatePoint(p.x, p.y));
+          const nid = newId();
+          state.entities[nid] = {
+            id: nid, type: 'spline', pts,
+            hs: { o: pts.map(() => null), i: pts.map(() => null) },
+            closed: false, color: colorOf(e), layer: e.layer
+          };
+          ids.push(nid);
         }
         if (!ids.length) {
           toast('Nothing to convert in that text');
@@ -21889,7 +24851,7 @@ function cmdSplitCurve() {
       return;
     }
 
-    // Move job (Ctrl+M): while picking the reference / destination point, the
+    // Move job (Ctrl+Shift+M): while picking the reference / destination point, the
     // cursor gets the same green point target a single-point drag shows, so an
     // exact snap is visible even when the point is selected (blue)
     if (ui.moveJob) {
@@ -21912,7 +24874,23 @@ function cmdSplitCurve() {
       return;
     }
 
-    const world = s2w(pos.x, pos.y);
+    // Touch point-drag lift: once the finger has moved a little, steer the
+    // drag from a virtual cursor ~TOUCH_LIFT_PX above the finger so the grabbed
+    // point stays visible (the thumb would otherwise cover it). The lift is
+    // suppressed when the finger is about to weld onto an existing point —
+    // otherwise the offset would aim the dragged point above the target and the
+    // weld would miss.
+    const realWorld = s2w(pos.x, pos.y);
+    // Visibility for a single-point touch drag comes from a RENDER-time camera
+    // lift (ui._dragLift), not from offsetting the drag world — so snap/weld
+    // stay on the real pointer and never jitter. Drafting keeps its pointer
+    // lift (the created point tracks above the finger).
+    const singlePointDrag = ui.drag && ui.drag.kind === 'entity' &&
+      ui.drag.ids && ui.drag.ids.length <= 1;
+    ui._dragLift = !!(singlePointDrag && ev.pointerType === 'touch');
+    const creating = (/^(line|arc|circle|box|poly|curve)$/.test(ui.tool) && !ui.drag);
+    const world = (creating ? touchLiftWorld(realWorld, pos, true) : null) || realWorld;
+    if (ui.drag) ui.drag.realWorld = realWorld;
     ui.raw = world;
     ui.lastWorld = world;
 
@@ -22189,23 +25167,80 @@ function cmdSplitCurve() {
         // and a snap near where the press-time grab vertex WOULD land shifts
         // the whole selection by the small difference.
         if (d.ids.length <= 1 && d.snapPrimary && d.primary != null && d.origPrimary) {
+          // A single-point drag snaps like drafting: to existing points (the
+          // visible square), to the origin, to line midpoints, anywhere along a
+          // line, to closed-loop centres, and to the grid when it is on. Every
+          // snap lands the dragged point EXACTLY on the target and shows its
+          // marker — drawSnapMarker draws each kind (midpoint / on line / loop
+          // centre / origin / grid / point). Ends, lines and loops always beat
+          // the grid; the grid is the last resort, like in drafting.
           const snap = snapPoint(world, { skip: new Set(d.bodyDrag ? d.ids : [d.primary]) });
-          // A CORRECTION to the pointer, not an absolute delta from the press
-          // pose. `dx = snap - origPrimary` re-anchored the point to where the
-          // drag started, wiping out any solve that ran mid-drag (the snapped
-          // single-point drag was the one case the rebase could not rescue).
-          dx += snap.x - world.x;
-          dy += snap.y - world.y;
-          d.snap = { x: snap.x, y: snap.y, coincident: snap.id != null, id: snap.id != null ? snap.id : null };
-        } else if (d.grab && d.snapCache) {
+          const geomSnap = snap && (snap.id != null || snap.origin ||
+            snap.midId != null || snap.lineId != null || snap.virtual || snap.grid);
+          if (geomSnap) {
+            // A snap onto a real point may WELD (same colour) or leave a
+            // coincident constraint on release; geometry snaps never do.
+            const isPoint = snap.id != null;
+            const dragColor = dragWeldColor(d.primary);
+            const canWeld = isPoint && dragColor != null && weldAllowed(snap.id, dragColor);
+            // Anchor to the snap position (relative to the point's base) so the
+            // dragged point lands EXACTLY on the target, not shifted by the grab
+            // offset between the press point and the point centre.
+            const bp = (d.base && d.base[d.primary]) ||
+              (d.startPos && d.startPos[d.primary]) ||
+              { x: d.origPrimary.x, y: d.origPrimary.y };
+            dx = snap.x - bp.x + (d.offX || 0);
+            dy = snap.y - bp.y + (d.offY || 0);
+            d.snap = {
+              x: snap.x, y: snap.y,
+              coincident: isPoint,
+              id: isPoint ? snap.id : null,
+              weld: canWeld,
+              origin: snap.origin,
+              midId: snap.midId,
+              lineId: snap.lineId,
+              virtual: snap.virtual,
+              loop: snap.loop,
+              grid: snap.grid
+            };
+          } else {
+            d.snap = null;
+          }
+        } else if (d.grab) {
+          // Multi-point body drag (a selected loop, several objects): the same
+          // bounded-snap model as before — the move is always the raw delta,
+          // and a snap near where the press-time grab vertex WOULD land shifts
+          // the whole selection by the small difference. The targets are the
+          // FULL point-snap set via snapPoint (points, origin, on-line, line
+          // midpoints, other loops' centres, grid) minus the dragged geometry
+          // itself (d.skip / d.skipEntities / d.skipLoops).
           const wx = d.grab.x + dx;
           const wy = d.grab.y + dy;
-          const snap = findSnapFor({ x: wx, y: wy }, null, d.snapCache);
-          if (snap && !(Math.abs(snap.x - d.grab.x) < 0.75 &&
+          const snap = snapPoint({ x: wx, y: wy }, {
+            tolPx: 16,   // body drags keep their wider 16-px catch radius
+            skip: d.skip,
+            skipEntities: d.skipEntities,
+            skipLoops: d.skipLoops
+          });
+          const isPoint = snap && snap.id != null;
+          const caught = snap && (isPoint || snap.origin ||
+            snap.midId != null || snap.lineId != null || snap.virtual || snap.grid);
+          if (caught && !(Math.abs(snap.x - d.grab.x) < 0.75 &&
             Math.abs(snap.y - d.grab.y) < 0.75)) {
             dx += snap.x - wx;
             dy += snap.y - wy;
-            d.snap = { x: snap.x, y: snap.y, coincident: false, id: null };
+            d.snap = {
+              x: snap.x, y: snap.y,
+              coincident: isPoint,
+              id: isPoint ? snap.id : null,
+              weld: snap.weld,
+              origin: snap.origin,
+              midId: snap.midId,
+              lineId: snap.lineId,
+              virtual: snap.virtual,
+              loop: snap.loop,
+              grid: snap.grid
+            };
           } else {
             d.snap = null;
           }
@@ -22217,6 +25252,27 @@ function cmdSplitCurve() {
         if (ev.ctrlKey || ev.metaKey) {
           if (Math.abs(dx) > Math.abs(dy)) dy = 0;
           else dx = 0;
+        }
+        // Drag wall: the wall is generated once from the start pose and then
+        // only translated. A collision holds the LAST VALID delta; the object
+        // and the wall preview both stay there until the pointer finds a clear
+        // pose again.
+        if (ui.tool === 'dragwall') {
+          if (!d.wall && !d.wallDisabled) {
+            wallBuildDrag(d);
+            // The hint changes from "select ... then drag" to "clear" (or
+            // "no closed loop") as soon as the wall exists.
+            if (d.wall || d.wallDisabled) updateUI();
+          }
+          if (d.wall) {
+            const wr = wallResolve(d, dx, dy);
+            const changed = !!d.wallBlocked !== wr.blocked;
+            d.wallBlocked = wr.blocked;
+            if (wr.blocked) d.snap = null;
+            dx = wr.dx;
+            dy = wr.dy;
+            if (changed) updateUI();
+          }
         }
         const targets = [];
         for (const id of d.ids) {
@@ -22255,7 +25311,7 @@ function cmdSplitCurve() {
             delete e.shapes;
           }
         }
-        d.moved = true;
+        d.moved = !d.wall || !!d.wall.movedAny;
         invalidateLoops();
         // Remember what the gesture is carrying so the timed auto-solve and the
         // release solve can use the SAME target. A solve without the target is
@@ -22326,7 +25382,7 @@ function cmdSplitCurve() {
 
     if (ui.tool === 'transform') return;
 
-    if (ui.tool === 'select') {
+    if (isSelectLikeTool()) {
       // Hover testing walks the hit-test pipeline (part marker → point →
       // dimension → entity). At a 125 Hz mouse that ran the pipeline 125 times
       // a second even though at most one frame paints between events. The
@@ -22341,7 +25397,7 @@ function cmdSplitCurve() {
     }
 
     ui.hoverSnap = snapPoint(world);
-    if (ui.draft || ui.tool !== 'select') scheduleRender();
+    if (ui.draft || !isSelectLikeTool()) scheduleRender();
   }
 
   let hoverRaf = 0;
@@ -22352,7 +25408,7 @@ function cmdSplitCurve() {
       hoverRaf = 0;
       const p = ui.hoverProbe;
       ui.hoverProbe = null;
-      if (!p || ui.drag || ui.pan || pinch || ui.tool !== 'select') return;
+      if (!p || ui.drag || ui.pan || pinch || !isSelectLikeTool()) return;
       const prev = ui.hover;
       runHoverProbe(p.x, p.y);
       if (hoverChanged(prev, ui.hover)) {
@@ -22410,6 +25466,16 @@ function cmdSplitCurve() {
     updateCanvasCursor();
   }
 
+  // True when the entity's own geometry lies entirely inside the marquee
+  // rectangle, judged on the tessellated bounds (a curve is measured by its
+  // real outline, not by its control points).
+  function marqueeCovers(e, w0, w1) {
+    const bb = entityBounds(e);
+    if (!bb) return false;
+    return bb.minX >= w0.x - 1e-9 && bb.maxX <= w1.x + 1e-9 &&
+      bb.minY >= w0.y - 1e-9 && bb.maxY <= w1.y + 1e-9;
+  }
+
   function applyRubberSelection(d, pos) {
     ui.rubber = null;
     lastPickEntityId = null;   // a marquee has no key object
@@ -22435,21 +25501,48 @@ function cmdSplitCurve() {
         if (!hits(p.x, p.y)) continue;
         kill.add('point:' + +key);
       }
+      // ...and the entities the rectangle fully covers (lines, curves, whole
+      // loops, containers) — the same geometric rule the additive pass uses, so
+      // Shift+drag can take out anything the marquee could put in.
+      for (const key in state.entities) {
+        const e = state.entities[key];
+        if (!e) continue;
+        if (e.type === 'note') continue;
+        if (!marqueeCovers(e, w0, w1)) continue;
+        kill.add('entity:' + +key);
+      }
       ui.selection = ui.selection.filter(s => !kill.has(s.kind + ':' + s.id));
       updateUI();
       render();
       return;
     }
-    // Rectangle selection picks POINTS only. Picking whole entities whose bounds
-    // graze the rectangle made a partial marquee grab a polyline wholesale —
-    // touching one edge selected the entire shape. Points are the atomic unit:
-    // the entities they belong to follow (drags, selection info, segments).
+    // Rectangle selection: a marquee takes POINTS inside it, then everything
+    // those points cover (lines, curves and therefore whole loops) and finally
+    // any loop fully inside. Picking whole entities whose bounds merely GRAZE
+    // the rectangle made a partial marquee grab a polyline wholesale — touching
+    // one edge selected the entire shape. Points are the atomic unit: the
+    // entities they belong to follow (drags, selection info, segments).
+    //
+    // The pick filters (Alt+1/2/3) are NOT applied on the way up: they say what
+    // the user may END UP with, so they are a post-processing pass on the
+    // finished selection (see below). Applying them while climbing broke the
+    // climb itself — with filter 1 off there were no points, so no line and no
+    // loop could ever be reached, while a plain click still worked.
     const picked = new Map(ui.selection.map(s => [s.kind + ':' + s.id, s]));
     if (!d.additive) picked.clear();
+    // Text/picture frames are container objects: their p0/pw/ph are the frame,
+    // not marquee point targets. They are picked as whole objects below (loop
+    // filter), so dragging a marquee never grabs a text by its corner points.
+    const framePointIds = new Set();
+    for (const key in state.entities) {
+      const e = state.entities[key];
+      if (!e || (e.type !== 'text' && e.type !== 'image')) continue;
+      for (const pid of entityPointIds(e)) framePointIds.add(+pid);
+    }
     for (const key in state.points) {
       const p = state.points[key];
       if (!hits(p.x, p.y)) continue;
-      if (!pickFilter.point) continue;   // pick filter 1: points locked
+      if (framePointIds.has(+key)) continue;
       if (!d.crossLayer && !pointEditable(+key)) continue;
       if (d.crossLayer) {
         const uses = pointUses(+key) || [];
@@ -22467,8 +25560,8 @@ function cmdSplitCurve() {
     for (const key in state.entities) {
       const e = state.entities[key];
       if (!e) continue;
-      if (e.type !== 'art' && e.type !== 'array' && e.type !== 'part') continue;
-      if (!pickFilter.loop && e.type !== 'part') continue;   // filter 3: container loop-like terkunci
+      if (e.type !== 'art' && e.type !== 'array' && e.type !== 'part' &&
+        e.type !== 'text' && e.type !== 'image') continue;
       if (!d.crossLayer && !entityEditable(e)) continue;
       const bb = entityBounds(e);
       if (!bb) continue;
@@ -22488,7 +25581,6 @@ function cmdSplitCurve() {
       if (!e || picked.has('entity:' + +key)) continue;
       if (e.type === 'note' || e.type === 'array' || e.type === 'part' ||
         e.type === 'image' || e.type === 'art' || e.type === 'text') continue;
-      if (!pickFilter.line) continue;   // pick filter 2: lines/curves locked
       if (!d.crossLayer && !entityEditable(e)) continue;
       const ids = entityPointIds(e);
       if (!ids.length) continue;
@@ -22498,6 +25590,63 @@ function cmdSplitCurve() {
       if (!(bb.minX >= w0.x - 1e-9 && bb.maxX <= w1.x + 1e-9 &&
         bb.minY >= w0.y - 1e-9 && bb.maxY <= w1.y + 1e-9)) continue;
       picked.set('entity:' + +key, { kind: 'entity', id: +key });
+    }
+    // Pick filter 3 (loop): a closed loop is selectable as a unit even when
+    // its points/lines are locked (keys 1/2) — a marquee covering the whole
+    // loop takes every editable member entity, the same rule the point-less
+    // containers above use. The geometry test is the loop polygon itself (or
+    // the circle's bounding box), so partial marquees still grab nothing.
+    // loopPicked remembers those members: the post-pass below keeps them even
+    // with the line filter off, because the LOOP is what the user selected.
+    const loopPicked = new Set();
+    for (const loop of getLoops()) {
+        let fullyInside = true;
+        if (loop.circle) {
+          const cd = circleData(state.entities[loop.entity]);
+          if (!cd || !(cd.c.x - cd.r >= w0.x - 1e-9 && cd.c.x + cd.r <= w1.x + 1e-9 &&
+            cd.c.y - cd.r >= w0.y - 1e-9 && cd.c.y + cd.r <= w1.y + 1e-9)) fullyInside = false;
+        } else {
+          if (!loop.poly || loop.poly.length < 3) fullyInside = false;
+          else for (const p of loop.poly) {
+            if (!hits(p.x, p.y)) { fullyInside = false; break; }
+          }
+        }
+        if (!fullyInside) continue;
+        const members = loopEntities(loop);
+        if (!members.length) continue;
+        if (!members.every(id => {
+          const e = state.entities[id];
+          if (!e) return false;
+          if (!d.crossLayer && !entityEditable(e)) return false;
+          return true;
+        })) continue;
+        for (const id of members) {
+          picked.set('entity:' + id, { kind: 'entity', id: +id });
+          loopPicked.add(+id);
+        }
+      }
+    // Post-processing: the climb above is purely geometric on purpose (points →
+    // the lines they cover → whole loops, plus containers fully inside), because
+    // that is what "the marquee took this shape" means. The pick filters decide
+    // what the user may END UP with, so they are applied to the FINISHED
+    // selection. A line that belongs to a loop taken as a unit stays even with
+    // the line filter off — that is exactly what filter 3 selected.
+    for (const [key, s] of Array.from(picked)) {
+      if (s.kind === 'point') {
+        if (!pickFilter.point) picked.delete(key);   // filter 1
+        continue;
+      }
+      const e = state.entities[s.id];
+      if (!e) { picked.delete(key); continue; }
+      if (e.type === 'part') continue;               // parts never machine
+      if (e.type === 'art' || e.type === 'text' || e.type === 'image' || e.type === 'array') {
+        if (!pickFilter.loop) picked.delete(key);    // filter 3: containers
+        continue;
+      }
+      // line / arc / circle / spline
+      if (pickFilter.line) continue;                // filter 2
+      if (pickFilter.loop && loopPicked.has(+s.id)) continue;
+      picked.delete(key);
     }
     ui.selection = Array.from(picked.values());
     updateUI();
@@ -22537,6 +25686,338 @@ function cmdSplitCurve() {
     cleanupPoints();
   }
 
+  // Position-only touching test (1e-6 mm) for grid-near candidates. Unlike
+  // pointsTouching it does NOT scan every constraint — coincident-constrained
+  // pairs are fed in separately as explicit candidates, so the hot loops stay
+  // O(1) per candidate instead of O(constraints).
+  function pointsCoincident(a, b) {
+    if (+a === +b) return true;
+    const pa = P(a), pb = P(b);
+    return !!pa && !!pb && Math.hypot(pa.x - pb.x, pa.y - pb.y) <= 1e-6;
+  }
+
+  // Batch-weld point pairs in ONE pass over entities/constraints. The old
+  // per-pair mergePoints rewrote every entity and every constraint per weld,
+  // so joining a big drawing was O(welds × (entities+constraints)); this is
+  // O(pairs + entities + constraints). Semantics are unchanged: pairs resolve
+  // through a redirect chain and each pair is still distance-gated unless
+  // opts.checkDist is false (caller already validated the pairs).
+  function weldPoints(pairs, opts) {
+    const o = opts || {};
+    const redirect = new Map();
+    const rep = (id) => {
+      let cur = +id;
+      while (redirect.has(cur)) cur = redirect.get(cur);
+      return cur;
+    };
+    let welded = 0;
+    for (const [from, to] of pairs) {
+      const a = rep(to), b = rep(from);
+      if (a === b) continue;
+      const q1 = P(a), q2 = P(b);
+      if (!q1 || !q2) continue;
+      if (o.checkDist !== false && Math.hypot(q1.x - q2.x, q1.y - q2.y) >= JOIN_TOL) continue;
+      redirect.set(b, a);
+      welded++;
+    }
+    const killed = new Set();
+    if (!welded) return { welded, killed };
+    const f = (id) => {
+      const n = +id;
+      let cur = n;
+      const seen = [];
+      while (redirect.has(cur)) { seen.push(cur); cur = redirect.get(cur); }
+      if (cur === n) return id;
+      for (const s of seen) redirect.set(s, cur);
+      return cur;
+    };
+    for (const eid in state.entities) {
+      const e = state.entities[eid];
+      if (e.type === 'line') { e.a = f(e.a); e.b = f(e.b); }
+      else if (e.type === 'arc') { e.c = f(e.c); e.s = f(e.s); e.e = f(e.e); }
+      else if (e.type === 'circle') { e.c = f(e.c); }
+      else if (e.type === 'spline') { e.pts = e.pts.map(pid => f(pid)); }
+    }
+    for (const cid in state.constraints) {
+      const c = state.constraints[cid];
+      for (const pk of ['p', 'p1', 'p2']) {
+        if (c[pk] != null) c[pk] = f(c[pk]);
+      }
+    }
+    for (const cid in state.constraints) {
+      const c = state.constraints[cid];
+      if (c.type === 'coincident' && +c.p1 === +c.p2) delete state.constraints[cid];
+    }
+    for (const pid in state.points) {
+      if (f(+pid) !== +pid) killed.add(+pid);
+    }
+    for (const pid of killed) delete state.points[pid];
+    return { welded, killed };
+  }
+
+  // Join open same-colour segments created by a vector import (PDF/CDR/DXF/
+  // SVG): coincident endpoints within JOIN_TOL become one shared point, so
+  // contours arrive connected and machine-ready. Only same-colour line ends
+  // weld — never ends of the SAME entity (a tiny segment must not collapse),
+  // never different colours (different operations), never curves/circles.
+  function joinImportedSegments(entityIds, tol) {
+    const t = isFinite(+tol) && +tol > 0 ? +tol : JOIN_TOL;
+    // Drop exact duplicate segments first (same undirected endpoints, same
+    // colour) — two copies of the same edge would otherwise weld into a
+    // zero-area A→B→A sliver. Clean doubles, THEN join.
+    const segSeen = new Set();
+    const lines = [];
+    for (const eid of entityIds) {
+      const e = state.entities[eid];
+      if (!e || e.type !== 'line') continue;
+      if (+e.a === +e.b) continue;
+      const pa = P(e.a), pb = P(e.b);
+      if (!pa || !pb) continue;
+      const ka = (+pa.x.toFixed(4)) + ',' + (+pa.y.toFixed(4));
+      const kb = (+pb.x.toFixed(4)) + ',' + (+pb.y.toFixed(4));
+      const key = (ka < kb ? ka + '|' + kb : kb + '|' + ka) + '#' + e.color;
+      if (segSeen.has(key)) {
+        // keep only one copy of an exactly duplicated segment
+        delete state.entities[eid];
+        continue;
+      }
+      segSeen.add(key);
+      lines.push(e);
+    }
+    if (lines.length < 2) return 0;
+    // How many segment ends sit at each (near-exact) position. An interior
+    // vertex of a dense polyline has degree 2+; only degree-1 OPEN ends may
+    // be moved by a weld. Without this rule a flattened curve's staircase of
+    // micro-segments welds across its own interior: ends redirect past each
+    // other, segments collapse, and the post-weld cleanup truncates the corner
+    // away from the file's shape.
+    const deg = new Map();
+    const dkey = (p) => (+p.x.toFixed(4)) + ',' + (+p.y.toFixed(4));
+    for (const e of lines) {
+      for (const pid of [e.a, e.b]) {
+        const p = P(pid);
+        if (!p) continue;
+        const k = dkey(p);
+        deg.set(k, (deg.get(k) || 0) + 1);
+      }
+    }
+    const cell = Math.max(t, 1e-4);
+    const segLen = (e) => {
+      const a = P(e.a), b = P(e.b);
+      return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+    };
+    // which entities own each end: two ends joined by ONE segment are that
+    // segment's own ends — welding them (from either perspective) would
+    // collapse it and drag a valid chain end onto its neighbour
+    const owner = new Map();
+    for (const e of lines) {
+      for (const pid of [e.a, e.b]) {
+        const p = P(pid);
+        if (!p) continue;
+        const k = dkey(p);
+        let arr = owner.get(k);
+        if (!arr) owner.set(k, arr = []);
+        arr.push(e);
+      }
+    }
+    const grid = new Map();
+    const put = (pid, pt, color) => {
+      const k = Math.floor(pt.x / cell) + ':' + Math.floor(pt.y / cell);
+      let arr = grid.get(k);
+      if (!arr) { arr = []; grid.set(k, arr); }
+      arr.push({ pid: +pid, color });
+    };
+    for (const e of lines) {
+      put(e.a, P(e.a), e.color);
+      put(e.b, P(e.b), e.color);
+    }
+    const pairs = [];
+    const seen = new Set();
+    for (const e of lines) {
+      const ends = [[e.a, P(e.a)], [e.b, P(e.b)]];
+      for (let i = 0; i < 2; i++) {
+        const pid = ends[i][0], pt = ends[i][1];
+        const cx = Math.floor(pt.x / cell), cy = Math.floor(pt.y / cell);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            const list = grid.get((cx + dx) + ':' + (cy + dy));
+            if (!list) continue;
+            for (const ent of list) {
+              const cid = ent.pid;
+              if (cid <= +pid) continue;
+              // different colours are different operations — never weld them
+              if (ent.color !== e.color) continue;
+              const q = P(cid);
+              if (!q) continue;
+              const d = Math.hypot(pt.x - q.x, pt.y - q.y);
+              if (d > t) continue;
+              // the same entity's own ends must never weld (short-segment guard)
+              const sameEnt = (+e.a === cid && +e.b === pid) || (+e.a === pid && +e.b === cid);
+              if (sameEnt) continue;
+              const key = pid + ':' + cid;
+              if (seen.has(key)) continue;
+              // Within 20% of the tolerance the ends are one point up to file
+              // noise: merge topologically, the survivor keeps its position
+              // (this is what closes imported loops without moving anything).
+              if (d <= Math.max(1e-6, t * 0.2)) {
+                seen.add(key);
+                pairs.push([cid, pid, 0]);
+                continue;
+              }
+              // Across a real distance: never weld the two ends of ONE segment
+              // (an open end a micro-step from its own interior vertex would
+              // eat the step and drag the valid chain end onto it).
+              const oa = owner.get(dkey(pt)), ob = owner.get(dkey(q));
+              if (oa && ob && oa.some(x => ob.includes(x))) continue;
+              // At least one side must be an OPEN end, and ends of segments
+              // LONGER than 20x the tolerance are VALID anchors that never
+              // move: only a short side may snap onto the other's position.
+              const openP = deg.get(dkey(pt)) === 1;
+              const openQ = deg.get(dkey(q)) === 1;
+              if (!openP && !openQ) continue;
+              const longP = segLen(e) > 20 * t;
+              const oq = ob || [];
+              const longQ = oq.some(x => segLen(x) > 20 * t);
+              let mover = 0;
+              if (openP && openQ) {
+                if (longP && longQ) continue;
+                mover = longP ? cid : longQ ? pid
+                  : (segLen(e) <= (oq[0] ? segLen(oq[0]) : 0) ? pid : cid);
+              } else if (openP) {
+                if (longP) continue;
+                mover = pid;
+              } else {
+                if (longQ) continue;
+                mover = cid;
+              }
+              seen.add(key);
+              pairs.push([mover, mover === +pid ? cid : pid, mover]);
+            }
+          }
+        }
+      }
+    }
+    if (!pairs.length) return 0;
+    // Position policy: keep VALID file positions. The mover (short-segment
+    // open end) takes the fixed point's exact coordinates; the survivor of a
+    // coincident merge never moves. No midpoint averaging — nothing invents a
+    // position the file never had.
+    const placed = new Set();
+    for (const [from, to, moverId] of pairs) {
+      if (!moverId || placed.has(moverId)) continue;
+      const mover = P(moverId);
+      const fixed = P(+to);
+      if (!mover || !fixed) continue;
+      mover.x = fixed.x;
+      mover.y = fixed.y;
+      placed.add(moverId);
+    }
+    const welded = weldPoints(pairs, { checkDist: false }).welded;
+    // Post-weld cleanup: once ends are welded together, near-duplicate
+    // segments that were only slightly apart at import become exactly
+    // overlapping — keep a single copy. Also drop any segment that collapsed
+    // onto itself. (i.e. clean doubles AFTER joining, not before.)
+    const seenPost = new Set();
+    for (const e of lines) {
+      const pa = P(e.a), pb = P(e.b);
+      if (!pa || !pb || +e.a === +e.b) {
+        delete state.entities[e.id];
+        continue;
+      }
+      const ka = (+pa.x.toFixed(4)) + ',' + (+pa.y.toFixed(4));
+      const kb = (+pb.x.toFixed(4)) + ',' + (+pb.y.toFixed(4));
+      const key = (ka < kb ? ka + '|' + kb : kb + '|' + ka) + '#' + e.color;
+      if (seenPost.has(key)) { delete state.entities[e.id]; continue; }
+      seenPost.add(key);
+    }
+    // Simplify by walking each same-colour chain end to end and hopping
+    // interior nodes whose whole span stays within the join distance of the
+    // chord between kept nodes. PDF numeric noise quantizes slanted runs into
+    // staircases of micro steps with 90-degree local turns; their deviation
+    // from the run's chord is tiny, so they collapse ("keep the valid ends,
+    // hop the small zigzags"). Nodes ending a segment longer than 20x the
+    // tolerance are VALID anchors and always survive, as do the chain ends;
+    // real corners deviate far from any chord across them and survive too.
+    // The chain is rebuilt between kept nodes, which reuse their exact file
+    // point ids — no incremental rewiring, nothing averaged or moved.
+    const simpTol = t;
+    const adj = new Map();
+    for (const e of lines) {
+      if (!state.entities[e.id]) continue;
+      for (const pid of [e.a, e.b]) {
+        const k = +pid;
+        let arr = adj.get(k);
+        if (!arr) adj.set(k, arr = []);
+        arr.push(e);
+      }
+    }
+    const visited = new Set();
+    let merged = 0;
+    const spanOk = (pts, forced, a, b) => {
+      const ax = pts[a].x, ay = pts[a].y;
+      const cx = pts[b].x - ax, cy = pts[b].y - ay;
+      const L2 = cx * cx + cy * cy;
+      if (L2 < 1e-12) return false;
+      for (let i = a + 1; i < b; i++) {
+        if (forced[i]) return false;
+        let u = ((pts[i].x - ax) * cx + (pts[i].y - ay) * cy) / L2;
+        u = Math.max(0, Math.min(1, u));
+        if (Math.hypot(pts[i].x - (ax + u * cx), pts[i].y - (ay + u * cy)) > simpTol) return false;
+      }
+      return true;
+    };
+    for (const e0 of lines) {
+      if (!state.entities[e0.id] || visited.has(e0.id)) continue;
+      const color = e0.color;
+      const seq = [+e0.a, +e0.b];
+      const chain = [e0];
+      visited.add(e0.id);
+      for (;;) {
+        const tail = seq[seq.length - 1];
+        const nx = (adj.get(tail) || []).find(e => !visited.has(e.id) && e.color === color);
+        if (!nx) break;
+        visited.add(nx.id);
+        chain.push(nx);
+        seq.push(+nx.a === tail ? +nx.b : +nx.a);
+      }
+      for (;;) {
+        const head = seq[0];
+        const nx = (adj.get(head) || []).find(e => !visited.has(e.id) && e.color === color);
+        if (!nx) break;
+        visited.add(nx.id);
+        chain.unshift(nx);
+        seq.unshift(+nx.a === head ? +nx.b : +nx.a);
+      }
+      if (seq.length < 3) continue;
+      const pts = seq.map(id => P(id));
+      if (pts.some(p => !p)) continue;
+      const lens = [];
+      for (let i = 0; i + 1 < pts.length; i++) {
+        lens.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
+      }
+      const forced = pts.map((p, i) =>
+        (i > 0 && lens[i - 1] > 20 * t) || (i < lens.length && lens[i] > 20 * t));
+      const kept = [0];
+      for (let i = 1; i < pts.length - 1; i++) {
+        const a = kept[kept.length - 1];
+        const b = Math.min(i + 1, pts.length - 1);
+        if (forced[i] || i - a > 64 || !spanOk(pts, forced, a, b)) kept.push(i);
+      }
+      kept.push(pts.length - 1);
+      if (kept.length === seq.length) continue;
+      const keepIds = kept.map(i => seq[i]);
+      const keepSet = new Set(keepIds);
+      for (const e of chain) delete state.entities[e.id];
+      for (const id of seq) if (!keepSet.has(id)) delete state.points[id];
+      for (let i = 0; i + 1 < keepIds.length; i++) {
+        const id = newId();
+        state.entities[id] = { id, type: 'line', color, a: keepIds[i], b: keepIds[i + 1] };
+      }
+      merged += seq.length - keepIds.length;
+    }
+    return welded + merged;
+  }
+
   // [Clean up loop] — per-loop weld of doubled points. At every loop junction
   // the two meeting edges usually each carry their own endpoint (a typical DXF
   // arrives as loose segments): when the two sit within JOIN_TOL they become
@@ -22574,43 +26055,145 @@ function cmdSplitCurve() {
   }
 
   function applyWeldPairs(pairs) {
-    // merge through a redirect map: mergePoints deletes the source id and a
-    // later pair may still name it, which has to resolve to the survivor
-    const redirect = new Map();
-    const rep = (id) => {
-      let cur = +id;
-      while (redirect.has(cur)) cur = redirect.get(cur);
-      return cur;
-    };
-    let welded = 0;
-    for (const [from, to] of pairs) {
-      const a = rep(to), b = rep(from);
-      if (a === b) continue;
-      const q1 = P(a), q2 = P(b);
-      if (!q1 || !q2) continue;
-      if (Math.hypot(q1.x - q2.x, q1.y - q2.y) >= JOIN_TOL) continue;
-      mergePoints(b, a);
-      redirect.set(b, a);
-      welded++;
-    }
-    return welded;
+    return weldPoints(pairs).welded;
   }
 
-  function cleanUpLoops() {
-    const pairs = loopWeldPairs(getLoops());
-    if (!pairs.length) {
-      toast('Nothing to clean up \u2014 no doubled points found');
+  // Manual weld with a per-job tolerance from the Weld dialog: the value never
+  // touches the global Settings, so a customer file's export cracks can be
+  // closed without weakening the CNC join tolerance for everything else.
+  // junctionsOnly welds just the doubled nodes around detected loops (safe);
+  // otherwise every same-colour, same-layer segment end within the distance
+  // joins, survivor keeping its exact position.
+  function weldWithTol(tol, junctionsOnly) {
+    const t = isFinite(+tol) && +tol > 0 ? +tol : JOIN_TOL;
+    const pairs = [];
+    if (junctionsOnly) {
+      for (const [from, to] of loopWeldPairs(getLoops())) {
+        const p = P(from), q = P(to);
+        if (p && q && Math.hypot(p.x - q.x, p.y - q.y) <= t) pairs.push([from, to]);
+      }
+    } else {
+      const ends = [];
+      for (const id in state.entities) {
+        const e = state.entities[id];
+        let a, b;
+        if (e.type === 'line') { a = +e.a; b = +e.b; }
+        else if (e.type === 'arc') { a = +e.s; b = +e.e; }
+        else if (e.type === 'spline') {
+          const s = entityPointIds(e).filter(pid => P(pid));
+          if (s.length < 2) continue;
+          a = +s[0]; b = +s[s.length - 1];
+        } else continue;
+        if (a === b) continue;
+        ends.push([a, e], [b, e]);
+      }
+      const cell = Math.max(t, 1e-4);
+      const grid = new Map();
+      for (const [pid, e] of ends) {
+        const p = P(pid);
+        if (!p) continue;
+        const k = Math.floor(p.x / cell) + ':' + Math.floor(p.y / cell);
+        let arr = grid.get(k);
+        if (!arr) grid.set(k, arr = []);
+        arr.push([pid, e]);
+      }
+      const seen = new Set();
+      for (const [pid, e] of ends) {
+        const p = P(pid);
+        if (!p) continue;
+        const cx = Math.floor(p.x / cell), cy = Math.floor(p.y / cell);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            const list = grid.get((cx + dx) + ':' + (cy + dy));
+            if (!list) continue;
+            for (const [qid, e2] of list) {
+              if (qid <= pid) continue;
+              if (e2.color !== e.color || layerOf(e2) !== layerOf(e)) continue;
+              // an entity's own two ends never weld (tiny-segment guard)
+              if (+e2.a === pid || +e2.b === pid) continue;
+              const q = P(qid);
+              if (!q) continue;
+              if (Math.hypot(p.x - q.x, p.y - q.y) > t) continue;
+              const key = pid + ':' + qid;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              pairs.push([qid, pid]);
+            }
+          }
+        }
+      }
+    }
+    if (!pairs.length) return 0;
+    return weldPoints(pairs, { checkDist: false }).welded;
+  }
+
+  function openWeldDialog() {
+    const modal = document.getElementById('weld-modal');
+    if (!modal) return;
+    const tolEl = document.getElementById('weld-tol');
+    if (tolEl) tolEl.value = String(Math.max(JOIN_TOL, LOOP_CLOSE_TOL));
+    const junEl = document.getElementById('weld-junctions');
+    if (junEl) junEl.checked = true;
+    modal.classList.remove('hidden');
+    if (tolEl) { tolEl.focus(); tolEl.select(); }
+  }
+
+  function applyWeldDialog() {
+    const tolEl = document.getElementById('weld-tol');
+    const junEl = document.getElementById('weld-junctions');
+    const tol = tolEl ? parseFloat(tolEl.value) : NaN;
+    if (!isFinite(tol) || tol <= 0) {
+      toast('Enter a weld distance above 0');
       return;
     }
+    const modal = document.getElementById('weld-modal');
+    if (modal) modal.classList.add('hidden');
     pushHistory();
-    const welded = applyWeldPairs(pairs);
+    const welded = weldWithTol(tol, !junEl || junEl.checked);
     if (!welded) {
-      toast('Nothing to clean up \u2014 no doubled points found');
+      history.pop();
+      updateHistoryButtons();
+      toast('Nothing within ' + fmt(tol) + ' mm to weld');
       return;
     }
     invalidateLoops();
     commit();
-    toast('Cleaned up ' + welded + ' doubled point' + (welded === 1 ? '' : 's'));
+    toast('Welded ' + welded + ' point pair' + (welded === 1 ? '' : 's') + ' at ' + fmt(tol) + ' mm');
+  }
+
+  function cleanUpLoops() {
+    // Re-run detection first: the button doubles as "re-detect loops" after a
+    // tolerance change or a customer file whose junctions arrived cracked.
+    invalidateLoops();
+    const loops = getLoops();
+    const closeTol = Math.max(JOIN_TOL, LOOP_CLOSE_TOL || 0);
+    // loopWeldPairs also yields consecutive spline node pairs (meant for the
+    // duplicated closing node only). Without a distance filter those far-apart
+    // nodes would weld and shred the curve — so keep pairs within the closure
+    // tolerance, then weld without re-checking against the narrower JOIN_TOL.
+    const pairs = loopWeldPairs(loops).filter(([from, to]) => {
+      const p = P(from), q = P(to);
+      return p && q && Math.hypot(p.x - q.x, p.y - q.y) <= closeTol;
+    });
+    const report = loops.length + ' closed loop' + (loops.length === 1 ? '' : 's');
+    if (!pairs.length) {
+      toast('Loops re-detected: ' + report + ' — no doubled points to weld');
+      return;
+    }
+    pushHistory();
+    // Junction pairs are already bounded by the loop closure tolerance, so the
+    // weld must not re-check against the (narrower) CNC join tolerance — that
+    // check is what left customer export cracks unwelded.
+    const welded = weldPoints(pairs, { checkDist: false }).welded;
+    if (!welded) {
+      history.pop();
+      updateHistoryButtons();
+      toast('Loops re-detected: ' + report + ' — no doubled points to weld');
+      return;
+    }
+    invalidateLoops();
+    commit();
+    toast('Cleaned up ' + welded + ' doubled point' + (welded === 1 ? '' : 's') + ' · ' + report);
   }
 
   // Joining the two ends of a spline leaves a duplicate point id at the end.
@@ -22758,27 +26341,101 @@ function cmdSplitCurve() {
       if (entityPointIds(e).some(pid => selPts.has(+pid))) affected.add(+eid);
     }
     pushHistory();
-    let ids = pts.slice();
+    let ids = pts.map(Number);
+    // Exactly two non-touching points: weld the SECOND into the FIRST (anchored
+    // at the first endpoint) so the two open ends become one shared point and
+    // the chain closes. Merging to the midpoint instead would yank both ends
+    // together — overlaying an interior point and eating a segment.
+    if (ids.length === 2) {
+      const a = +ids[0], b = +ids[1];
+      if (state.points[a] && state.points[b] && !pointsCoincident(a, b)) {
+        mergePoints(b, a);
+        invalidateLoops();
+        normalizeSplineLoops(affected);
+        cleanupPoints();
+        ui.selection = [{ kind: 'point', id: a }];
+        toast('Points joined');
+        requestSolve();
+        commit();
+        return;
+      }
+    }
     let merged = 0;
-    let changed = true;
-    while (changed) {
-      changed = false;
-      outer:
-      for (let i = 0; i < ids.length; i++) {
-        if (!state.points[ids[i]]) continue;
-        for (let j = i + 1; j < ids.length; j++) {
-          if (!state.points[ids[j]]) continue;
-          if (pointsTouching(ids[i], ids[j])) {
-            mergePoints(ids[j], ids[i]);
-            ids.splice(j, 1);
-            merged++;
-            changed = true;
-            break outer;
+    // Index the selected points by rounded position (cell 1e-6 mm — the same
+    // scale as pointsTouching) and, walking ids in the old ascending order,
+    // merge every later point j that touches the current point i. This is the
+    // EXACT decision sequence of the previous O(n²) rescan (it never merged
+    // through an already-merged away point), only with O(1) candidate lookups
+    // instead of an all-pairs scan.
+    const CELL = 1e-6;
+    const alive = new Set(ids);
+    const byKey = new Map();
+    for (const id of ids) {
+      const p = state.points[id];
+      if (!p) continue;
+      const cx = Math.round(p.x / CELL), cy = Math.round(p.y / CELL);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const k = (cx + dx) + ',' + (cy + dy);
+          let arr = byKey.get(k);
+          if (!arr) { arr = []; byKey.set(k, arr); }
+          arr.push(id);
+        }
+      }
+    }
+    // Coincident constraints can bind points that are far apart: the grid
+    // never pairs them, so add them as explicit candidates (the old scan's
+    // pointsTouching saw them because it tested every pair).
+    const partners = new Map();
+    for (const cid in state.constraints) {
+      const c = state.constraints[cid];
+      if (c.type !== 'coincident') continue;
+      const a = +c.p1, b = +c.p2;
+      if (!alive.has(a) || !alive.has(b)) continue;
+      let la = partners.get(a); if (!la) { la = []; partners.set(a, la); } la.push(b);
+      let lb = partners.get(b); if (!lb) { lb = []; partners.set(b, lb); } lb.push(a);
+    }
+    const cands = [];
+    const pairs = [];
+    for (let ii = 0; ii < ids.length; ii++) {
+      const i = ids[ii];
+      if (!alive.has(i)) continue;
+      const p = state.points[i];
+      if (!p) continue;
+      const cx = Math.round(p.x / CELL), cy = Math.round(p.y / CELL);
+      cands.length = 0;
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const arr = byKey.get((cx + dx) + ',' + (cy + dy));
+          if (arr) {
+            for (const id of arr) {
+              if (id > i && alive.has(id)) cands.push(id);
+            }
+          }
+        }
+      }
+      for (let c = 0; c < cands.length; c++) {
+        const j = cands[c];
+        if (!alive.has(j)) continue;
+        if (pointsCoincident(i, j)) {
+          pairs.push([j, i]);
+          alive.delete(j);
+        }
+      }
+      const pl = partners.get(i);
+      if (pl) {
+        for (const pid of pl) {
+          if (pid > i && alive.has(pid)) {
+            pairs.push([pid, i]);
+            alive.delete(pid);
           }
         }
       }
     }
-    ids = ids.filter(id => state.points[id]);
+    // Apply every merge in one pass — per-pair mergePoints was O(E+C) each.
+    const res = pairs.length ? weldPoints(pairs, { checkDist: false }) : { welded: 0, killed: new Set() };
+    merged = res.welded;
+    ids = ids.filter(id => !res.killed.has(+id) && state.points[id]);
     let target = ids[0];
     if (merged === 0 && ids.length >= 2) {
       let sx = 0;
@@ -22816,6 +26473,32 @@ function cmdSplitCurve() {
     // the gesture is over: the solve below is allowed again
     dragSolveSuppressed = false;
     cancelDragAutoSolve();
+    ui._dragLift = false;
+    // Line draft on touch: the pending point locks on its first release, and the
+    // second-and-later release commits a segment (tap = at the tapped spot,
+    // drag = at the lifted tip).
+    if (ev.pointerType === 'touch' && ui.tool === 'line' &&
+      ui.draft && ui.draft.type === 'line') {
+      const pos = pointerPos(ev);
+      const pp = ui._touchPress;
+      const moved = !!(pp && Math.hypot(pos.x - pp.x, pos.y - pp.y) > 8);
+      const realWorld = s2w(pos.x, pos.y);
+      const endW = moved ? (touchLiftWorld(realWorld, pos, true) || realWorld) : realWorld;
+      const snap = snapFor('line', endW);
+      const end = { x: snap.x, y: snap.y, id: snap.id, midId: snap.midId, lineId: snap.lineId, weld: snap.weld };
+      if (ui._linePressHadDraft) {
+        lineCommitToEnd(end);
+      } else if (ui.draft.a == null) {
+        // position the first point
+        ui.draft.a = end;
+      }
+      ui._linePressHadDraft = false;
+      ui._touching = false;
+      ui._touchPress = null;
+      render();
+      return;
+    }
+    if (ev.pointerType === 'touch') { ui._touching = false; ui._touchPress = null; }
     if (ui.tool === 'curve' && ui.draft && ui.draft.drag) {
       ui.draft.drag = null;
       render();
@@ -22848,6 +26531,7 @@ function cmdSplitCurve() {
       const p = pointerPos(ev);
       const moved = ui.pan.startX != null &&
         (Math.abs(p.x - ui.pan.startX) > 3 || Math.abs(p.y - ui.pan.startY) > 3);
+      const cycleOnClick = ui.pan.cycleOnClick;
       ui.pan = null;
       // A right press in transform mode panned; if it never moved it was a
       // right CLICK, which still means cancel / exit there.
@@ -22858,6 +26542,12 @@ function cmdSplitCurve() {
           else exitTransformMode();
           return;
         }
+      }
+      // Right-click in select mode (no drag) cycles through the stacked
+      // objects at the spot — the old middle-click role, now on right-click.
+      if (cycleOnClick && !moved) {
+        selectBelow(ev);
+        return;
       }
       updateCanvasCursor();
       scheduleViewSave();
@@ -22888,7 +26578,11 @@ function cmdSplitCurve() {
       // dimension is ON — that is the whole point of the setting. This path used
       // to add it unconditionally, so dragging a point with auto dimension off
       // still produced "Coincident constraint added".
-      if (settings.autoDimension !== 'off' &&
+      const weldTarget = (d.moved && d.kind === 'entity' && d.primary != null &&
+        d.snap && d.snap.id != null && d.snap.weld && +d.snap.id !== +d.primary &&
+        state.points[d.primary] && state.points[d.snap.id])
+        ? +d.snap.id : null;
+      if (settings.autoDimension !== 'off' && !weldTarget &&
         d.moved && d.primary != null && d.snap && d.snap.id != null &&
         state.points[d.primary] && state.points[d.snap.id]) {
         if (!constraintExists(c => c.type === 'coincident' &&
@@ -22901,6 +26595,14 @@ function cmdSplitCurve() {
       if (d.moved && (d.kind === 'point' || d.kind === 'entity' || d.kind === 'radius')) {
         solveRelease(d);
         invalidateLoops();
+        updateUI();
+      }
+      // A drop onto the snap-crosshair target WELDS: merge the dragged point
+      // into the target so both become one shared point.
+      if (weldTarget) {
+        weldPoints([[d.primary, weldTarget]], { checkDist: false });
+        invalidateLoops();
+        ui.selection = ui.selection.filter(s => !(s.kind === 'point' && +s.id === +d.primary));
         updateUI();
       }
       if (!ui.drag.moved) {
@@ -22956,24 +26658,41 @@ function cmdSplitCurve() {
       return;
     }
     const pos = pointerPos(ev);
-    const w = s2w(pos.x, pos.y);
-    const factor = Math.exp(-ev.deltaY * 0.0015);
-    const next = clamp(view.zoom * factor, 0.03, 100);
-    if (next === view.zoom) return;
-    if (!ui.zoomBlast) {
-      // first wheel tick of a burst: keep the last fully rendered frame; while
-      // the wheel spins it is blitted scaled instead of re-rendering the scene
-      const snap = frameSnapshot();
-      ui.zoomBlast = snap
-        ? { snap: snap, zoom0: view.zoom, ax: pos.x, ay: pos.y }
-        : null;
+    // Ctrl+wheel = zoom about the cursor (Inkscape-style). Plain wheel pans;
+    // Shift+wheel pans horizontally instead of vertically.
+    if (ev.ctrlKey || ev.metaKey) {
+      const w = s2w(pos.x, pos.y);
+      const factor = Math.exp(-ev.deltaY * 0.0015);
+      const next = clamp(view.zoom * factor, 0.03, 100);
+      if (next === view.zoom) return;
+      if (!ui.zoomBlast) {
+        // first wheel tick of a burst: keep the last fully rendered frame; while
+        // the wheel spins it is blitted scaled instead of re-rendering the scene
+        const snap = frameSnapshot();
+        ui.zoomBlast = snap
+          ? { snap: snap, zoom0: view.zoom, ax: pos.x, ay: pos.y }
+          : null;
+      }
+      view.zoom = next;
+      view.ox = pos.x - w.x * view.zoom;
+      view.oy = pos.y - w.y * view.zoom;
+      markZoomFast();
+      scheduleRender();
+      scheduleZoomSettle();
+      scheduleViewSave();
+      return;
     }
-    view.zoom = next;
-    view.ox = pos.x - w.x * view.zoom;
-    view.oy = pos.y - w.y * view.zoom;
-    markZoomFast();
+    const dv = ev.deltaY || 0;
+    const deltaX = ev.deltaX || 0;
+    if (ev.shiftKey) {
+      // shift+wheel pans horizontally
+      view.ox -= (dv || deltaX);
+    } else {
+      // plain wheel pans vertically
+      view.oy -= dv;
+    }
+    ui.lastWorld = s2w(pos.x, pos.y);
     scheduleRender();
-    scheduleZoomSettle();
     scheduleViewSave();
   }
 
@@ -23238,7 +26957,7 @@ function cmdSplitCurve() {
     }
     // Double-click on a loop: select the loop and everything it encloses —
     // the same selection a Ctrl+click on the loop performs.
-    if (ui.tool === 'select') {
+    if (isSelectLikeTool()) {
       const world = s2w(pos.x, pos.y);
       const loop = pickLoopAt(world, false);
       if (loop) {
@@ -23273,10 +26992,13 @@ function cmdSplitCurve() {
       toast('Measure — double-click it to make it driving first');
       return;
     }
+    const ce0 = c.entity != null ? state.entities[c.entity] : null;
+    const isCir = c.type === 'radius' && ce0 && ce0.type === 'circle';
     const label = c.type === 'angle' ? 'Angle in degrees' :
-      (c.type === 'radius' ? 'Radius (or "rx, ry" for an ellipse)' :
-        (c.kind === 'radius' ? 'Radius' : 'Distance'));
-    const input = prompt(label, fmt(c.value));
+      (isCir ? 'Diameter (or "rx, ry" radii for an ellipse)' :
+        (c.type === 'radius' ? 'Radius (or "rx, ry" for an ellipse)' :
+          (c.kind === 'radius' ? 'Radius' : 'Distance')));
+    const input = prompt(label, fmt(isCir ? c.value * 2 : c.value));
     if (input == null) return;
     if (c.type === 'radius') {
       const pair = parsePairInput(input);
@@ -23318,9 +27040,10 @@ function cmdSplitCurve() {
       return;
     }
     // the new value must not fight the other constraints on the same geometry
-    if (!c.reference && constraintBlocked(Object.assign({}, c, { value }), c.id)) return;
+    const finalValue = isCir ? value / 2 : value;
+    if (!c.reference && constraintBlocked(Object.assign({}, c, { value: finalValue }), c.id)) return;
     pushHistory();
-    c.value = value;
+    c.value = finalValue;
     requestSolve();
     commit();
   }
@@ -23488,19 +27211,19 @@ function cmdSplitCurve() {
   // match: key for .tool-btn[data-tool], #qb-*, [data-quick], [data-cmd].
   const KEYMAP = [
     // Select carries no shortcut: Esc / clicking empty space deselects, so no chip.
-    { key: 'L', label: 'Line', match: 'line', kind: 'tool' },
-    { key: 'K', label: 'Curve', match: 'curve', kind: 'tool' },
-    { key: 'Y', label: 'Poly', match: 'poly', kind: 'tool' },
+    { key: 'Shift+B', chip: 'Sh+B', label: 'Line', match: 'line', kind: 'tool' },
+    { key: 'B', label: 'Curve', match: 'curve', kind: 'tool' },
+    { key: '*', label: 'Poly', match: 'poly', kind: 'tool' },
     { key: 'A', label: 'Arc', match: 'arc', kind: 'tool' },
-    { key: 'C', label: 'Circle', match: 'circle', kind: 'tool' },
-    { key: 'B', label: 'Box', match: 'box', kind: 'tool' },
-    { key: 'W', label: 'Text', match: 'text', kind: 'tool' },
+    { key: 'E', label: 'Circle', match: 'circle', kind: 'tool' },
+    { key: 'R', label: 'Box', match: 'box', kind: 'tool' },
+    { key: 'T', label: 'Text', match: 'text', kind: 'tool' },
     { key: 'I', label: 'Trim', match: 'trim', kind: 'tool' },
-    { key: 'E', label: 'Separate', match: 'separate', kind: 'tool' },
-    { key: 'R', label: 'Transform', match: 'qb-transform', kind: 'cmd' },
+    { key: 'Shift+E', chip: 'Sh+E', label: 'Separate', match: 'separate', kind: 'tool' },
+    { key: 'W', label: 'Drag wall', match: 'dragwall', kind: 'tool' },
+    { key: 'Ctrl+M', chip: 'Ct+M', label: 'Transform', match: 'qb-transform', kind: 'cmd' },
     { key: 'D', label: 'Dimension', match: 'qb-dimension', kind: 'cmd' },
-    { key: 'Shift+D', label: 'Measure', match: 'qb-refdim', kind: 'cmd' },
-    { key: 'Shift+E', label: 'Driving ↔ ref', match: '', kind: 'cmd' },
+    { key: 'Shift+D', chip: 'Sh+D', label: 'Measure', match: 'qb-refdim', kind: 'cmd' },
     { key: 'F', label: 'Fillet', match: 'qb-fillet', kind: 'cmd' },
     { key: 'Shift+F', chip: 'Sh+F', label: 'Fit', match: 'qb-fit', kind: 'cmd' },
     { key: 'J', label: 'Join', match: 'qb-join', kind: 'cmd' },
@@ -23513,22 +27236,34 @@ function cmdSplitCurve() {
     { key: 'Q', label: 'Equal', match: 'equal', kind: 'cmd' },
     { key: '.', label: 'Anchor', match: 'anchor', kind: 'cmd' },
     { key: 'M', label: 'Midpoint', match: 'midpoint', kind: 'cmd' },
-    { key: 'T', label: 'Tangent', match: 'tangent', kind: 'cmd' },
+    { key: 'G', label: 'Tangent', match: 'tangent', kind: 'cmd' },
     { key: 'Z', label: 'Clean', match: 'rb-clean', kind: 'cmd' },
     { key: 'N', label: 'Connected', match: 'btn-connected', kind: 'cmd' },
-    { key: 'G', label: 'Grid', match: 'tgl-grid', kind: 'toggle' },
-    { key: 'S', label: 'Snap', match: 'tgl-snap', kind: 'toggle' },
+    { key: '#', label: 'Grid', match: 'tgl-grid', kind: 'toggle' },
+    { key: '%', chip: 'Shift+5', label: 'Snap', match: 'tgl-snap', kind: 'toggle' },
     { key: 'F9', label: 'Solve', match: '', kind: 'cmd' },
+    { key: 'F1', label: 'Select / Move', match: '', kind: 'cmd' },
+    { key: 'F2', label: 'Node edit', match: '', kind: 'cmd' },
+    { key: 'F3', label: 'Junction points', match: '', kind: 'cmd' },
+    { key: '3', label: 'Fit selection', match: '', kind: 'cmd' },
+    { key: 'Alt+1', label: 'Pick: points', match: '', kind: 'cmd' },
+    { key: 'Alt+2', label: 'Pick: lines', match: '', kind: 'cmd' },
+    { key: 'Alt+3', label: 'Pick: loops', match: '', kind: 'cmd' },
     { key: 'Alt+T', label: 'Mate', match: 'rb-mate', kind: 'cmd' },
     { key: 'Alt+Q', label: 'CNC', match: 'qb-cnc', kind: 'cmd' },
     { key: 'Alt+C', label: 'Biaya', match: 'qb-cost', kind: 'cmd' },
     { key: 'Alt+R', label: 'Frame L/T/W/H', match: '', kind: 'cmd' },
     { key: '?', label: 'Help', match: '', kind: 'cmd' },
-    { key: 'Shift+Z', label: 'Shortcuts', match: '', kind: 'cmd' },
+    { key: 'Shift+Z', chip: 'Sh+Z', label: 'Shortcuts', match: '', kind: 'cmd' },
+    { key: 'Shift+L', chip: 'Sh+L', label: 'Re-detect loops', match: 'btn-clean-loops', kind: 'cmd' },
+    { key: 'Alt+W', chip: 'Alt+W', label: 'Weld', match: 'qb-weld', kind: 'cmd' },
     // Ctrl chords: chip text shortened to Ct+ so wide chords fit the button.
     // Full form stays in title/tooltip/help.
-    { key: 'Ctrl+O', chip: 'Ct+O', label: 'Offset', match: 'qb-offset', kind: 'cmd' },
-    { key: 'Ctrl+M', chip: 'Ct+M', label: 'Move', match: 'qb-move', kind: 'cmd' },
+    { key: 'Ctrl+J', chip: 'Ct+J', label: 'Offset', match: 'qb-offset', kind: 'cmd' },
+    { key: 'Ctrl+K', chip: 'Ct+K', label: 'Fit curve (fewer nodes)', match: '', kind: 'cmd' },
+    { key: 'Ctrl+[', chip: 'Ct+[', label: 'Rotate 90 ↺', match: '', kind: 'cmd' },
+    { key: 'Ctrl+]', chip: 'Ct+]', label: 'Rotate 90 ↻', match: '', kind: 'cmd' },
+    { key: 'Ctrl+Shift+M', chip: 'Ct+Sh+M', label: 'Move', match: 'qb-move', kind: 'cmd' },
     { key: 'Ctrl+G', chip: 'Ct+G', label: 'Group', match: 'rb-group', kind: 'cmd' },
     { key: 'Ctrl+U', chip: 'Ct+U', label: 'Ungroup', match: 'rb-ungroup', kind: 'cmd' },
     { key: 'Ctrl+L', chip: 'Ct+L', label: 'Clone', match: 'rb-clone', kind: 'cmd' },
@@ -23556,6 +27291,23 @@ function cmdSplitCurve() {
     }
   }
 
+  let pendingImportMode = 'replace';
+
+  // Collapse / expand the left edit+layers stack (#stage-left). Defined here
+  // at module scope so both the tab button (bindUI) and the Tab key
+  // (onKeyDown) can call it; state persists across reloads.
+  function toggleStageLeft() {
+    const wrap = document.getElementById('stage-left');
+    const tab = document.getElementById('stage-left-tab');
+    if (!wrap || !tab) return;
+    const KEY = 'minisketch.stageLeftCollapsed';
+    const collapsed = !wrap.classList.contains('collapsed');
+    wrap.classList.toggle('collapsed', collapsed);
+    tab.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    try { localStorage.setItem(KEY, collapsed ? '1' : '0'); } catch (err) { /* ignore */ }
+    resize();
+  }
+
   function onKeyDown(ev) {
     const key = ev.key;
     const lower = key.toLowerCase();
@@ -23571,7 +27323,7 @@ function cmdSplitCurve() {
         !!(ev.target.closest && ev.target.closest('.modal'));
       if (!(clipCombo && !editingText)) return;
     }
-    if (ui.offsetJob && !((ev.ctrlKey || ev.metaKey) && lower === 'o')) {
+    if (ui.offsetJob && !((ev.ctrlKey || ev.metaKey) && lower === 'j')) {
       if (key === 'Escape') {
         ev.preventDefault();
         cancelOffset();
@@ -23581,11 +27333,17 @@ function cmdSplitCurve() {
       }
       return;
     }
-    // Plasticity-style pick filter: 1 = points, 2 = lines, 3 = loops. Plain
-    // digits only — with Ctrl/Alt the chord shortcuts keep their meaning.
-    if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && (key === '1' || key === '2' || key === '3')) {
+    // Inkscape-style pick filter: Alt+1 = points, Alt+2 = lines, Alt+3 = loops.
+    // Plain 3 is free now and means fit-selection (handled just below).
+    if (ev.altKey && !ev.ctrlKey && !ev.metaKey && (key === '1' || key === '2' || key === '3')) {
       ev.preventDefault();
       setPickFilter({ '1': 'point', '2': 'line', '3': 'loop' }[key], !pickFilter[{ '1': 'point', '2': 'line', '3': 'loop' }[key]]);
+      return;
+    }
+    // Plain 3 = fit the selection (Inkscape-style zoom to selection).
+    if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && key === '3') {
+      ev.preventDefault();
+      fitSelection();
       return;
     }
     // Ctrl+T opens a browser tab and the page cannot stop it (like Ctrl+N):
@@ -23607,18 +27365,32 @@ function cmdSplitCurve() {
       ev.preventDefault();
       return;
     }
-    if ((ev.ctrlKey || ev.metaKey) && lower === 'o') {
+    if ((ev.ctrlKey || ev.metaKey) && lower === 'j') {
       ev.preventDefault();
       startOffset();
       return;
     }
     if ((ev.ctrlKey || ev.metaKey) && lower === 'm') {
       ev.preventDefault();
-      startMoveJob();
+      if (ev.shiftKey) startMoveJob();
+      else enterTransformMode();
+      return;
+    }
+    // Ctrl+] = rotate 90° CW, Ctrl+[ = rotate 90° CCW — the Inkscape/CorelDRAW
+    // standard, wired to the same quickRotate the ribbon buttons use.
+    if ((ev.ctrlKey || ev.metaKey) && (key === '[' || key === ']')) {
+      ev.preventDefault();
+      quickRotate(key === '[' ? 90 : -90);
       return;
     }
     if (key === ' ') {
       ev.preventDefault();
+      // Space at the arc's third point toggles between an arc and a full
+      // circle through the three points.
+      if (ui.tool === 'arc' && ui.draft && ui.draft.type === 'arc' && ui.draft.stage === 2) {
+        ui.draft.fullCircle = !ui.draft.fullCircle;
+        render();
+      }
       return;
     }
     if (ui.transform.pending) {
@@ -23638,6 +27410,21 @@ function cmdSplitCurve() {
       }
       return;
     }
+    if (key === 'F1') {
+      ev.preventDefault();
+      setMode('select');
+      return;
+    }
+    if (key === 'F2') {
+      ev.preventDefault();
+      setMode('node');
+      return;
+    }
+    if (key === 'F3') {
+      ev.preventDefault();
+      cmdSelectJunctionPoints();
+      return;
+    }
     if (key === 'F9') {
       ev.preventDefault();
       solveAll();
@@ -23648,7 +27435,29 @@ function cmdSplitCurve() {
       createNote();
       return;
     }
+    // Plain Tab (no Ctrl/Shift/Alt) toggles the whole LEFT panel — the edit
+    // grid + the Layers card, i.e. the #stage-left stack. It reuses the same
+    // toggle as the slim tab button so state stays in sync and persists. When
+    // a modal is open Tab cycles its fields instead, so never steal it there.
+    // Field focus (INPUT/TEXTAREA/SELECT) is already excluded by the guard at
+    // the top of this handler. Shift+Tab keeps the browser's native backward-
+    // focus navigation.
+    if (key === 'Tab' && !ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey) {
+      if (!activeModal()) {
+        ev.preventDefault();
+        toggleStageLeft();
+      }
+      return;
+    }
     if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown') {
+      // While dragging a clones-only selection, Left/Right turn it 5° per press
+      // (the classic wall turns with it). Other drags keep the nudge behaviour.
+      if ((key === 'ArrowLeft' || key === 'ArrowRight') && ui.drag) {
+        if (rotateDragClones(ui.drag, key === 'ArrowLeft' ? -5 : 5)) {
+          ev.preventDefault();
+          return;
+        }
+      }
       if (ui.draft) {
         // drafting: the arrows shift the view by one scale-bar unit (the "100 mm"
         // shown bottom left) instead of nudging points
@@ -23666,6 +27475,11 @@ function cmdSplitCurve() {
       const dx = key === 'ArrowLeft' ? -s : key === 'ArrowRight' ? s : 0;
       const dy = key === 'ArrowUp' ? -s : key === 'ArrowDown' ? s : 0;
       if (nudgeSelection(dx, dy)) ev.preventDefault();
+      return;
+    }
+    if (ev.altKey && !ev.ctrlKey && !ev.metaKey && lower === 'w') {
+      ev.preventDefault();
+      openWeldDialog();
       return;
     }
     if (ev.altKey && lower === 'q') {
@@ -23775,9 +27589,18 @@ function cmdSplitCurve() {
       downloadSketch(false);
       return;
     }
+    if ((ev.ctrlKey || ev.metaKey) && lower === 'o') {
+      ev.preventDefault();
+      pendingImportMode = 'replace';
+      if (pickSketchFileHook) pickSketchFileHook();
+      else fileInput.click();
+      return;
+    }
     if ((ev.ctrlKey || ev.metaKey) && lower === 'i') {
       ev.preventDefault();
-      fileInput.click();
+      pendingImportMode = 'merge';
+      if (pickSketchFileHook) pickSketchFileHook();
+      else fileInput.click();
       return;
     }
     if ((ev.ctrlKey || ev.metaKey) && lower === 'e') {
@@ -23870,14 +27693,19 @@ function cmdSplitCurve() {
       fitView();
       return;
     }
-    // P0-1: Shift+E toggles driving <-> reference on the selected dimension.
-    // Plain E is the Separate tool only — overloading one letter for two jobs
-    // (tool vs constraint toggle) was invisible in the UI.
-    if (ev.shiftKey && lower === 'e') {
+    // P0-1: Shift+D is now contextual — a selected dimension badge toggles
+    // driving <-> reference; otherwise it adds a Measure (reference dimension).
+    // The old Shift+E toggle moved here. Plain E is the Circle tool now (Shift+E
+    // is Separate), so there is no room for a separate letter toggle.
+    if (ev.shiftKey && lower === 'd') {
       const dims = selectedConstraintIds().filter(cid => isDimensionConstraint(state.constraints[cid]));
-      if (dims.length) toggleDimensionReference(dims[0]);
-      else toast('Select a dimension first, then Shift+E toggles driving ↔ reference');
-      return;
+      if (dims.length) {
+        toggleDimensionReference(dims[0]);
+        return;
+      }
+      // No badge selected: fall through to case 'd', which reads ev.shiftKey
+      // and adds a Measure. (The old unconditional return swallowed this path,
+      // so Shift+D did nothing on a clean selection.)
     }
     // P0-1: Shift+Z opens the shortcut panel. Plain Z is Clean only — the old
     // "Z also selects leftovers" overload is gone; Clean with no selection
@@ -23886,18 +27714,63 @@ function cmdSplitCurve() {
       openHelpModal();
       return;
     }
+    if (ev.shiftKey && lower === 'l') {
+      ev.preventDefault();
+      cleanUpLoops();
+      return;
+    }
     switch (lower) {
-      case 'l': cmdLineFromPoints(); break;
       case 'a': setTool('arc'); break;
-      case 'c': setTool('circle'); break;
-      case 'b': setTool('box'); break;
-      case 'z': cmdCleanSelection(); break;
+      case 'b':
+        // Shift+B = line (the old L); plain B = curve/pen (old K)
+        if (ev.shiftKey) cmdLineFromPoints();
+        else setTool('curve');
+        break;
+      case 'e':
+        // Shift+E = separate; plain E = circle (old C)
+        if (ev.shiftKey) setTool('separate');
+        else setTool('circle');
+        break;
+      case 'r': setTool('box'); break;            // R = box (old B)
+      case 'w':                                    // W = drag wall (toggle)
+        setTool(ui.tool === 'dragwall' ? 'select' : 'dragwall');
+        break;
+      case '+': case '=': {                        // +/- = wall thickness (wheel is zoom/pan)
+        if (ui.tool !== 'dragwall') break;
+        const step = (ev.shiftKey || ui.shiftToggle) ? 0.1 : ((ev.altKey || ui.altToggle) ? 1 : 0.5);
+        settings.wallDragMm = clamp(Math.round((+settings.wallDragMm + step) * 100) / 100, 0, 50);
+        applySettings();
+        saveSettings();
+        updateUI();
+        render();
+        return;
+      }
+      case '-': case '_': {
+        if (ui.tool !== 'dragwall') break;
+        const step = (ev.shiftKey || ui.shiftToggle) ? 0.1 : ((ev.altKey || ui.altToggle) ? 1 : 0.5);
+        settings.wallDragMm = clamp(Math.round((+settings.wallDragMm - step) * 100) / 100, 0, 50);
+        applySettings();
+        saveSettings();
+        updateUI();
+        render();
+        return;
+      }
+      case 't': setTool('text'); break;           // T = text (old W)
+      case 'g': cmdTangent(); break;              // G = tangent (old T; grid moved to #)
+      case '*': setTool('poly'); break;           // * = poly/star (old Y)
+      case '#':                                    // # = grid (old G)
+        ui.showGrid = !ui.showGrid;
+        syncViewToggles();
+        render();
+        break;
+      case '%':                                    // % (Shift+5) = snap (old S)
+      case 's':                                    // S kept as a snap alias
+        ui.snap = !ui.snap;
+        syncViewToggles();
+        break;
       case 'i': setTool('trim'); break;
-      case 't': cmdTangent(); break;
-      case 'e': setTool('separate'); break;
-      case 'k': setTool('curve'); break;
-      case 'y': setTool('poly'); break;
       case 'n': cmdSelectConnected(); break;
+      case 'z': cmdCleanSelection(); break;
       case 'j': cmdJoinPoints(); break;
       case 'o': cmdCoincident(); break;
       case 'h': cmdLineAxis('horizontal'); break;
@@ -23905,21 +27778,15 @@ function cmdSplitCurve() {
       case 'p': cmdLinePair('parallel'); break;
       case '[': cmdLinePair('perpendicular'); break;
       case 'q': cmdLinePair('equal'); break;
-      case 'r': enterTransformMode(); break;
       case '.': cmdAnchor(); break;
       case 'm': cmdMidpoint(); break;
-      case 'd': createDimension({ reference: ev.shiftKey }); break;
+      case 'd': {
+        // D = driving dimension; Shift+D (with no dimension selected) = Measure.
+        // The badge-toggle case is handled earlier in this keydown.
+        createDimension({ reference: ev.shiftKey });
+        break;
+      }
       case 'f': cmdFillet(); break;
-      case 'w': setTool('text'); break;
-      case 'g':
-        ui.showGrid = !ui.showGrid;
-        syncViewToggles();
-        render();
-        break;
-      case 's':
-        ui.snap = !ui.snap;
-        syncViewToggles();
-        break;
       default: break;
     }
   }
@@ -24103,6 +27970,10 @@ function cmdSplitCurve() {
     ui.focusLoop = null;
     ui.solverCost = null;
     ui.draft = null;
+    // a demo is not a file: the next Save must ask, not overwrite the
+    // document that was open before
+    save.handle = null;
+    setFileName(null);
     invalidateLoops();
     requestSolve();
     fitView();
@@ -24136,6 +28007,7 @@ function cmdSplitCurve() {
     scope: 'selected',
     tol: 0.05,
     chain: true,
+    route: 'classic',
     ws: null,
     busy: false
   };
@@ -24160,68 +28032,100 @@ function cmdSplitCurve() {
     return null;
   }
 
-  // True when every vertex of `inner` lies strictly inside `outer` (bbox quick
-  // reject, then a ray-cast point-in-polygon per vertex). A nested loop that is
-  // wholly inside another loop is part of the same filled body.
-  function loopContainedIn(inner, outer) {
+  // One bbox per loop, computed once per loops-array identity — loopDepthOf
+  // and loopContainedIn then reject far-apart pairs with four number
+  // compares instead of re-scanning both polygons every time.
+  function loopBox(loop) {
+    const poly = loop.poly;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of poly) {
+      if (p.x < x0) x0 = p.x;
+      if (p.y < y0) y0 = p.y;
+      if (p.x > x1) x1 = p.x;
+      if (p.y > y1) y1 = p.y;
+    }
+    return { x0, y0, x1, y1 };
+  }
+
+  // True when `inner` lies wholly inside `outer`. A closed inner loop is
+  // contained iff its bbox fits, one interior point is inside, and its boundary
+  // never crosses the outer boundary (Jordan curve theorem). The old test ray-
+  // cast EVERY inner vertex against the outer polygon — O(n*m) per pair, which
+  // dominated drag-release on dense splines (4426 verts / 14 loops). The boundary
+  // sweep below rejects almost every segment pair by bbox first, so nested loops
+  // with margin cost near O(n+m) instead of O(n*m) pointInPoly calls.
+  function loopContainedIn(inner, outer, ib, ob) {
     if (!inner || !outer || inner === outer) return false;
     const ip = inner.poly, op = outer.poly;
     if (!ip || ip.length < 3 || !op || op.length < 3) return false;
-    let ix0 = Infinity, iy0 = Infinity, ix1 = -Infinity, iy1 = -Infinity;
-    for (const p of ip) { if (p.x < ix0) ix0 = p.x; if (p.y < iy0) iy0 = p.y; if (p.x > ix1) ix1 = p.x; if (p.y > iy1) iy1 = p.y; }
-    let ox0 = Infinity, oy0 = Infinity, ox1 = -Infinity, oy1 = -Infinity;
-    for (const p of op) { if (p.x < ox0) ox0 = p.x; if (p.y < oy0) oy0 = p.y; if (p.x > ox1) ox1 = p.x; if (p.y > oy1) oy1 = p.y; }
-    if (ix0 < ox0 || iy0 < oy0 || ix1 > ox1 || iy1 > oy1) return false;
-    // Column vertices are nudged a hair toward their centroid before the
-    // point-in-polygon test, so a loop whose edge sits exactly ON the
-    // container's boundary is still read as contained (raw boundary points are
-    // ambiguous to the ray cast).
-    let ccx = 0, ccy = 0;
-    for (const p of ip) { ccx += p.x; ccy += p.y; }
-    ccx /= ip.length; ccy /= ip.length;
-    const eps = Math.max(ix1 - ix0, iy1 - iy0) * 1e-4 + 1e-9;
-    for (const p of ip) {
-      const dx = ccx - p.x, dy = ccy - p.y;
-      const L = Math.hypot(dx, dy);
-      if (!L) { if (!pointInPoly(p, op)) return false; continue; }
-      const q = { x: p.x + dx / L * eps, y: p.y + dy / L * eps };
-      if (!pointInPoly(q, op)) return false;
+    let ix0, iy0, ix1, iy1, ox0, oy0, ox1, oy1;
+    if (ib && ob) {
+      ix0 = ib.x0; iy0 = ib.y0; ix1 = ib.x1; iy1 = ib.y1;
+      ox0 = ob.x0; oy0 = ob.y0; ox1 = ob.x1; oy1 = ob.y1;
+    } else {
+      ix0 = Infinity; iy0 = Infinity; ix1 = -Infinity; iy1 = -Infinity;
+      for (const p of ip) { if (p.x < ix0) ix0 = p.x; if (p.y < iy0) iy0 = p.y; if (p.x > ix1) ix1 = p.x; if (p.y > iy1) iy1 = p.y; }
+      ox0 = Infinity; oy0 = Infinity; ox1 = -Infinity; oy1 = -Infinity;
+      for (const p of op) { if (p.x < ox0) ox0 = p.x; if (p.y < oy0) oy0 = p.y; if (p.x > ox1) ox1 = p.x; if (p.y > oy1) oy1 = p.y; }
     }
-    return true;
+    if (ix0 < ox0 || iy0 < oy0 || ix1 > ox1 || iy1 > oy1) return false;
+    if (!pointInPoly(interiorProbe(ip), op)) return false;
+    return !polysCross(ip, op);
   }
 
-  // The loops that carry an explicit gray/yellow fill, cached per loops-array
-  // identity. loopFill's inheritance pass only needs to consider these (they
-  // are few), instead of scanning every loop — the O(loops²) cost on large
-  // files.
-  let filledLoopsCacheLoops = null;
-  let filledLoopsCache = [];
-  function filledLoopsList() {
-    const loops = getLoops();
-    if (filledLoopsCacheLoops !== loops) {
-      filledLoopsCacheLoops = loops;
-      filledLoopsCache = loops.filter(l => filledFillOf(l));
+  // Do two closed polygons' boundaries cross? Outer segments are bucketed into
+  // Y bands once, so each inner segment only tests the bands it spans (then a
+  // bbox reject before the inclusive orientation test). Nested loops with
+  // margin therefore skip nearly every pair instead of scanning all n*m — the
+  // old per-vertex ray-cast was O(n*m) pointInPoly and dominated drag-release.
+  function polysCross(ip, op) {
+    const n = ip.length, m = op.length;
+    let y0 = Infinity, y1 = -Infinity;
+    const segs = new Array(m);
+    for (let j = 0; j < m; j++) {
+      const c = op[j], d = op[(j + 1) % m];
+      const sy0 = Math.min(c.y, d.y), sy1 = Math.max(c.y, d.y);
+      segs[j] = { a: c, b: d, x0: Math.min(c.x, d.x), x1: Math.max(c.x, d.x), y0: sy0, y1: sy1 };
+      if (sy0 < y0) y0 = sy0;
+      if (sy1 > y1) y1 = sy1;
     }
-    return filledLoopsCache;
+    const bands = Math.max(1, Math.min(256, Math.ceil(m / 4)));
+    const h = (y1 - y0) / bands || 1;
+    const grid = new Array(bands);
+    for (let b = 0; b < bands; b++) grid[b] = [];
+    for (const s of segs) {
+      const b0 = Math.max(0, Math.floor((s.y0 - y0) / h));
+      const b1 = Math.min(bands - 1, Math.floor((s.y1 - y0) / h));
+      for (let b = b0; b <= b1; b++) grid[b].push(s);
+    }
+    for (let i = 0; i < n; i++) {
+      const a = ip[i], b = ip[(i + 1) % n];
+      const ax0 = Math.min(a.x, b.x), ax1 = Math.max(a.x, b.x);
+      const ay0 = Math.min(a.y, b.y), ay1 = Math.max(a.y, b.y);
+      const b0 = Math.max(0, Math.floor((ay0 - y0) / h));
+      const b1 = Math.min(bands - 1, Math.floor((ay1 - y0) / h));
+      for (let bb = b0; bb <= b1; bb++) {
+        for (const s of grid[bb]) {
+          if (ax0 > s.x1 || ax1 < s.x0 || ay0 > s.y1 || ay1 < s.y0) continue;
+          if (segmentsIntersect(a, b, s.a, s.b)) return true;
+        }
+      }
+    }
+    return false;
   }
 
   // Per-loop fill (drives the offset flip inside KaryaCNC). A loop with no
-  // fill of its own inherits the fill of the smallest filled loop that fully
-  // contains it — so a nested loop inside a filled body reads as filled too
+  // fill of its own inherits the fill of the nearest filled ancestor in the
+  // LoopTree — so a nested loop inside a filled body reads as filled too
   // instead of staying blank.
   function loopFill(loop) {
     if (!loop) return 'none';
     const own = filledFillOf(loop);
     if (own) return own;
-    if (loop.poly && loop.poly.length >= 3) {
-      let best = null, bestArea = Infinity;
-      for (const other of filledLoopsList()) {
-        if (other === loop || !(other.area > loop.area) || other.area >= bestArea) continue;
-        if (!loopContainedIn(loop, other)) continue;
-        bestArea = other.area;
-        best = filledFillOf(other);
-      }
-      if (best) return best;
+    loopTree();
+    for (let p = loop.parent; p; p = p.parent) {
+      const f = filledFillOf(p);
+      if (f) return f;
     }
     return 'none';
   }
@@ -24260,6 +28164,7 @@ function cmdSplitCurve() {
       if (isFinite(saved.port)) cnc.port = clamp(Math.round(+saved.port), 1, 65535);
       if (saved.scope === 'visible' || saved.scope === 'selected' || saved.scope === 'active') cnc.scope = saved.scope;
       if (typeof saved.chain === 'boolean') cnc.chain = saved.chain;
+      if (saved.route === 'classic' || saved.route === 'json') cnc.route = saved.route;
       // One-time migration: move the old private copy into the shared setting,
       // then rewrite the record without it so this cannot happen again.
       if (isFinite(saved.tol)) {
@@ -24289,7 +28194,7 @@ function cmdSplitCurve() {
     }
     try {
       localStorage.setItem(CNC_KEY, JSON.stringify({
-        host: cnc.host, port: cnc.port, scope: cnc.scope, chain: cnc.chain
+        host: cnc.host, port: cnc.port, scope: cnc.scope, chain: cnc.chain, route: cnc.route
       }));
     } catch (err) { /* ignore */ }
   }
@@ -24421,7 +28326,7 @@ function cmdSplitCurve() {
     const scope = (cnc.scope === 'selected' && !selectedEntitiesForExport().length)
       ? 'visible'
       : cnc.scope;
-    const items = cncChains(cncCollectItems(scope));
+    const items = cncChains(cncCollectItems(scope, { dedupe: true }));
     const p = cost.presets[cost.presetIdx] || null;
     const cutSpeed = p && p.speed > 0 ? p.speed : 10;
     let cut = 0;          // mm at the cut speed
@@ -24853,6 +28758,8 @@ function cmdSplitCurve() {
       used[s] = true;
       const seed = open[s];
       const group = seed.group;
+      let wmax = seed.sortWeight || 0;
+      let dmax = seed.depth || 0;
       let pts = seed.pts.slice();
       // grow at the tail
       for (let guard = 0; guard < N + 2; guard++) {
@@ -24861,6 +28768,8 @@ function cmdSplitCurve() {
         const hit = findNext(key(tail), group);
         if (!hit) break;
         used[hit.i] = true;
+        wmax = Math.max(wmax, open[hit.i].sortWeight || 0);
+        dmax = Math.max(dmax, open[hit.i].depth || 0);
         const add = oriented(open[hit.i], hit.end);
         for (let k = 1; k < add.length; k++) pts.push(add[k]);
       }
@@ -24871,6 +28780,8 @@ function cmdSplitCurve() {
         const hit = findNext(key(head), group);
         if (!hit) break;
         used[hit.i] = true;
+        wmax = Math.max(wmax, open[hit.i].sortWeight || 0);
+        dmax = Math.max(dmax, open[hit.i].depth || 0);
         // add ends at the matching point; the rest prepends far-end first.
         // (The old .reverse() here flipped the segment and made the chain jump
         // across the shape — raw sends disagreed with the baked contours.)
@@ -24879,7 +28790,7 @@ function cmdSplitCurve() {
         pts = prep.concat(pts);
       }
       const closed = pts.length > 2 && key(pts[0]) === key(pts[pts.length - 1]);
-      out.push({ color: seed.color, fill: seed.fill, pts, closed });
+      out.push({ color: seed.color, fill: seed.fill, pts, closed, sortWeight: wmax, depth: dmax });
     }
     return out;
   }
@@ -24961,8 +28872,10 @@ function cmdSplitCurve() {
     return out.length ? out : null;
   }
 
-  function cncCollectItems(scopeOverride) {
+  function cncCollectItems(scopeOverride, mode) {
     const scope = scopeOverride || cnc.scope;
+    const dedupe = !!(mode && mode.dedupe);
+    const segSeen = dedupe ? new Set() : null;
     const selIds = new Set(selectedEntitiesForExport().map(e => +e.id));
     const opts = {
       onlySelected: scope === 'selected',
@@ -25007,7 +28920,7 @@ function cmdSplitCurve() {
             }
             const col = cncColorStroke(shape.color);
             const fl = (shape.fill === 'gray' || shape.fill === 'yellow') ? shape.fill : fill;
-            list.push({ color: col, fill: fl, group: col + '|' + fl, pts, closed: shape.closed });
+            list.push({ color: col, fill: fl, group: col + '|' + fl, pts, closed: shape.closed, sortWeight: e.sortWeight || 0, depth: e.depth || 0 });
             any = true;
           }
         }
@@ -25016,7 +28929,7 @@ function cmdSplitCurve() {
             const pts = cncCleanPts(loop.pts.map(p => [p.x, p.y]));
             if (pts.length < (loop.closed ? 3 : 2)) continue;
             if (loop.closed) pts.push([pts[0][0], pts[0][1]]);
-            list.push({ color, fill, group: color + '|' + fill, pts, closed: loop.closed });
+            list.push({ color, fill, group: color + '|' + fill, pts, closed: loop.closed, sortWeight: e.sortWeight || 0, depth: e.depth || 0 });
             any = true;
           }
         }
@@ -25039,7 +28952,7 @@ function cmdSplitCurve() {
           } else if (pts.length < 2) {
             continue;
           }
-          list.push({ color, fill, group: color + '|' + fill, pts, closed: outline.closed });
+          list.push({ color, fill, group: color + '|' + fill, pts, closed: outline.closed, sortWeight: e.sortWeight || 0, depth: e.depth || 0 });
           any = true;
         }
         if (!any) cnc.skippedText++;
@@ -25072,7 +28985,7 @@ function cmdSplitCurve() {
             }
             const color = cncColorStroke(sh.color || colorOf(e));
             const fill = sh.fill || baseFill;
-            list.push({ color, fill, group: color + '|' + fill, pts, closed });
+            list.push({ color, fill, group: color + '|' + fill, pts, closed, sortWeight: e.sortWeight || 0, depth: e.depth || 0 });
           }
         }
         continue;
@@ -25096,7 +29009,18 @@ function cmdSplitCurve() {
       }
       const color = cncColorStroke(colorOf(e));
       const fill = (e.fill === 'gray' || e.fill === 'yellow') ? e.fill : 'none';
-      list.push({ color, fill, group: color + '|' + fill, pts, closed });
+      // Both routes must send clean data: drop duplicate segments (same
+      // undirected endpoint pair, same colour/fill). The text route once
+      // relied on KaryaCNC's own join to absorb these, but that leaves
+      // artefacts (missing/overdrawn lines) — send clean from here.
+      if (segSeen && pts.length === 2) {
+        const ka = (+pts[0][0].toFixed(4)) + ',' + (+pts[0][1].toFixed(4));
+        const kb = (+pts[1][0].toFixed(4)) + ',' + (+pts[1][1].toFixed(4));
+        const key = (ka < kb ? ka + '|' + kb : kb + '|' + ka) + '#' + color + '|' + fill;
+        if (segSeen.has(key)) continue;
+        segSeen.add(key);
+      }
+      list.push({ color, fill, group: color + '|' + fill, pts, closed, sortWeight: e.sortWeight || 0, depth: e.depth || 0 });
     }
     return cncChains(list);
   }
@@ -25154,6 +29078,57 @@ function cmdSplitCurve() {
       points,
       width: maxX - minX,
       height: maxY - minY
+    };
+  }
+
+  // Build the wire-contract JSON job frame (v1). One frame per job; mm,
+  // Y-up, origin free (KaryaCNC normalises to the bbox). skipJoin=true
+  // because MiniSketch data is already cleaned/joined — that is what makes
+  // this route fast. Sends the SAME item shapes as cncBuildPayload, so the
+  // legacy path stays untouched.
+  function cncBuildJsonPayload(items) {
+    const images = cnc.images || [];
+    const paths = [];
+    let points = 0;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const it of items) {
+      if (!it.pts || it.pts.length < 2) continue;
+      const p = { color: it.color, pts: it.pts, closed: !!it.closed, skipJoin: true };
+      if (it.fill === 'gray') p.fill = '#808000';
+      else if (it.fill === 'yellow') p.fill = '#ffff00';
+      // KaryaCNC adds weight to the sort distance (positive = cut later); the
+      // UI stores -100..100, sent scaled by ×100 to match sortadd's scale.
+      if (it.sortWeight) p.weight = Math.round(it.sortWeight * 100);
+      // Millimetre depth override, straight through: KaryaCNC reads p.depth
+      // into sty.strokedeep and honours it for cut / engrave / mark / pocket,
+      // whatever colour picked the operation. 0 / absent = machine default.
+      if (it.depth && it.depth > 0) p.depth = +it.depth;
+      paths.push(p);
+      points += it.pts.length;
+      for (const q of it.pts) {
+        if (q[0] < minX) minX = q[0];
+        if (q[0] > maxX) maxX = q[0];
+        if (q[1] < minY) minY = q[1];
+        if (q[1] > maxY) maxY = q[1];
+      }
+    }
+    const imgs = [];
+    for (const im of images) {
+      const g = im.gg;
+      if (!g) continue;
+      imgs.push({ src: String(im.e.src || ''), x: g.p0.x, y: g.p0.y, w: g.w, h: g.h });
+      const x2 = g.p0.x + g.w, y2 = g.p0.y + g.h;
+      if (g.p0.x < minX) minX = g.p0.x;
+      if (x2 > maxX) maxX = x2;
+      if (g.p0.y < minY) minY = g.p0.y;
+      if (y2 > maxY) maxY = y2;
+    }
+    if (!paths.length && !imgs.length) return null;
+    return {
+      type: 'job', version: 1, units: 'mm', source: 'minisketch',
+      paths, images: imgs, points,
+      width: isFinite(minX) ? maxX - minX : 0,
+      height: isFinite(minY) ? maxY - minY : 0
     };
   }
 
@@ -25229,11 +29204,13 @@ function cmdSplitCurve() {
     const scopeEl = document.getElementById('cnc-scope');
     const tolEl = document.getElementById('cnc-tol');
     const chainEl = document.getElementById('cnc-chain');
+    const routeEl = document.getElementById('cnc-route');
     if (hostEl) hostEl.value = cnc.host;
     cncSetPortValue(cnc.port);
     if (scopeEl) scopeEl.value = cnc.scope;
     if (tolEl) tolEl.value = String(cnc.tol);
     if (chainEl) chainEl.checked = !!cnc.chain;
+    if (routeEl) routeEl.value = cnc.route;
     cncRenderLegend();
     cncSetStatus('Ready', '');
     modal.classList.remove('hidden');
@@ -25252,6 +29229,7 @@ function cmdSplitCurve() {
     const scopeEl = document.getElementById('cnc-scope');
     const tolEl = document.getElementById('cnc-tol');
     const chainEl = document.getElementById('cnc-chain');
+    const routeEl = document.getElementById('cnc-route');
     if (hostEl) cnc.host = hostEl.value.trim() || '127.0.0.1';
     if (portEl) {
       const p = parseFloat(portEl.value);
@@ -25266,6 +29244,7 @@ function cmdSplitCurve() {
       tolEl.value = String(cnc.tol);
     }
     if (chainEl) cnc.chain = !!chainEl.checked;
+    if (routeEl && (routeEl.value === 'classic' || routeEl.value === 'json')) cnc.route = routeEl.value;
     cncSaveSettings();
   }
 
@@ -25290,7 +29269,12 @@ function cmdSplitCurve() {
       say('Select objects first (or change Scope)', 'error');
       return;
     }
-    const payload = cncBuildPayload(cncCollectItems());
+    const jsonRoute = cnc.route === 'json';
+    const items = cncCollectItems(undefined, { dedupe: true });
+    const payload = jsonRoute ? cncBuildJsonPayload(items) : cncBuildPayload(items);
+    // Classic counts paths as a number; the JSON frame carries them as an
+    // array — derive a count either way for the status/toast lines.
+    const pathCount = jsonRoute ? payload.paths.length : payload.paths;
     if (!payload) {
       say('Nothing to send', 'error');
       return;
@@ -25324,12 +29308,37 @@ function cmdSplitCurve() {
     }, 8000);
 
     ws.onopen = () => {
-      cncSetStatus('Sending ' + payload.paths + ' paths / ' + payload.points + ' points …', 'busy');
+      cncSetStatus('Sending ' + pathCount + ' paths / ' + payload.points + ' points …', 'busy');
       try {
-        for (let i = 0; i < payload.text.length; i += CNC_CHUNK) {
-          ws.send(payload.text.slice(i, i + CNC_CHUNK));
+        if (jsonRoute) {
+          // One JSON frame per job (wire contract v1); the meta fields
+          // (points/width/height) are for the status line, not the wire.
+          const { width, height, points, ...frame } = payload;
+          // TEMP DEBUG (remove after diagnosis): keep the exact frame for
+          // console inspection — copy with copy(window.__cncLastFrame).
+          window.__cncLastFrame = frame;
+          const byColor = {};
+          for (const p of frame.paths) {
+            byColor[p.color] = (byColor[p.color] || 0) + 1;
+          }
+          const lens = frame.paths.map(p => p.pts.length);
+          console.log('[CNC_JSON_FRAME]', JSON.stringify({
+            pathCount: frame.paths.length,
+            totalPts: frame.paths.reduce((n, p) => n + p.pts.length, 0),
+            closed: frame.paths.filter(p => p.closed).length,
+            minPts: Math.min.apply(null, lens),
+            maxPts: Math.max.apply(null, lens),
+            byColor,
+            sample: frame.paths.slice(0, 5),
+            imageCount: frame.images.length
+          }));
+          ws.send(JSON.stringify(frame));
+        } else {
+          for (let i = 0; i < payload.text.length; i += CNC_CHUNK) {
+            ws.send(payload.text.slice(i, i + CNC_CHUNK));
+          }
+          ws.send('>REVECTOR2');
         }
-        ws.send('>REVECTOR2');
       } catch (err) {
         finish('Send failed: ' + err.message, 'error', false);
       }
@@ -25340,7 +29349,7 @@ function cmdSplitCurve() {
         const skipped = cnc.skippedText
           ? ' \u00b7 ' + cnc.skippedText + ' text object(s) could not be traced'
           : '';
-        finish('Sent ' + payload.paths + ' paths · ' + fmt(payload.width) + ' × ' + fmt(payload.height) + ' mm' + skipped, 'ok', true);
+        finish('Sent ' + pathCount + ' paths · ' + fmt(payload.width) + ' × ' + fmt(payload.height) + ' mm' + skipped, 'ok', true);
       }
     };
     ws.onerror = () => {
@@ -25353,29 +29362,42 @@ function cmdSplitCurve() {
 
   function bindUI() {
     document.querySelectorAll('.tool-btn').forEach(btn => {
-      btn.addEventListener('click', () => setTool(btn.dataset.tool));
+      btn.addEventListener('click', () => toolIconTapped(btn.dataset.tool));
     });
+
+    // Drag wall thickness: one field, shared with Settings and the wheel.
+    (function bindWallInput() {
+      const el = document.getElementById('wall-mm');
+      if (!el) return;
+      const commit = () => {
+        const sp = settingSpec('wallDragMm');
+        settings.wallDragMm = clampSetting(sp, el.value === '' ? sp.def : el.value);
+        applySettings();
+        saveSettings();
+        el.value = String(settings.wallDragMm);
+        updateUI();
+        render();
+      };
+      el.addEventListener('change', commit);
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); el.blur(); }
+      });
+    })();
 
     // Collapse / expand the left edit+layers stack. A phone cannot spare two
     // cards' worth of canvas, so one slim tab hides them; the choice sticks.
+    // toggleStageLeft() (defined at module scope) is shared: the tab button
+    // and the Tab key both call it.
     (function bindStageLeftTab() {
       const wrap = document.getElementById('stage-left');
       const tab = document.getElementById('stage-left-tab');
       if (!wrap || !tab) return;
       const KEY = 'minisketch.stageLeftCollapsed';
-      const apply = (collapsed) => {
-        wrap.classList.toggle('collapsed', collapsed);
-        tab.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-      };
       let collapsed = false;
       try { collapsed = localStorage.getItem(KEY) === '1'; } catch (err) { /* no storage */ }
-      apply(collapsed);
-      tab.addEventListener('click', () => {
-        collapsed = !wrap.classList.contains('collapsed');
-        apply(collapsed);
-        try { localStorage.setItem(KEY, collapsed ? '1' : '0'); } catch (err) { /* ignore */ }
-        resize();
-      });
+      wrap.classList.toggle('collapsed', collapsed);
+      tab.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      tab.addEventListener('click', toggleStageLeft);
     })();
 
     // Collapse / expand the right-hand sidebar panels one-by-one, the same way
@@ -25410,7 +29432,19 @@ function cmdSplitCurve() {
       b.style.background = c.value;
       b.addEventListener('click', () => {
         ui.color = c.value;
-        const ents = selectedEntities();
+        // A segment / node selection carries POINTS, not entities, so
+        // selectedEntities() alone is empty and the click painted nothing
+        // (the user had to press N first). Resolve the host entities of every
+        // selected point: a curve is coloured as a whole, so picking one of its
+        // segments and clicking a swatch repaints the entire curve.
+        const seen = new Set();
+        const ents = [];
+        const add = (e) => { if (e && !seen.has(+e.id)) { seen.add(+e.id); ents.push(e); } };
+        for (const e of selectedEntities()) add(e);
+        for (const s of ui.selection) {
+          if (!s || s.kind !== 'point') continue;
+          for (const e of (pointUses(+s.id) || [])) add(e);
+        }
         if (ents.length) {
           pushHistory();
           for (const e of ents) e.color = c.value;
@@ -25460,28 +29494,46 @@ function cmdSplitCurve() {
       ui.draft = null;
       ui.solverCost = null;
       view = { ox: W / 2, oy: H / 2, zoom: 1 };
+      // a new document has no file yet: the next Save must ask for a name
+      // instead of overwriting the file that was open before
+      save.handle = null;
+      setFileName(null);
       invalidateLoops();
       commit();
       toast('New sketch');
     });
-    document.getElementById('btn-open').addEventListener('click', async () => {
+    // File menu: Open always replaces the current sketch; Import always merges
+    // it into the current one (and re-centres it into the active viewport).
+    // NOTE: the keyboard shortcuts (Ctrl+O / Ctrl+I) set pendingImportMode and
+    // trigger the file input directly; this helper is the menu-path picker.
+    async function pickSketchFile() {
+      const wasMerge = pendingImportMode === 'merge';
       // With a file picker we keep the handle, so the next Ctrl+S writes back
-      // into the SAME file instead of dropping another copy in Downloads.
+      // into the SAME file instead of dropping another copy in Downloads. Only
+      // in Open mode though — after an Import the save target must stay the
+      // CURRENT file, not the just-merged one.
       if (!isEmbedded() && typeof window.showOpenFilePicker === 'function' &&
         window.isSecureContext && !isWailsRuntime()) {
         try {
+          // Same filter as the <input type=file> fallback, derived from its
+          // accept attribute so the menu and Ctrl+O / Ctrl+I dialogs can never
+          // drift apart (the picker used to offer .sketch/.json only).
+          const exts = String(fileInput.getAttribute('accept') || '')
+            .split(',').map(s => s.trim()).filter(s => s.startsWith('.'));
           const [handle] = await window.showOpenFilePicker({
             multiple: false,
             types: [{
-              description: 'MiniSketch drawing',
-              accept: { 'application/octet-stream': ['.sketch', '.json'] }
+              description: 'MiniSketch drawing / vector import',
+              accept: { 'application/octet-stream': exts.length ? exts : ['.sketch', '.json'] }
             }]
           });
           if (!handle) return;
           const file = await handle.getFile();
           await openDocumentFile(file);
-          save.handle = handle;
-          saveRememberName(handle.name || 'sketch.sketch');
+          if (!wasMerge) {
+            save.handle = handle;
+            saveRememberName(handle.name || 'sketch.sketch');
+          }
           return;
         } catch (err) {
           if (err && err.name === 'AbortError') return;
@@ -25489,6 +29541,15 @@ function cmdSplitCurve() {
         }
       }
       fileInput.click();
+    }
+    document.getElementById('btn-open').addEventListener('click', () => {
+      pendingImportMode = 'replace';
+      pickSketchFile();
+    });
+    pickSketchFileHook = pickSketchFile;
+    document.getElementById('btn-import').addEventListener('click', () => {
+      pendingImportMode = 'merge';
+      pickSketchFile();
     });
     // Everything an import can be, in one place: the picker path and the
     // <input type=file> path must behave identically.
@@ -25500,7 +29561,7 @@ function cmdSplitCurve() {
       }
       if (lower.endsWith('.dxf')) {
         try {
-          importDxfText(await file.text());
+          openDxfImport(await file.text(), file.name);
         } catch (err) {
           toast('That DXF could not be read');
         }
@@ -25529,14 +29590,28 @@ function cmdSplitCurve() {
       try {
         const text = await file.text();
         const data = JSON.parse(text);
+        const merge = pendingImportMode === 'merge';
         pushHistory();
-        loadDocument(data);
-        fitView();
-        updateUI();
-        render();
-        toast('Imported ' + file.name);
+        if (merge) {
+          const added = mergeDocument(data);
+          updateUI();
+          render();
+          toast('Merged ' + file.name + ' · ' + added + ' entity' + (added === 1 ? '' : 's'));
+        } else {
+          // A plain <input type=file> pick carries no handle: the next Save
+          // must ASK, never write into the file opened before this one.
+          save.handle = null;
+          loadDocument(data);
+          fitView();
+          updateUI();
+          render();
+          saveRememberName(file.name);
+          setFileName(file.name);
+          toast('Opened ' + file.name);
+        }
       } catch (err) {
-        toast('That file could not be imported');
+        console.error('[import]', err);
+        toast('That file could not be imported' + (err && err.message ? ': ' + String(err.message).slice(0, 140) : ''));
       }
     }
     fileInput.addEventListener('change', async () => {
@@ -25545,7 +29620,13 @@ function cmdSplitCurve() {
       if (!file) return;
       await openDocumentFile(file);
     });
-    document.getElementById('btn-download').addEventListener('click', () => downloadSketch());
+    // Save as ALWAYS asks: no handle reuse, whatever the context (the File
+    // menu item used to call downloadSketch() with no argument and silently
+    // overwrote the current file).
+    document.getElementById('btn-download').addEventListener('click', () => downloadSketch(true));
+    // the caption under the colour strip is a Save button too
+    const fileChip = document.getElementById('stage-file');
+    if (fileChip) fileChip.addEventListener('click', () => downloadSketch(false));
 
     const btnName = document.getElementById('btn-name');
     if (btnName) btnName.addEventListener('click', cmdNameSelection);
@@ -25561,6 +29642,27 @@ function cmdSplitCurve() {
     if (btnSplitCurve) btnSplitCurve.addEventListener('click', cmdSplitCurve);
     const btnCleanLoops = document.getElementById('btn-clean-loops');
     if (btnCleanLoops) btnCleanLoops.addEventListener('click', cleanUpLoops);
+    const btnWeld = document.getElementById('qb-weld');
+    if (btnWeld) btnWeld.addEventListener('click', openWeldDialog);
+    const weldApply = document.getElementById('weld-apply');
+    if (weldApply) weldApply.addEventListener('click', applyWeldDialog);
+    const weldCancel = document.getElementById('weld-cancel');
+    if (weldCancel) weldCancel.addEventListener('click', () => {
+      const m = document.getElementById('weld-modal');
+      if (m) m.classList.add('hidden');
+    });
+    const weldTol = document.getElementById('weld-tol');
+    if (weldTol) weldTol.addEventListener('keydown', ev => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); applyWeldDialog(); }
+      else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        const m = document.getElementById('weld-modal');
+        if (m) m.classList.add('hidden');
+      }
+    });
+    const btnJoinPoints = document.getElementById('btn-join-points');
+    if (btnJoinPoints) btnJoinPoints.addEventListener('click', cmdJoinPoints);
     const btnArray = document.getElementById('btn-array');
     if (btnArray) btnArray.addEventListener('click', cmdCreateArray);
     const btnNest = document.getElementById('btn-nest');
@@ -25652,27 +29754,68 @@ function cmdSplitCurve() {
     });
     const arrKind = document.getElementById('arr-kind');
     if (arrKind) arrKind.addEventListener('change', updateArrayDialogKind);
+    const arrToCurve = document.getElementById('arr-to-curve');
+    if (arrToCurve) arrToCurve.addEventListener('click', () => {
+      const draft = ui.arrayDraft;
+      const id = draft && draft.id != null ? +draft.id : null;
+      const m = document.getElementById('array-modal');
+      if (m) m.classList.add('hidden');
+      ui.arrayDraft = null;
+      if (id == null || !state.entities[id]) return;
+      ui.selection = [{ kind: 'entity', id }];
+      cmdConvertToCurve();
+    });
     const cdrRun = document.getElementById('cdr-imp-run');
-    if (cdrRun) cdrRun.addEventListener('click', () => {
+    if (cdrRun) cdrRun.addEventListener('click', async () => {
+      const prims = pendingCdr;
+      if (!prims || !prims.length) {
+        const m = document.getElementById('cdr-import-modal');
+        if (m) m.classList.add('hidden');
+        pendingCdr = null;
+        return;
+      }
+      const pagesEl = document.getElementById('cdr-pages');
+      const pages = parsePageSpec(pagesEl ? pagesEl.value : '', importPageCount(prims));
+      if (pages && !pages.size) {
+        toast('No pages match that selection (file has pages 1-' + importPageCount(prims) + ')');
+        return;
+      }
       const modal = document.getElementById('cdr-import-modal');
       if (modal) modal.classList.add('hidden');
-      const prims = pendingCdr;
       pendingCdr = null;
-      if (prims && prims.length) {
-        const sel = document.getElementById('cdr-text-mode');
-        const keep = document.getElementById('cdr-keep-color');
-        importPrimsIntoDocument(prims, 1, 'CDR', {
-          textMode: sel ? sel.value : 'comment',
-          keepColors: keep ? keep.checked : true,
-          flipY: true
-        });
-      }
+      const sel = document.getElementById('cdr-text-mode');
+      const keep = document.getElementById('cdr-keep-color');
+      await importPrimsIntoDocument(filterImportPages(prims, pages, 100), 1, 'CDR', {
+        textMode: sel ? sel.value : 'comment',
+        keepColors: keep ? keep.checked : true,
+        flipY: true,
+        ...importJoinOpts('cdr')
+      });
     });
     const cdrCancel = document.getElementById('cdr-imp-cancel');
     if (cdrCancel) cdrCancel.addEventListener('click', () => {
       const modal = document.getElementById('cdr-import-modal');
       if (modal) modal.classList.add('hidden');
       pendingCdr = null;
+    });
+    const dxfRun = document.getElementById('dxf-imp-run');
+    if (dxfRun) dxfRun.addEventListener('click', () => {
+      const modal = document.getElementById('dxf-import-modal');
+      if (modal) modal.classList.add('hidden');
+      const text = pendingDxf;
+      pendingDxf = null;
+      if (text == null) return;
+      try {
+        importDxfText(text, importJoinOpts('dxf'));
+      } catch (err) {
+        toast('That DXF could not be read');
+      }
+    });
+    const dxfCancel = document.getElementById('dxf-imp-cancel');
+    if (dxfCancel) dxfCancel.addEventListener('click', () => {
+      const modal = document.getElementById('dxf-import-modal');
+      if (modal) modal.classList.add('hidden');
+      pendingDxf = null;
     });
 
     document.querySelectorAll('[data-quick]').forEach(btn => {
@@ -25781,7 +29924,7 @@ function cmdSplitCurve() {
     });
     syncModToggles();
 
-    const tfFields = { 'tf-left': 'left', 'tf-top': 'top', 'tf-width': 'width', 'tf-height': 'height' };
+    const tfFields = { 'tf-left': 'left', 'tf-top': 'top', 'tf-width': 'width', 'tf-height': 'height', 'tf-weight': 'weight', 'tf-depth': 'depth' };
     for (const id in tfFields) {
       const el = document.getElementById(id);
       if (!el) continue;
@@ -25812,7 +29955,7 @@ function cmdSplitCurve() {
           // Alt+R +20 Tab +20 Enter = move by (+20,+20) without the mouse.
           // change fires on blur, which the blur below triggers.
           ev.preventDefault();
-          const order = ['tf-left', 'tf-top', 'tf-width', 'tf-height'];
+          const order = ['tf-left', 'tf-top', 'tf-width', 'tf-height', 'tf-weight', 'tf-depth'];
           const at = order.indexOf(id);
           const next = document.getElementById(order[(at + 1) % order.length]);
           el.blur();
@@ -26054,8 +30197,28 @@ function cmdSplitCurve() {
     const previewInputs = ['text-value','text-font','text-weight','text-italic','text-tracking','text-leading'];
     for (const id of previewInputs) {
       const el = document.getElementById(id);
-      if (el) el.addEventListener('input', renderTextPreview);
+      if (!el) continue;
+      // 'change' as well as 'input': a <select> fires `input` in modern
+      // browsers but the change event is the one guaranteed for keyboard and
+      // assistive activation, and the preview is cheap to repaint twice.
+      el.addEventListener('input', renderTextPreview);
+      if (el.tagName === 'SELECT') el.addEventListener('change', renderTextPreview);
     }
+    // Picking a family must have that face registered before the preview
+    // paints, otherwise the canvas measures the FALLBACK and the preview shows
+    // a width the real font does not have. `registered` is keyed per member, so
+    // asking for weight 400 alone would leave a Bold-only pick unloaded.
+    const fontPick = document.getElementById('text-font');
+    if (fontPick) fontPick.addEventListener('change', () => {
+      const reg = window.MiniSketchFonts;
+      if (!reg) return renderTextPreview();
+      const weightEl = document.getElementById('text-weight');
+      const italicEl = document.getElementById('text-italic');
+      const want = weightEl ? +weightEl.value || 400 : 400;
+      const style = italicEl && italicEl.value === '1' ? 'italic' : 'normal';
+      reg.load(fontPick.value, want, style)
+        .then(() => renderTextPreview(), () => renderTextPreview());
+    });
     const btnHelp = document.getElementById('btn-help');
     if (btnHelp) btnHelp.addEventListener('click', openHelpModal);
     const langBtns = document.querySelectorAll('[data-help-lang]');
@@ -26086,7 +30249,7 @@ function cmdSplitCurve() {
     const impCancel = document.getElementById('imp-cancel');
     if (impCancel) impCancel.addEventListener('click', closeSvgImport);
     const impRun = document.getElementById('imp-run');
-    if (impRun) impRun.addEventListener('click', runSvgImport);
+    if (impRun) impRun.addEventListener('click', () => { runSvgImport(); });
     const impModal = document.getElementById('svg-import-modal');
 
     const helpClose = document.getElementById('help-close');
@@ -26443,25 +30606,49 @@ function cmdSplitCurve() {
         if (pids.length < 2) continue;
         let closed = !!e.closed && pids.length >= 2;
         let dropped = false;
+        // stored handles may be re-homed below when the duplicated seam node
+        // gets collapsed, so read them up front
+        const hasStoredHs = e.hs && Array.isArray(e.hs.o) && Array.isArray(e.hs.i) &&
+          e.hs.o.length === pids.length && e.hs.i.length === pids.length;
+        const stored = hasStoredHs
+          ? {
+            o: e.hs.o.map(h => (Array.isArray(h) && isFinite(+h[0]) && isFinite(+h[1]) ? { x: +h[0], y: +h[1] }
+              : (h && isFinite(h.x) && isFinite(h.y) ? { x: +h.x, y: +h.y } : null))),
+            i: e.hs.i.map(h => (Array.isArray(h) && isFinite(+h[0]) && isFinite(+h[1]) ? { x: +h[0], y: +h[1] }
+              : (h && isFinite(h.x) && isFinite(h.y) ? { x: +h.x, y: +h.y } : null)))
+          }
+          : null;
         if (!closed && pids.length >= 4) {
           const firstP = points[pids[0]];
           const lastP = points[pids[pids.length - 1]];
           if (pids[0] === pids[pids.length - 1] ||
             (firstP && lastP && Math.hypot(firstP.x - lastP.x, firstP.y - lastP.y) < 1e-6)) {
+            // An exporter may draw a closed shape as an OPEN path that curves
+            // back to its exact start point (a PDF rounded rect does this: the
+            // final corner Bézier lands on node 0 without a `h` operator). The
+            // duplicated seam node must go, but its HANDLES are real curve
+            // data: its in-handle belongs to the closing segment (the wrap
+            // segment node[n-1] -> node[0] reads node[0].i), and its out-handle
+            // leaves the same coordinates as node 0. Re-home them instead of
+            // discarding hs — dropping them here used to replace a rounded
+            // rectangle's corners with autoHandles() loops after a reload.
+            const seam = stored ? { o: stored.o[pids.length - 1], i: stored.i[pids.length - 1] } : null;
+            if (stored && seam) {
+              if (!stored.i[0] && seam.i) stored.i[0] = seam.i;
+              if (!stored.o[0] && seam.o) stored.o[0] = seam.o;
+            }
             pids.pop();
+            if (stored) { stored.o.pop(); stored.i.pop(); }
             closed = true;
             dropped = true;
           }
         }
         const ent = { id, type: 'spline', pts: pids, color: e.color || '#000000', layer: elayer };
         if (closed && pids.length >= 2) ent.closed = true;
-        if (!dropped && e.hs && Array.isArray(e.hs.o) && Array.isArray(e.hs.i) &&
-          e.hs.o.length === pids.length && e.hs.i.length === pids.length) {
-          const handle = h => {
-            if (Array.isArray(h)) return isFinite(+h[0]) && isFinite(+h[1]) ? { x: +h[0], y: +h[1] } : null;
-            return h && isFinite(h.x) && isFinite(h.y) ? { x: +h.x, y: +h.y } : null;
-          };
-          ent.hs = { o: e.hs.o.map(handle), i: e.hs.i.map(handle) };
+        if (stored && stored.o.length === pids.length && stored.i.length === pids.length) {
+          ent.hs = { o: stored.o, i: stored.i };
+        } else if (!dropped) {
+          ent.hs = null;
         }
         entities[id] = ent;
       } else if (e.type === 'part') {
@@ -26656,6 +30843,19 @@ function cmdSplitCurve() {
       }
       if (id > maxId) maxId = id;
     }
+    // Sort weight (-100..100) and the depth override (mm, > 0) survive
+    // save+load; absent means 0 (no badge, no wire field). Both are kept
+    // separate from e.weight, which text uses for font weight.
+    for (const key in s.entities) {
+      const src = s.entities[key];
+      const ent = entities[+key];
+      if (!src || !ent) continue;
+      const w = +src.sortWeight;
+      if (isFinite(w)) ent.sortWeight = Math.max(-100, Math.min(100, Math.round(w)));
+      const d = +src.depth;
+      if (isFinite(d) && d > 0) ent.depth = Math.round(d * 100) / 100;
+      else delete ent.depth;
+    }
     // names are cosmetic, so they are carried for every entity type at once
     for (const key in entities) {
       const raw = s.entities[key];
@@ -26840,6 +31040,173 @@ function cmdSplitCurve() {
     if (!noSave) scheduleSave();
   }
 
+  // Merge an imported .sketch/.json document into the CURRENT sketch instead of
+  // replacing it. The incoming file is normalized by the standard loader (so
+  // validation, migrations and per-entity sanitization stay identical), then
+  // every id is remapped to a fresh one and the two documents are joined.
+  function mergeDocument(data) {
+    const s = data.state || data;
+    if (!s || typeof s !== 'object' || !s.points || !s.entities || !s.constraints) {
+      throw new Error('Invalid sketch');
+    }
+    const prev = {
+      points: state.points, entities: state.entities, constraints: state.constraints,
+      mates: state.mates, layers: state.layers, nextLayerId: state.nextLayerId,
+      nextId: state.nextId, activeLayer: ui.activeLayer, selection: ui.selection,
+      focusLoop: ui.focusLoop, draft: ui.draft, hover: ui.hover,
+      view, fitted: ui.fitted
+    };
+    try {
+    // normalize the incoming document through the standard loader (it swaps the
+    // module `state` temporarily), then detach its watchers before we merge.
+    loadDocument(data, true);
+    const inc = state;
+    genWatchClear();
+    const ptMap = new Map(), entMap = new Map();
+    let nid = prev.nextId;
+    for (const key in inc.points) ptMap.set(+key, nid++);
+    for (const key in inc.entities) entMap.set(+key, nid++);
+    const rp = v => (v == null ? v : (ptMap.has(+v) ? ptMap.get(+v) : v));
+    const re = v => (v == null ? v : (entMap.has(+v) ? entMap.get(+v) : v));
+    const newPts = {};
+    for (const key in inc.points) newPts[ptMap.get(+key)] = inc.points[key];
+    // The merged import is special: translate it so its bbox centres on the
+    // ACTIVE viewport, leaving the existing sketch where it is.
+    let ix0 = Infinity, iy0 = Infinity, ix1 = -Infinity, iy1 = -Infinity;
+    for (const p of Object.values(newPts)) {
+      if (p.x < ix0) ix0 = p.x;
+      if (p.y < iy0) iy0 = p.y;
+      if (p.x > ix1) ix1 = p.x;
+      if (p.y > iy1) iy1 = p.y;
+    }
+    // layers: reuse a same-id layer, allocate a fresh one otherwise
+    const layerMap = new Map();
+    const layersOut = prev.layers.slice();
+    let layerN = prev.nextLayerId;
+    for (const lay of inc.layers) {
+      if (layersOut.some(l => l.id === lay.id)) { layerMap.set(lay.id, lay.id); continue; }
+      const nl = layerN++;
+      layerMap.set(lay.id, nl);
+      layersOut.push({ id: nl, name: lay.name || ('Layer ' + nl), visible: lay.visible !== false, locked: !!lay.locked });
+    }
+    const newEnts = {};
+    for (const key in inc.entities) {
+      const old = inc.entities[key];
+      const e = Object.assign({}, old, { id: entMap.get(+key) });
+      e.layer = layerMap.get(e.layer) ?? e.layer;
+      if (e.type === 'spline' && Array.isArray(e.pts)) e.pts = e.pts.map(rp);
+      else if (e.type === 'line') { e.a = rp(e.a); e.b = rp(e.b); }
+      else if (e.type === 'arc') { e.c = rp(e.c); e.s = rp(e.s); e.e = rp(e.e); }
+      else if (e.type === 'circle') e.c = rp(e.c);
+      else if (e.type === 'note') e.p = rp(e.p);
+      else if (e.type === 'text' || e.type === 'art' || e.type === 'image' || e.type === 'array') {
+        if (e.p0 != null) e.p0 = rp(e.p0);
+        if (e.pw != null) e.pw = rp(e.pw);
+        if (e.ph != null) e.ph = rp(e.ph);
+      }
+      if (Array.isArray(e.guide)) e.guide = e.guide.map(re);
+      if (Array.isArray(e.masters)) e.masters = e.masters.map(re);
+      if (e.guideId != null) e.guideId = re(e.guideId);
+      newEnts[e.id] = e;
+    }
+    // Translate the merged import so its bbox centres on the ACTIVE viewport,
+    // leaving the existing sketch where it is. Points get shifted above; here
+    // the curve geometry that lives in ENTITY data (not in points) follows too:
+    // spline handles (absolute world coords) and array snapshot shapes (world
+    // coords). Art contours/curveSrc are stored in the frame's LOCAL
+    // coordinates — they follow the p0/pw/ph anchors and must NOT be shifted
+    // (shifting them turns curves into long diagonal lines).
+    if (isFinite(ix0) && isFinite(ix1)) {
+      const dx = prev.view.ox - (ix0 + ix1) / 2;
+      const dy = prev.view.oy - (iy0 + iy1) / 2;
+      for (const p of Object.values(newPts)) { p.x += dx; p.y += dy; }
+      const sh = pt => { if (pt) { pt.x += dx; pt.y += dy; } return pt; };
+      const shXY = a => { if (Array.isArray(a) && a.length >= 2) { a[0] += dx; a[1] += dy; } return a; };
+      for (const e of Object.values(newEnts)) {
+        if (!e) continue;
+        if (e.type === 'spline' && e.hs) {
+          if (Array.isArray(e.hs.o)) e.hs.o.forEach(sh);
+          if (Array.isArray(e.hs.i)) e.hs.i.forEach(sh);
+        } else if (e.type === 'array' && Array.isArray(e.shapes)) {
+          for (const s of e.shapes) if (s && Array.isArray(s.pts)) s.pts.forEach(shXY);
+        }
+      }
+    }
+    const newCons = {};
+    for (const key in inc.constraints) {
+      const c = inc.constraints[key];
+      const nc = { ...c, id: nid++ };
+      if (nc.p1 != null) nc.p1 = rp(nc.p1);
+      if (nc.p2 != null) nc.p2 = rp(nc.p2);
+      if (nc.p != null) nc.p = rp(nc.p);
+      if (nc.p0 != null) nc.p0 = rp(nc.p0);
+      if (nc.pw != null) nc.pw = rp(nc.pw);
+      if (nc.ph != null) nc.ph = rp(nc.ph);
+      if (nc.entity != null) nc.entity = re(nc.entity);
+      if (nc.line != null) nc.line = re(nc.line);
+      if (nc.line1 != null) nc.line1 = re(nc.line1);
+      if (nc.line2 != null) nc.line2 = re(nc.line2);
+      newCons[nc.id] = nc;
+    }
+    const newMates = {};
+    for (const key in inc.mates) {
+      const m = inc.mates[key];
+      const nm = { ...m, id: nid++, a: entMap.get(+m.a) ?? m.a, b: entMap.get(+m.b) ?? m.b };
+      newMates[nm.id] = nm;
+    }
+    state = {
+      points: Object.assign({}, prev.points, newPts),
+      entities: Object.assign({}, prev.entities, newEnts),
+      constraints: Object.assign({}, prev.constraints, newCons),
+      mates: Object.assign({}, prev.mates, newMates),
+      layers: layersOut,
+      nextLayerId: layerN,
+      nextId: nid
+    };
+    ui.activeLayer = prev.activeLayer;
+    ui.selection = prev.selection;
+    touchSelection();
+    ui.focusLoop = prev.focusLoop;
+    ui.draft = prev.draft;
+    ui.hover = prev.hover;
+    view = prev.view;
+    ui.fitted = prev.fitted;
+    genWatchRestore();
+    for (const eid in state.entities) {
+      const ent = state.entities[eid];
+      if (ent.type === 'spline') ensureSplineHandles(ent);
+    }
+    for (const eid in state.entities) {
+      const ent = state.entities[eid];
+      if (ent.type === 'text' || ent.type === 'art') ensureTextAspect(ent, true);
+    }
+    invalidateLoops();
+    requestSolve();
+    scheduleSave();
+    return Object.keys(newEnts).length;
+    } catch (err) {
+      // a failed merge must leave the pre-import document fully intact — the
+      // loader already swapped `state`, so restore every piece we saved.
+      state = {
+        points: prev.points, entities: prev.entities, constraints: prev.constraints,
+        mates: prev.mates, layers: prev.layers,
+        nextLayerId: prev.nextLayerId, nextId: prev.nextId
+      };
+      ui.activeLayer = prev.activeLayer;
+      ui.selection = prev.selection;
+      touchSelection();
+      ui.focusLoop = prev.focusLoop;
+      ui.draft = prev.draft;
+      ui.hover = prev.hover;
+      view = prev.view;
+      ui.fitted = prev.fitted;
+      genWatchClear();
+      genWatchRestore();
+      invalidateLoops();
+      throw err;
+    }
+  }
+
   // When the app is framed by KaryaCNC it is served from the host's own port
   // (/sketcher/), so a same-origin POST reaches the Go process — which has a
   // real native Save dialog. That is the only way to "save over a file" from
@@ -26888,8 +31255,11 @@ function cmdSplitCurve() {
       if (viaHost === 'saved') {
         // Remember the name the dialog actually ended up with, so the next
         // Save suggests THAT name instead of the stale default.
-        if (save.hostName) saveRememberName(save.hostName);
+        const written = save.hostName;
+        if (written) saveRememberName(written);
         save.hostName = null;
+        // the host renamed it in the dialog: the caption follows the real file
+        if (written) setFileName(written);
         toast('Saved');
         return;
       }
@@ -26897,14 +31267,17 @@ function cmdSplitCurve() {
     }
     const res = await saveTextAs(text, '.sketch', 'MiniSketch drawing', forcePicker);
     if (res === 'saved') {
+      if (save.handle && save.handle.name) setFileName(save.handle.name);
       toast('Saved');
       return;
     }
     if (res === 'cancelled') return;
-    // No picker in this browser (or it was blocked): keep the old behaviour.
+    // No picker in this browser (or it was blocked): download silently under
+    // the remembered name; only an explicit Save As still asks for a name.
     const date = new Date();
     const stamp = date.toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    downloadBlob('sketch-' + stamp + '.sketch', new Blob([text], { type: 'application/json' }));
+    const written = downloadBlob('sketch-' + stamp + '.sketch', new Blob([text], { type: 'application/json' }), forcePicker);
+    if (written) setFileName(written);
     toast('Downloaded .sketch file');
   }
 
@@ -26929,8 +31302,45 @@ function cmdSplitCurve() {
   const save = {
     handle: null,          // FileSystemFileHandle from the picker
     suggested: '',         // last name, used to prefill the dialog
+    name: null,            // basename of the document on disk (null = Untitled)
     busy: false
   };
+
+  // The current document's file name, shown as a caption under the colour
+  // strip and in the browser tab title. MiniSketch also runs INSIDE the
+  // KaryaCNC tab (an iframe with no tab title of its own), so the caption is
+  // the reliable place to read "which file am I editing".
+  const DOCNAME_KEY = 'minisketch.v1.docname';
+  function setFileName(name) {
+    save.name = name ? String(name) : null;
+    try {
+      if (save.name) localStorage.setItem(DOCNAME_KEY, save.name);
+      else localStorage.removeItem(DOCNAME_KEY);
+    } catch (err) { /* private mode: the caption still works this session */ }
+    paintFileName();
+  }
+  function paintFileName() {
+    const el = document.getElementById('stage-file-name');
+    if (!el) return;
+    el.textContent = save.name || 'Untitled';
+    const chip = document.getElementById('stage-file');
+    if (chip) {
+      chip.classList.toggle('is-untitled', !save.name);
+      chip.title = save.name
+        ? 'File aktif: ' + save.name + ' \u2014 klik untuk Save (Ctrl+S menulis ulang file ini)'
+        : 'Belum ada file \u2014 Ctrl+S untuk menyimpan';
+    }
+    // the browser tab is the second readout (useless inside KaryaCNC, free
+    // everywhere else)
+    document.title = save.name
+      ? save.name + ' \u2014 MiniSketch'
+      : 'MiniSketch - 2D constraint sketcher';
+  }
+  // Small dot on the caption: the document differs from the file on disk.
+  function paintFileDirty(on) {
+    const chip = document.getElementById('stage-file');
+    if (chip) chip.classList.toggle('dirty', !!on);
+  }
 
   // Is the app running inside someone else's frame (the KaryaCNC tab)?
   //
@@ -27018,7 +31428,7 @@ function cmdSplitCurve() {
     }
   }
 
-  function downloadBlob(name, blob) {
+  function downloadBlob(name, blob, askName) {
     let outName = String(name || 'download');
     if (!isWailsRuntime()) {
       const dot = outName.lastIndexOf('.');
@@ -27026,20 +31436,30 @@ function cmdSplitCurve() {
       const ext = dot > 0 ? outName.slice(dot) : '';
       let remembered = '';
       try { remembered = String(localStorage.getItem(FILENAME_KEY) || '').trim(); } catch (err) { remembered = ''; }
-      let typed = prompt('File name', remembered || base0);
-      if (typed == null) {
-        toast('Download cancelled');
-        return;
+      // No picker in this context (insecure origin, Firefox, …): download
+      // silently under the remembered name instead of interrupting with a
+      // prompt. Only an explicit Save As (askName) still asks for a name.
+      let typed = null;
+      if (askName) {
+        typed = prompt('File name', remembered || base0);
+        if (typed == null) {
+          toast('Download cancelled');
+          return null;
+        }
+      } else if (remembered) {
+        typed = remembered;
       }
-      typed = String(typed).trim().replace(/[\\/:*?"<>|]/g, '_');
-      if (!typed) typed = base0;
-      // the extension belongs to the file type; typing it is fine too
-      let base = typed;
-      if (ext && base.toLowerCase().endsWith(ext.toLowerCase())) base = base.slice(0, base.length - ext.length);
-      base = base.replace(/[. ]+$/, '');
-      if (!base) base = base0;
-      outName = base + ext;
-      try { localStorage.setItem(FILENAME_KEY, base); } catch (err) { /* ignore */ }
+      if (typed != null) {
+        typed = String(typed).trim().replace(/[\\/:*?"<>|]/g, '_');
+        if (!typed) typed = base0;
+        // the extension belongs to the file type; typing it is fine too
+        let base = typed;
+        if (ext && base.toLowerCase().endsWith(ext.toLowerCase())) base = base.slice(0, base.length - ext.length);
+        base = base.replace(/[. ]+$/, '');
+        if (!base) base = base0;
+        outName = base + ext;
+        try { localStorage.setItem(FILENAME_KEY, base); } catch (err) { /* ignore */ }
+      }
     }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -27049,6 +31469,8 @@ function cmdSplitCurve() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1200);
+    // the caller shows this name as the current document's file
+    return outName;
   }
 
   function svgArcPath(e) {
@@ -27463,7 +31885,7 @@ function cmdSplitCurve() {
         cmdSelectSameColor();
         return;
       }
-      // Alt+3: select the junction points (used by more than 3 lines)
+      // Alt+3: select the junction points (used by 3+ lines)
       if (ev.altKey && (ev.key === '3' || ev.key === '#')) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -27638,6 +32060,14 @@ function cmdSplitCurve() {
     initTheme();
     loadSettings();
     loadPickFilter();
+    // Every open/reload starts in F1 (select/move): points & lines locked and
+    // node markers hidden, regardless of what was persisted. Press F2 for
+    // node edit.
+    ui.mode = 'select';
+    pickFilter.point = false;
+    pickFilter.line = false;
+    pickFilter.loop = true;
+    ui.showPoints = false;
     syncPickFilterUI();
     loadSolveMode();
     cncLoadSettings();
@@ -27705,6 +32135,45 @@ function cmdSplitCurve() {
       invalidateLoops();
     }
 
+    // A bundled face registers only once something asks for it, and a text
+    // measured while its face was missing keeps the FALLBACK's metrics — a
+    // frame that is subtly the wrong shape, with no error anywhere. So ask for
+    // exactly the faces this document needs: the default one (a new text starts
+    // there) plus every member the restored entities actually reference.
+    //
+    // Not the whole catalogue: at 41 faces that is several megabytes of base64
+    // parsed on every cold start to serve fonts the document never mentions.
+    // Anything else still loads itself the moment it is picked, which is the
+    // point of bundling — no import step, no IndexedDB entry, no missing file.
+    const preloadFonts = () => {
+      const reg = window.MiniSketchFonts;
+      if (!reg) return Promise.resolve([]);
+      const wanted = new Set();
+      const ask = (family, weight, style) => {
+        if (!family || !reg.known(family)) return;
+        wanted.add(family + '|' + (weight || 400) + '|' + (style || 'normal'));
+      };
+      ask(TEXT_DEFAULT_FONT, 400, 'normal');
+      for (const e of Object.values(state.entities)) {
+        if (e.type === 'text' && e.font) ask(e.font, e.weight || 400, e.italic ? 'italic' : 'normal');
+      }
+      const jobs = [];
+      for (const key of wanted) {
+        const [fam, w, st] = key.split('|');
+        if (reg.registered(fam, +w, st)) continue;
+        jobs.push(reg.load(fam, +w, st));
+      }
+      return Promise.all(jobs);
+    };
+
+    // Caption under the colour strip: restore the name of the document that
+    // came back from storage — only when one did, a fresh demo has no file —
+    // and start with no "unsaved" dot.
+    let docName = null;
+    try { docName = localStorage.getItem(DOCNAME_KEY); } catch (err) { docName = null; }
+    setFileName(loaded ? docName : null);
+    paintFileDirty(false);
+
     // Imported fonts register from IndexedDB; a load bumps FONT_EPOCH, which
     // invalidates every text trace key, so texts redraw with the real font.
     if (window.MiniSketchFonts) {
@@ -27721,7 +32190,7 @@ function cmdSplitCurve() {
         let touched = false;
         for (const e of Object.values(state.entities)) {
           if (e.type === 'text' && e.font && !window.MiniSketchFonts.known(e.font) &&
-            window.MiniSketchFonts.registered(e.font)) {
+            window.MiniSketchFonts.registered(e.font, e.weight || 400, e.italic ? 'italic' : 'normal')) {
             ensureTextAspect(e);
             touched = true;
           }
@@ -27730,6 +32199,22 @@ function cmdSplitCurve() {
         invalidateLoops();
         render();
       });
+      preloadFonts().then(() => {
+        // The catalogue just landed. Any text that was already in the document
+        // was measured while its face was missing and carries the ratio the
+        // fallback produced; re-pin it to the real glyph metrics now.
+        let touched = false;
+        for (const e of Object.values(state.entities)) {
+          if (e.type === 'text' && e.font && window.MiniSketchFonts.known(e.font)) {
+            ensureTextAspect(e);
+            touched = true;
+          }
+        }
+        if (touched) requestSolve();
+        invalidateLoops();
+        render();
+      });
+
       // A document restored from storage keeps its text in whatever font it was
       // written in, and that face is not registered on a fresh page — fonts
       // load on demand. Until it is, the glyph outline is unavailable and the
@@ -27749,7 +32234,8 @@ function cmdSplitCurve() {
         window.MiniSketchFonts.load(fam, +w, st).then((ok) => {
           if (ok) {
             for (const e of Object.values(state.entities)) {
-              if (e.type === 'text' && e.font === fam) ensureTextAspect(e);
+              if (e.type === 'text' && e.font === fam && (e.weight || 400) === +w &&
+                (e.italic ? 'italic' : 'normal') === st) ensureTextAspect(e);
             }
             requestSolve();
           }
@@ -27826,6 +32312,23 @@ function cmdSplitCurve() {
   window.MiniSketch = {
     getState: () => JSON.parse(JSON.stringify(state)),
     getLoops: () => getLoops().map(l => ({ area: l.area, circle: !!l.circle })),
+    // LoopTree debug: the global hierarchy as plain data (level, parent index,
+    // leaf counts). Pass true to include the polygons for offline checks.
+    loopTree: (withPoly) => {
+      const t = loopTree();
+      return {
+        epoch: loopTreeEpoch,
+        roots: t.roots.map(l => t.loops.indexOf(l)),
+        ownerCount: t.owner.size,
+        loops: t.loops.map((l, i) => ({
+          i, level: l.level, area: l.area,
+          parent: l.parent ? t.loops.indexOf(l.parent) : null,
+          children: l.children.map(c => t.loops.indexOf(c)),
+          leaves: (t.leaves.get(l) || []).slice(),
+          poly: withPoly ? l.poly : undefined
+        }))
+      };
+    },
     // Loop-detection debug: rebuilds from scratch and logs the raw graph the
     // extractor sees — edge count, each edge's welded node pair, and the
     // union-find roots. Paste MiniSketch.debugLoops() in the DevTools console
@@ -27948,7 +32451,7 @@ function cmdSplitCurve() {
       return {
         exact: textExactLoopsWorld(e),
         trace: textContoursWorld(e),
-        metrics: { width: m.width, height: m.height, ascent: m.ascent, lineHeight: m.lineHeight },
+        metrics: m ? { width: m.width, height: m.height, ascent: m.ascent, lineHeight: m.lineHeight } : null,
         geom: { p0: { x: P(e.p0).x, y: P(e.p0).y }, A: textGeom(e).A, B: textGeom(e).B }
       };
     }

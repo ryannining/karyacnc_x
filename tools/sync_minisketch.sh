@@ -6,7 +6,8 @@
 #
 # Daftar file TIDAK ditulis manual: semua <script src> dan <link href> lokal
 # dibaca dari index.html sumber, jadi dependensi baru (help.js, tools/*.js, dst)
-# otomatis ikut tersalin.
+# otomatis ikut tersalin. Aset yang dimuat RUNTIME (fonts/<slug>.js disuntik
+# fonts/fonts.js saat family dipilih) ikut disapu lewat glob fonts/*.js.
 
 set -euo pipefail
 
@@ -46,6 +47,18 @@ done < <(
 # CSS/JS tambahan yang tidak selalu dirujuk lewat tag (mis. core.js dimuat app.js)
 for extra in app.js core.js styles.css; do
     [ -f "$SRC/$extra" ] && FILES+=("$extra")
+done
+
+# Aset RUNTIME: fonts/fonts.js menyuntik fonts/<slug>.js lewat <script> saat
+# sebuah family dipilih — file itu TIDAK dirujuk index.html, jadi discovery
+# tag melewatkannya. Tanpa ikut tersalin, salinan embed (KaryaCNC/Windows)
+# hanya punya fonts.js + hershey: semua font bundled 404, teks tidak render,
+# preview font tidak berubah, dan -> Curve gagal ("nothing could be converted").
+# build.js adalah generator node, bukan aset runtime — tidak perlu ikut.
+for f in "$SRC"/fonts/*.js; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "build.js" ] && continue
+    FILES+=("fonts/$(basename "$f")")
 done
 
 # Buang duplikat, jaga urutan
