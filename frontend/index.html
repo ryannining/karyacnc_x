@@ -232,46 +232,6 @@
 			z-index: 3000;
 		}
 
-		.overlay_nestjs {
-			position: absolute;
-			display: none;
-			top: 0;
-			right: 0;
-			bottom: 0;
-			left: 0;
-			background: rgba(0, 0, 0, 0.5);
-			z-index: 4000;
-		}
-
-
-
-		.popup_nestjs {
-			position: absolute;
-			width: 90%;
-			height: 90%;
-			top: 5%;
-			left: 5%;
-			background: white;
-			border-radius: 10px;
-			display: flex;
-			flex-direction: column;
-			overflow: hidden;
-		}
-
-		.popup_nestjs iframe {
-			flex: 1;
-			border: none;
-		}
-
-		.popup_nestjs_header {
-			background: #333;
-			color: white;
-			padding: 10px;
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-		}
-
 		#appTabs {
 			position: fixed;
 			top: 0;
@@ -405,7 +365,6 @@
 	<div id="appTabs">
 		<button class="apptab active" data-tab="karyacnc">KaryaCNC</button>
 		<button class="apptab" data-tab="sketcher">Sketcher</button>
-		<button class="apptab" data-tab="nesting">Nesting</button>
 		<button class="apptab" data-tab="invoice">Invoice</button>
 		<button id="btnAppTheme" title="Switch dark / light theme">Dark</button>
 	</div>
@@ -423,9 +382,6 @@
 	</div>
 	<div class="tabpanel" id="panelSketcher">
 		<iframe id="sketcherFrame" src="about:blank"></iframe>
-	</div>
-	<div class="tabpanel" id="panelNesting">
-		<iframe id="nestjsFrame" src="about:blank"></iframe>
 	</div>
 	<div class="tabpanel" id="panelInvoice">
 		<iframe id="invoiceFrame" src="about:blank"></iframe>

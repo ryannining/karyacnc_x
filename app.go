@@ -20,7 +20,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	goruntime "runtime"
 	"sort"
 	"strings"
@@ -38,9 +37,6 @@ var SHOWDEBUG = false
 
 //go:embed all:frontend/inkscape_ex
 var inkscapeFiles embed.FS
-
-//go:embed all:nestjs2/frontend
-var nestjs2WebFiles embed.FS
 
 //go:embed all:minisketch
 var minisketchWebFiles embed.FS
@@ -294,13 +290,8 @@ type App struct {
 	streamMutex    sync.Mutex
 	wsServer       *http.Server
 	wsServerMutex  sync.Mutex
-	storedSvgMutex sync.Mutex
 	roCache        *roCache
 	roCacheMu      sync.Mutex
-
-	storedSvgData       string
-	storedSvgTimestamp  int64
-	storedresultSvgData string
 
 	profilesMutex sync.Mutex
 	profilesJSON  string
@@ -830,23 +821,23 @@ func copyRealFile(src, dest string) error {
 	return err
 }
 
-// startServer starts the nestjs HTTP server on port 3000
+// startServer starts the HTTP server on port 3000 (sketcher + invoice + API)
 func (a *App) startServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleRequest)
 	if SHOWDEBUG {
-		log.Println("Starting nestjs server on :3000")
+		log.Println("Starting HTTP server on :3000")
 	}
 	if err := http.ListenAndServe(":3000", mux); err != nil {
 		if SHOWDEBUG {
-			log.Printf("Error starting nestjs server: %v", err)
+			log.Printf("Error starting HTTP server: %v", err)
 		}
 	}
 }
 
 func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if SHOWDEBUG {
-		log.Printf("NestJS Server received request: %s %s", r.Method, r.URL.Path)
+		log.Printf("HTTP server received request: %s %s", r.Method, r.URL.Path)
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -890,120 +881,10 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 		} else {
 			io.WriteString(w, data)
 		}
-	case "/stored-svg", "/stored_svg":
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", 405)
-			return
-		}
-		a.storedSvgMutex.Lock()
-		data := a.storedSvgData
-		a.storedSvgMutex.Unlock()
-		if data == "" {
-			http.Error(w, "Not found", 404)
-			return
-		}
-		w.Header().Set("Content-Type", "image/svg+xml")
-		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-		io.WriteString(w, data)
-	case "/result-svg", "/result_svg":
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", 405)
-			return
-		}
-		a.storedSvgMutex.Lock()
-		data := a.storedresultSvgData
-		a.storedSvgMutex.Unlock()
-		if data == "" {
-			http.Error(w, "Not found", 404)
-			return
-		}
-		w.Header().Set("Content-Type", "image/svg+xml")
-		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-		io.WriteString(w, data)
-	case "/check-svg-timestamp", "/check_svg_timestamp":
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", 405)
-			return
-		}
-		a.storedSvgMutex.Lock()
-		ts := a.storedSvgTimestamp
-		a.storedSvgMutex.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"timestamp": %d}`, ts)
 	case "/save-sketch", "/save_sketch":
 		a.handleSaveSketch(w, r)
 		return
-	case "/upload-svg", "/upload_svg":
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", 405)
-			return
-		}
-		err := r.ParseMultipartForm(32 << 20) // 32MB max
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		file, _, err := r.FormFile("svg_data")
-		if err != nil {
-			http.Error(w, "No svg_data", 400)
-			return
-		}
-		defer file.Close()
-		data, err := io.ReadAll(file)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		svgStr := string(data)
-		// Clean: remove all xmlns attributes
-		re := regexp.MustCompile(`xmlns="[^"]*"`)
-		svgStr = re.ReplaceAllString(svgStr, "")
-		// Add xmlns to <svg tag
-		svgStr = strings.Replace(svgStr, "<svg", `<svg xmlns="http://www.w3.org/2000/svg"`, 1)
-		inkscape := r.FormValue("inkscape")
-		if inkscape == "y" {
-			a.storedSvgMutex.Lock()
-			a.storedSvgData = svgStr
-			a.storedSvgTimestamp = time.Now().UnixMilli()
-			// Clear any previous nesting result - it's invalidated by the new upload
-			a.storedresultSvgData = ""
-			a.storedSvgMutex.Unlock()
-			a.emit("NESTING_UPLOAD_RECEIVED", a.storedSvgTimestamp)
-		} else if inkscape == "n" {
-			a.storedSvgMutex.Lock()
-			a.storedresultSvgData = svgStr
-			a.storedSvgMutex.Unlock()
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"success": true, "message": "SVG data received and processed successfully"}`)
 	default:
-		// Handle /v2 prefix for nestjs2
-		if r.URL.Path == "/v2" {
-			http.Redirect(w, r, "/v2/", http.StatusMovedPermanently)
-			return
-		}
-		if strings.HasPrefix(r.URL.Path, "/v2/") {
-			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/v2")
-			if r.URL.Path == "" {
-				r.URL.Path = "/"
-			}
-			devPath := "nestjs2/frontend"
-			if _, err := os.Stat(devPath); err == nil {
-				if SHOWDEBUG {
-					log.Printf("Serving nestjs2 from development folder: %s", devPath)
-				}
-				fileServer := http.FileServer(http.Dir(devPath))
-				fileServer.ServeHTTP(w, r)
-			} else {
-				if SHOWDEBUG {
-					log.Printf("Serving nestjs2 from embedded files")
-				}
-				subFS, _ := fs.Sub(nestjs2WebFiles, "nestjs2/frontend")
-				fileServer := http.FileServer(http.FS(subFS))
-				fileServer.ServeHTTP(w, r)
-			}
-			return
-		}
 		// Handle /sketcher prefix for minisketch
 		if r.URL.Path == "/sketcher" {
 			http.Redirect(w, r, "/sketcher/", http.StatusMovedPermanently)
@@ -1180,7 +1061,7 @@ func (a *App) serveInvoiceFile(w http.ResponseWriter, r *http.Request) bool {
 	if clean == "" {
 		return false
 	}
-	// Only serve known invoice filenames (avoid clashing with NestJS assets)
+	// Only serve known invoice filenames
 	if !isInvoiceAsset(clean) {
 		return false
 	}

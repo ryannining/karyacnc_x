@@ -440,7 +440,7 @@ function applyAppTheme(name) {
         btn.textContent = (name === 'dark') ? 'Dark' : 'Light';
         btn.title = 'Theme saat ini: ' + name + ' — klik untuk ganti';
     }
-    var frames = ['sketcherFrame', 'nestjsFrame', 'invoiceFrame'];
+    var frames = ['sketcherFrame', 'invoiceFrame'];
     for (var i = 0; i < frames.length; i++) {
         var f = $(frames[i]);
         if (f && f.contentWindow && f.getAttribute('data-loaded'))
@@ -1076,11 +1076,6 @@ async function setupEventListeners() {
         refreshgcode();
     });
 
-    await window.listen('NESTING_UPLOAD_RECEIVED', (event) => {
-        console.log('NESTING_UPLOAD_RECEIVED', event);
-        // Buka tab Nesting; app nesting polling timestamp sendiri, jadi cukup ganti tab
-        showTab('nesting');
-    });
 }
 
 function startserver() {
@@ -2930,17 +2925,15 @@ setclick('btOpenDevTools', async function () {
 });
 
 // ============================================================
-// APP TABS (KaryaCnc / Sketcher / Nesting / Invoice)
+// APP TABS (KaryaCnc / Sketcher / Invoice)
 // ============================================================
 
 var APP_TAB_URLS = {
     sketcher: 'http://localhost:3000/sketcher/',
-    nesting: 'http://localhost:3000/v2/',
     invoice: 'http://localhost:3000/invoice.html'
 };
 var APP_TAB_FRAMES = {
     sketcher: ['panelSketcher', 'sketcherFrame'],
-    nesting: ['panelNesting', 'nestjsFrame'],
     invoice: ['panelInvoice', 'invoiceFrame']
 };
 
@@ -2965,7 +2958,7 @@ function showTab(name) {
         b.classList.toggle('active', b.getAttribute('data-tab') === name);
     });
     if (APP_TAB_FRAMES[name]) {
-        // iframe di-load sekali lalu dibiarkan hidup — state sketsa/nesting tidak hilang saat ganti tab
+        // iframe di-load sekali lalu dibiarkan hidup — state sketsa tidak hilang saat ganti tab
         var frame = $(APP_TAB_FRAMES[name][1]);
         if (!frame.getAttribute('data-loaded')) {
             frame.src = APP_TAB_URLS[name] + (APP_TAB_URLS[name].indexOf('?') >= 0 ? '&' : '?') + 'theme=' + appTheme;
@@ -3027,7 +3020,7 @@ document.addEventListener('keydown', async function (e) {
 });
 
 // Tab navigation with Ctrl+Tab / Ctrl+Shift+Tab
-var TAB_ORDER = ['karyacnc', 'sketcher', 'nesting', 'invoice'];
+var TAB_ORDER = ['karyacnc', 'sketcher', 'invoice'];
 
 function addTabKeyHandler(win) {
     win.addEventListener('keydown', function (e) {
@@ -3048,7 +3041,7 @@ function addTabKeyHandler(win) {
 // Listener ke window utama (untuk tab karyacnc)
 addTabKeyHandler(window);
 
-// Frame (sketcher/nesting/invoice) di-host di :3000 beda origin, jadi keydown
+// Frame (sketcher/invoice) di-host di :3000 beda origin, jadi keydown
 // tidak pernah sampai ke window ini. Frame mengirim postMessage, kita pindah tab.
 window.addEventListener('message', function (e) {
     var d = e.data;

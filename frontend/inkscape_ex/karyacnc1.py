@@ -75,7 +75,6 @@ def print_(*arg):
 ###        Gcodetools class
 ###
 ################################################################################
-import re
 class laser_gcode(inkex.Effect):
     def get_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -99,235 +98,6 @@ class laser_gcode(inkex.Effect):
         else:
             # If only 1 digit/last number (or anything without dots)
             return f"{local_ip[0]}.{local_ip[1]}.{local_ip[2]}.{kip}"
-
-    def send_nesting_request(self, method, path, fields=None, files=None):
-        """Send an HTTP request for nesting using sockets."""
-        host = self.resolve_kip()
-        port = self.options.nesting_port
-
-        boundary = '----Boundary' + os.urandom(16).hex()
-        body = bytearray()
-
-        if method == "POST":
-            content_type = f'multipart/form-data; boundary={boundary}'
-            if fields:
-                for name, value in fields.items():
-                    body.extend(f'--{boundary}\r\n'.encode('utf-8'))
-                    body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode('utf-8'))
-                    body.extend(f'{value}\r\n'.encode('utf-8'))
-            if files:
-                for field_name, file_info in files.items():
-                    filename, data, f_content_type = file_info
-                    if isinstance(data, str):
-                        data = data.encode('utf-8')
-                    body.extend(f'--{boundary}\r\n'.encode('utf-8'))
-                    body.extend(f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode('utf-8'))
-                    body.extend(f'Content-Type: {f_content_type}\r\n\r\n'.encode('utf-8'))
-                    body.extend(data)
-                    body.extend(b'\r\n')
-            body.extend(f'--{boundary}--\r\n'.encode('utf-8'))
-        else:
-            content_type = 'application/x-www-form-urlencoded'
-
-        headers = [
-            f'{method} {path} HTTP/1.1',
-            f'Host: {host}:{port}',
-            f'Content-Type: {content_type}',
-            f'Content-Length: {len(body)}',
-            'Connection: close',
-            '',
-            ''
-        ]
-        request_head = '\r\n'.join(headers).encode('utf-8')
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(30)
-        try:
-            sock.connect((host, port))
-            sock.sendall(request_head + body)
-            response_data = bytearray()
-            while True:
-                chunk = sock.recv(8192)
-                if not chunk: break
-                response_data.extend(chunk)
-            response_text = response_data.decode('utf-8', errors='ignore')
-            if '\r\n\r\n' not in response_text:
-                raise Exception("Invalid server response")
-            resp_headers, resp_body = response_text.split('\r\n\r\n', 1)
-            status_line = resp_headers.split('\r\n')[0]
-            status_code = int(status_line.split()[1])
-            return status_code, resp_body
-        finally:
-            sock.close()
-
-    def create_svg_from_selection(self, selected_paths):
-        """Create a new SVG document containing only the selected elements."""
-        svg = etree.Element("svg", nsmap=self.document.getroot().nsmap)
-        svg.set("xmlns", "http://www.w3.org/2000/svg")
-        
-        # selected_paths is a dict {layer: [elements]}
-        for layer in selected_paths:
-            for element in selected_paths[layer]:
-                if element.tag.endswith('}path') or element.tag == 'path':
-                    clone = etree.fromstring(etree.tostring(element))
-                else:
-                    clone = self.shape_to_path(element)
-                
-                # Collect transform from element and all parent elements
-                parent = element.getparent()
-                total_transform = None
-                while parent is not None and parent != self.document.getroot():
-                    parent_transform = parent.get('transform', '')
-                    if parent_transform:
-                        t = Transform(parent_transform)
-                        total_transform = (t @ total_transform) if total_transform else t
-                    parent = parent.getparent()
-                
-                # Also get the transform from the element itself
-                element_transform = element.get('transform', '')
-                if element_transform:
-                    t = Transform(element_transform)
-                    total_transform = (t @ total_transform) if total_transform else t
-                
-                if total_transform:
-                    clone.set('transform', str(total_transform))
-                
-                svg.append(clone)
-        
-        return etree.tostring(svg, encoding='unicode', method='xml')
-
-    def shape_to_path(self, element):
-        """Convert various SVG shapes to path elements."""
-        tag = element.tag.split('}')[-1] if '}' in element.tag else element.tag
-        path = etree.Element('path')
-        for attr in ['id', 'style', 'fill', 'stroke', 'stroke-width', 'transform']:
-            if element.get(attr):
-                path.set(attr, element.get(attr))
-        
-        if tag == 'rect':
-            x = float(element.get('x', 0))
-            y = float(element.get('y', 0))
-            width = float(element.get('width', 0))
-            height = float(element.get('height', 0))
-            rx = float(element.get('rx', 0))
-            ry = float(element.get('ry', rx))
-            if rx > 0 or ry > 0:
-                rx = min(rx, width / 2)
-                ry = min(ry, height / 2)
-                d = f'M {x + rx},{y} L {x + width - rx},{y} Q {x + width},{y} {x + width},{y + ry} L {x + width},{y + height - ry} Q {x + width},{y + height} {x + width - rx},{y + height} L {x + rx},{y + height} Q {x},{y + height} {x},{y + height - ry} L {x},{y + ry} Q {x},{y} {x + rx},{y} Z'
-            else:
-                d = f'M {x},{y} L {x + width},{y} L {x + width},{y + height} L {x},{y + height} Z'
-            path.set('d', d)
-        elif tag == 'circle':
-            cx = float(element.get('cx', 0))
-            cy = float(element.get('cy', 0))
-            r = float(element.get('r', 0))
-            d = f'M {cx - r},{cy} A {r},{r} 0 1,0 {cx + r},{cy} A {r},{r} 0 1,0 {cx - r},{cy} Z'
-            path.set('d', d)
-        elif tag == 'ellipse':
-            cx = float(element.get('cx', 0))
-            cy = float(element.get('cy', 0))
-            rx = float(element.get('rx', 0))
-            ry = float(element.get('ry', 0))
-            d = f'M {cx - rx},{cy} A {rx},{ry} 0 1,0 {cx + rx},{cy} A {rx},{ry} 0 1,0 {cx - rx},{cy} Z'
-            path.set('d', d)
-        elif tag == 'line':
-            x1 = float(element.get('x1', 0))
-            y1 = float(element.get('y1', 0))
-            x2 = float(element.get('x2', 0))
-            y2 = float(element.get('y2', 0))
-            d = f'M {x1},{y1} L {x2},{y2}'
-            path.set('d', d)
-        elif tag == 'polyline':
-            points = element.get('points', '')
-            if points:
-                point_list = points.replace(',', ' ').split()
-                d = f'M {point_list[0]},{point_list[1]}'
-                for i in range(2, len(point_list), 2):
-                    d += f' L {point_list[i]},{point_list[i+1]}'
-                path.set('d', d)
-        elif tag == 'polygon':
-            points = element.get('points', '')
-            if points:
-                point_list = points.replace(',', ' ').split()
-                d = f'M {point_list[0]},{point_list[1]}'
-                for i in range(2, len(point_list), 2):
-                    d += f' L {point_list[i]},{point_list[i+1]}'
-                d += ' Z'
-                path.set('d', d)
-        elif tag == 'path':
-            return etree.fromstring(etree.tostring(element))
-        else:
-            return etree.fromstring(etree.tostring(element))
-        return path
-
-    def import_nested_svg(self, nested_svg, position=None):
-        """Import the nested SVG content into the current document.
-        If position (x, y) is given, the imported group is translated to that point."""
-        # Get the current layer or create a new one
-        try:
-            layer = self.svg.get_current_layer()
-        except:
-            layer = self.document.getroot()
-
-        # Create a group for the nested paths
-        group = etree.SubElement(layer, inkex.addNS('g', 'svg'))
-        group.set(inkex.addNS('label', 'inkscape'), 'Nested Parts')
-        if position is not None:
-            x, y = position
-            group.set('transform', f'translate({x},{y})')
-
-        # Import elements from the nested SVG preserving groups and paths
-        def import_element(elem, parent_group):
-            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-            if tag == 'g':
-                sub_g = etree.SubElement(parent_group, inkex.addNS('g', 'svg'))
-                for attr, value in elem.items():
-                    sub_g.set(attr, value)
-                for child in elem:
-                    import_element(child, sub_g)
-            elif tag == 'path':
-                path = etree.SubElement(parent_group, inkex.addNS('path', 'svg'))
-                for attr, value in elem.items():
-                    path.set(attr, value)
-
-        for element in nested_svg:
-            import_element(element, group)
-
-    def find_text_marker(self, keyword):
-        """Find a selected text element whose content exactly matches `keyword`
-        (case-insensitive, whitespace-trimmed). Returns (element, (x, y_below))
-        with the position just below the text in document user space, or
-        (None, None) if not found."""
-        keyword = keyword.strip().lower()
-        for layer in self.selected_paths:
-            for elem in self.selected_paths[layer]:
-                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-                if tag not in ('text', 'tspan'):
-                    continue
-                text_content = ''.join(elem.itertext()).strip().lower()
-                if text_content != keyword:
-                    continue
-                return elem, self._text_position_below(elem)
-        return None, None
-
-    def _text_position_below(self, elem):
-        """Compute a point at the bottom-center of the given text element in document space."""
-        try:
-            bbox = elem.bounding_box()
-            if bbox is not None and (bbox.width > 0 or bbox.height > 0):
-                return (bbox.center.x, bbox.bottom)
-        except Exception:
-            logger.exception("Error computing bounding box for nest marker")
-        # Fallback: use x/y attributes and font-size from style
-        x = float(elem.get('x', 0))
-        y = float(elem.get('y', 0))
-        font_size = 0.0
-        style = elem.get('style', '')
-        m = re.search(r'font-size:\s*([0-9.]+)', style)
-        if m:
-            font_size = float(m.group(1))
-        return (x, y + font_size)
 
     def export_path(self,paths,xmin,ymin):
         f=0
@@ -408,7 +178,6 @@ class laser_gcode(inkex.Effect):
         self.arg_parser.add_argument("--directory",type=str,default="",help="Output directory")
         self.arg_parser.add_argument("--filename",type=str,default="output.gcode",help="File name")
         self.arg_parser.add_argument("--karyaws",type=str,default=";",help="KaryaCNC WS Server IP last number")
-        self.arg_parser.add_argument("--nesting_port",type=int,default=3000,help="Nesting port")
         self.arg_parser.add_argument("--flatten",type=float,default="0.1",help="Flatten resolution")
         self.arg_parser.add_argument("--port",type=str,default="8887",help="Karyacnc port")
         # self.arg_parser.add_argument("--quiet_mode",type=str,default="false",help="Enable quiet mode (no success messages)")
@@ -598,68 +367,19 @@ class laser_gcode(inkex.Effect):
 ################################################################################
     def effect(self) :
         self.get_info()
-        nest_elem, nest_position = self.find_text_marker("nest")
-        result_elem, result_position = self.find_text_marker("result")
-
-        # Collect selected non-text objects, excluding any marker text
+        # Kumpulkan objek terpilih non-teks (teks/tspan = anotasi, dilewati)
         other_objects = {}
         for layer in self.selected_paths:
             for elem in self.selected_paths[layer]:
-                if elem is nest_elem or elem is result_elem:
-                    continue
                 tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
                 if tag in ('text', 'tspan'):
                     continue
                 other_objects.setdefault(layer, []).append(elem)
 
-        # Upload: nest text with other objects
-        if nest_elem is not None and other_objects:
-            try:
-                svg_data = self.create_svg_from_selection(other_objects)
-                fields = {'inkscape': 'y'}
-                files = {'svg_data': ('input.svg', svg_data, 'image/svg+xml')}
-                status_code, _ = self.send_nesting_request("POST", "/upload_svg", fields, files)
-                if status_code != 200:
-                    inkex.errormsg(f"Failed to upload. Status code: {status_code}")
-            except Exception as e:
-                inkex.errormsg(f"Error during nesting upload: {str(e)}")
-            return
-
-        # Error: result text with other objects (must be alone)
-        if result_elem is not None and other_objects:
-            inkex.errormsg("Untuk download hasil nesting, pilih hanya teks 'result' tanpa objek lain.")
-            return
-
-        # Download: nest alone, or result alone
-        dl_trigger = nest_elem if nest_elem is not None else result_elem
-        dl_position = nest_position if nest_elem is not None else result_position
-
-        if dl_trigger is not None:
-            try:
-                status_code, svg_content = self.send_nesting_request("GET", "/result_svg")
-                if status_code == 200:
-                    try:
-                        start_idx = svg_content.find('<')
-                        if start_idx != -1:
-                            svg_content = svg_content[start_idx:]
-                        nested_svg = etree.fromstring(svg_content.strip().encode('utf-8'))
-                        self.import_nested_svg(nested_svg, position=dl_position)
-                    except Exception as e:
-                        logger.exception("Parser error")
-                        inkex.errormsg(f"Error parsing SVG response: {str(e)}")
-                elif status_code == 404:
-                    inkex.errormsg("Blom ada hasil. Jalankan nesting lalu klik 'Select as Best' dulu.")
-                else:
-                    inkex.errormsg(f"Failed to retrieve solution. Status code: {status_code}")
-            except Exception as e:
-                inkex.errormsg(f"Error during nesting download: {str(e)}")
-            return
-
-        # No markers: gcode if there are objects, otherwise error
         if other_objects:
             self.laser()
         else:
-            inkex.errormsg("Tidak ada seleksi. Pilih objek untuk G-code, teks 'nest' + objek untuk upload nesting, atau teks 'nest'/'result' sendirian untuk download hasil.")
+            inkex.errormsg("Tidak ada seleksi. Pilih objek untuk G-code.")
 
 
 if __name__ == '__main__':

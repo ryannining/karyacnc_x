@@ -11,7 +11,6 @@ The application was migrated from Tauri (Rust) to Wails (Go) while preserving th
 - **Machine Control**: Real-time TCP connection to CNC machines for position tracking and job monitoring
 - **WebSocket Server**: Receives G-code from external applications (e.g., Inkscape extension)
 - **File Upload**: HTTP multipart upload of G-code files to machines
-- **SVG Nesting**: Integrated nesting tool for optimizing material usage
 - **Inkscape Extension**: Python extension for sending paths directly from Inkscape
 - **Multi-machine Support**: Laser, CNC Router, Plasma cutter modes
 
@@ -38,7 +37,6 @@ The application was migrated from Tauri (Rust) to Wails (Go) while preserving th
 
 ### External Tools
 - **Inkscape Extension**: Python 3 with `inkex` module
-- **Nesting Tool**: Pure JavaScript with Web Workers
 
 ---
 
@@ -78,11 +76,6 @@ karyacnc/
 │       ├── karyacnc1.inx    # Extension metadata
 │       ├── karyacnc1.py     # Extension Python script
 │       └── websocket/       # Embedded websocket-client library
-│
-├── nestjs2/                 # SVG Nesting tool V2 (separate web app)
-│   └── frontend/
-│       ├── index.html       # Nesting UI
-│       └── js/              # Nesting algorithms
 │
 └── build/                   # Build outputs
     ├── bin/                 # Compiled executables
@@ -275,7 +268,6 @@ var SHOWDEBUG = true  // Enable debug output
 - [ ] File upload to machine works
 - [ ] G-code generation produces valid output
 - [ ] Inkscape extension installs correctly
-- [ ] Nesting tool loads and runs
 
 ### Testing Commands
 ```bash
@@ -286,8 +278,8 @@ wails dev
 # Use the Inkscape extension or any WebSocket client to connect to ws://localhost:8887
 
 # Test HTTP endpoints
-curl http://localhost:3000/stored-svg
-curl -X POST -F "svg_data=@test.svg" http://localhost:3000/upload-svg
+curl http://localhost:3000/api/profiles
+curl http://localhost:3000/sketcher/
 ```
 
 ---
@@ -304,7 +296,6 @@ wails build
 # Output: build/bin/karyacnc.exe
 # - No external dependencies required
 # - Inkscape extension files are embedded
-# - Nesting tool files are embedded
 ```
 
 ### Installation Artifacts
@@ -338,7 +329,7 @@ wails build
 |---------|------|--------------|
 | WebSocket Server | 8887 | Yes (UI) |
 | Telegram Server | 8887 (shared) | Yes (UI) |
-| NestJS HTTP | 3000 | No |
+| HTTP Server (Sketcher/Invoice/API) | 3000 | No |
 | CNC Machine | 8888 | Yes (UI) |
 
 ### File Locations

@@ -15,8 +15,6 @@
     <item value="8888">8888</item>
     <item value="8889">8889</item>
   </param>
-	<param name="nesting_port" type="int" min="1" max="65535" _gui-text="Nesting Port:">3000</param>
-
 	<effect>
 		<effects-menu>
 			<submenu _name="KaryaCNC"/>
