@@ -1780,9 +1780,9 @@ function draw_line(num, lcol, lines, srl, dash, len, closed, snum, flip, shift, 
 		if (closed) {
 			cll = isClockwise(lines);
 			if (!cll) lcol = "#00C800";
-			else lcol = theme == 0 ? "#000000" : "#ee8888";
+			else lcol = theme == 0 ? "#000000" : "#ffffff";
 		} else {
-			lcol = theme == 0 ? "#664400" : "#cc4400";
+			lcol = theme == 0 ? "#664400" : "#ffffff";
 		}
 		if (sty.dovcarve) lcol = "#00ffff";
 		if (sty.dopocket) lcol = "#800080";
