@@ -60,7 +60,9 @@ jobs:
 
       - name: Build binary (Linux)
         if: matrix.name == 'linux'
-        run: wails build
+        run: |
+          export GOAMD64=v1
+          wails build
 
       - name: Build binary (Windows)
         if: matrix.name == 'windows'
