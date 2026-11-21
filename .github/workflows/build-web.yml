@@ -27,8 +27,7 @@ jobs:
       - name: Generate manifest.json (sha256 per file)
         working-directory: frontend/dist
         run: |
-          VERSION="$(date +%Y.%m.%d.%H%M)-${GITHUB_SHA::7}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          export VERSION="$(date +%Y.%m.%d.%H%M)-${GITHUB_SHA::7}"
           node -e '
             const fs = require("fs"), crypto = require("crypto"), path = require("path");
             const files = [];
@@ -50,6 +49,7 @@ jobs:
             fs.writeFileSync("manifest.json", JSON.stringify(manifest, null, 2));
             console.log("manifest:", manifest.version, files.length, "files");
           '
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Zip dist
         run: |
