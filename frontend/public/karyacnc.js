@@ -1451,6 +1451,23 @@ document.getElementById('btInstallInkscapeExt').addEventListener('click', async 
     }
 });
 
+document.getElementById('btCheckUpdate').addEventListener('click', async () => {
+    const st = document.getElementById('updateStatus');
+    st.textContent = 'checking...';
+    try {
+        const r = await window.go.main.App.CheckWebUpdate();
+        if (r.updateAvailable) {
+            st.textContent = 'update ' + r.latestVersion + ' tersedia, downloading...';
+            const res = await window.go.main.App.ApplyWebUpdate();
+            st.textContent = res.message;
+        } else {
+            st.textContent = 'sudah versi terbaru (' + r.currentVersion + ')';
+        }
+    } catch (error) {
+        st.textContent = 'gagal: ' + error;
+    }
+});
+
 // ============================================================
 // GCODEX RENDERER - 2D View from GCode Text
 // ============================================================

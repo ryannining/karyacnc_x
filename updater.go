@@ -10,6 +10,7 @@ package main
 //   {"version":"1.2.3","files":[{"path":"index.html","sha256":"...","size":123},...]}
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -250,6 +251,39 @@ func StartUpdateCheck() {
 		}
 		fmt.Printf("[update] web %s -> %s (%d file didownload)\n", ver, newVer, n)
 	}()
+}
+
+// CheckWebUpdate cek update frontend dari GitHub (dipanggil dari UI).
+func (a *App) CheckWebUpdate(ctx context.Context) (map[string]interface{}, error) {
+	ver, ok, err := CheckForUpdate()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"latestVersion": ver,
+		"updateAvailable": ok,
+		"currentVersion": currentWebVersion(),
+	}, nil
+}
+
+// ApplyWebUpdate download + apply update frontend (dipanggil dari UI).
+func (a *App) ApplyWebUpdate(ctx context.Context) (map[string]interface{}, error) {
+	ver, n, err := ApplyUpdate()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"version":    ver,
+		"downloaded": n,
+		"message":    fmt.Sprintf("Web diupdate ke %s (%d file didownload). Refresh halaman untuk memakai versi baru.", ver, n),
+	}, nil
+}
+
+func currentWebVersion() string {
+	if m := readLocalManifest(); m != nil {
+		return m.Version
+	}
+	return "embedded"
 }
 
 // webAssetHandler returns handler for Wails AssetServer: cache first, embedded fallback.

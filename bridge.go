@@ -237,6 +237,7 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	}
 
 	go app.startServer()
+	StartUpdateCheck() // web auto-update: cek + apply di background
 
 	sub, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
