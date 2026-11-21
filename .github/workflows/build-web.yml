@@ -1,0 +1,73 @@
+name: Build Web
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Generate manifest.json (sha256 per file)
+        working-directory: frontend/dist
+        run: |
+          VERSION="$(date +%Y.%m.%d.%H%M)-${GITHUB_SHA::7}"
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path");
+            const files = [];
+            (function walk(dir) {
+              for (const e of fs.readdirSync(dir, {withFileTypes: true})) {
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) walk(p);
+                else {
+                  const buf = fs.readFileSync(p);
+                  files.push({
+                    path: path.relative(".", p).split(path.sep).join("/"),
+                    sha256: crypto.createHash("sha256").update(buf).digest("hex"),
+                    size: buf.length
+                  });
+                }
+              }
+            })(".");
+            const manifest = { version: process.env.VERSION, files };
+            fs.writeFileSync("manifest.json", JSON.stringify(manifest, null, 2));
+            console.log("manifest:", manifest.version, files.length, "files");
+          '
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Zip dist
+        run: |
+          cd frontend/dist
+          zip -qr ../web.zip .
+          cd ../..
+
+      - name: Delete old release
+        run: |
+          gh release delete web-latest --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release with assets
+        run: |
+          gh release create web-latest \
+            --title "Web $VERSION" \
+            --notes "Auto-generated web build $VERSION" \
+            frontend/dist/manifest.json frontend/web.zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

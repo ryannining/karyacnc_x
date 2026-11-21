@@ -243,6 +243,7 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 		fmt.Println("ERROR: aset frontend tidak tersedia:", err)
 		os.Exit(1)
 	}
+	embedded := http.FileServer(http.FS(sub))
 
 	ln := listenBridge()
 	url := fmt.Sprintf("http://%s/", ln.Addr().String())
@@ -251,7 +252,12 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	mux.HandleFunc("/__bridge", func(w http.ResponseWriter, r *http.Request) {
 		handleBridgeWS(w, r, app)
 	})
-	mux.Handle("/", http.FileServer(http.FS(sub)))
+	// web update: serve from cache if fresh copy exists, else embedded
+	if dir := webAssetDir(); dir != "" {
+		mux.Handle("/", serveWebAsset(dir, embedded))
+	} else {
+		mux.Handle("/", embedded)
+	}
 	go http.Serve(ln, mux)
 
 	fmt.Println("Mode browser: UI di", url)
