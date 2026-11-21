@@ -61,7 +61,7 @@ jobs:
       - name: Build binary (Linux)
         if: matrix.name == 'linux'
         run: |
-          export GOAMD64=v1
+          go env -w GOAMD64=v1
           wails build -debug
 
       - name: Build binary (Windows)
