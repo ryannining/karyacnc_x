@@ -68,6 +68,12 @@ jobs:
           gh release create web-latest \
             --title "Web $VERSION" \
             --notes "Auto-generated web build $VERSION" \
-            frontend/dist/manifest.json frontend/web.zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload all dist files
+        run: |
+          cd frontend/dist
+          gh release upload web-latest $(find . -type f | sed 's|^\./||' | tr '\n' ' ') --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
