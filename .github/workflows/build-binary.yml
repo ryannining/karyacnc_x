@@ -34,8 +34,32 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install Wails (Linux only)
+      - name: Patch Go for baseline x86-64 (Linux only)
         if: matrix.name == 'linux'
+        run: |
+          GOROOT=$(go env GOROOT)
+          # Disable assembly math that requires x86-64-v3 (FMA): exp, exp2.
+          # Pure-Go fallbacks are used instead; perf hit negligible.
+          rm -f "$GOROOT/src/math/exp_amd64.s"
+          cat > "$GOROOT/src/math/exp_asm.go" << 'EOF'
+          //go:build amd64
+
+          package math
+
+          const haveArchExp = false
+          EOF
+          rm -f "$GOROOT/src/math/exp2_amd64.s" 2>/dev/null || true
+          cat > "$GOROOT/src/math/exp2_asm.go" << 'EOF'
+          //go:build amd64
+
+          package math
+
+          const haveArchExp2 = false
+          EOF
+          go env -w GOAMD64=v1
+          echo "GOROOT patched for x86-64-baseline"
+
+      - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 
       - name: Install Linux deps
@@ -47,11 +71,6 @@ jobs:
           sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
           pkg-config --modversion webkit2gtk-4.0
 
-      - name: Install Wails (Windows)
-        if: matrix.name == 'windows'
-        shell: pwsh
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
-
       - name: Build frontend
         working-directory: frontend
         run: |
@@ -60,9 +79,7 @@ jobs:
 
       - name: Build binary (Linux)
         if: matrix.name == 'linux'
-        run: |
-          go env -w GOAMD64=v1
-          wails build -debug
+        run: wails build -debug
 
       - name: Build binary (Windows)
         if: matrix.name == 'windows'
