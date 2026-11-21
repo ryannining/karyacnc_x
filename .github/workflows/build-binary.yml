@@ -89,6 +89,17 @@ jobs:
         if: matrix.name == 'linux'
         run: wails build -debug
 
+      - name: Strip ISA note (Linux, fix old CPU)
+        if: matrix.name == 'linux'
+        run: |
+          # .note.gnu.property claims x86-64-v3 (from AESENC/PSHUFB in runtime
+          # hash asm, guarded by runtime CPU check). The note makes the kernel
+          # refuse to load the binary on older CPUs. Instruction-level v3
+          # instrs (vfmadd etc.) are already removed by the Go patch above;
+          # the remaining SSE/AES ops all exist on baseline+SSSE3 CPUs.
+          objcopy -R .note.gnu.property build/bin/karyacnc
+          readelf -n build/bin/karyacnc | grep -i "x86 ISA" || echo "ISA note removed"
+
       - name: Build binary (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
