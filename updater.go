@@ -76,16 +76,23 @@ func fetchManifest() (*manifest, error) {
 }
 
 // CheckForUpdate membandingkan manifest remote dengan cache lokal.
-// Return: versi terbaru ("" = sudah terbaru), apakah perlu update.
+// Return: versi terbaru ("" = sudah terbaru), apakah ada update.
 func CheckForUpdate() (latestVersion string, updateAvailable bool, err error) {
 	updateMu.Lock()
 	defer updateMu.Unlock()
 
+	fmt.Println("[update] cek manifest:", manifestURL)
 	remote, err := fetchManifest()
 	if err != nil {
+		fmt.Println("[update] cek gagal:", err)
 		return "", false, fmt.Errorf("cek update gagal: %w", err)
 	}
 	local := readLocalManifest()
+	localVer := "tidak ada (pakai embedded)"
+	if local != nil {
+		localVer = local.Version
+	}
+	fmt.Printf("[update] versi lokal: %s | remote: %s\n", localVer, remote.Version)
 	if local != nil && local.Version == remote.Version {
 		return remote.Version, false, nil
 	}
@@ -132,6 +139,8 @@ func ApplyUpdate() (newVersion string, downloaded int, err error) {
 	baseURL := fileBaseURL
 	client := updateHTTPClient
 
+	fmt.Printf("[update] update tersedia: %d file dicek...\n", len(remote.Files))
+	skipped := 0
 	for _, f := range remote.Files {
 		if prev, ok := localByPath[f.Path]; ok && prev.Sha256 == f.Sha256 {
 			// unchanged: copy from cache
@@ -140,11 +149,13 @@ func ApplyUpdate() (newVersion string, downloaded int, err error) {
 			if err := copyFile(src, dst); err != nil {
 				// cache missing/corrupt: fall through to download
 			} else {
+				skipped++
 				continue
 			}
 		}
 		// download — release asset name is flat: "assets/x.js" -> "assets__x.js"
 		assetName := strings.ReplaceAll(f.Path, "/", "__")
+		fmt.Printf("[update] download: %s (%d bytes)\n", f.Path, f.Size)
 		dst := filepath.Join(tmpDir, filepath.FromSlash(f.Path))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return "", downloaded, err
@@ -199,6 +210,7 @@ func ApplyUpdate() (newVersion string, downloaded int, err error) {
 	_ = os.RemoveAll(oldDir)
 
 	currentWebVer = remote.Version
+	fmt.Printf("[update] selesai: %d didownload, %d dipakai dari cache (total %d file)\n", downloaded, skipped, len(remote.Files))
 	return remote.Version, downloaded, nil
 }
 
@@ -229,12 +241,13 @@ func webAssetDir() string {
 	return ""
 }
 
-// UpdateStartup runs in background at startup: check + apply silently.
+// UpdateStartup runs in background at startup: check + apply.
 func StartUpdateCheck() {
 	go func() {
+		fmt.Println("[update] auto-check di startup...")
 		ver, ok, err := CheckForUpdate()
 		if err != nil {
-			fmt.Println("[update] offline / gagal cek:", err)
+			fmt.Println("[update] offline / gagal cek (pakai cache/embed):", err)
 			return
 		}
 		if !ok {
@@ -249,7 +262,7 @@ func StartUpdateCheck() {
 			fmt.Println("[update] apply gagal (pakai cache lama/embed):", err)
 			return
 		}
-		fmt.Printf("[update] web %s -> %s (%d file didownload)\n", ver, newVer, n)
+		fmt.Printf("[update] web %s -> %s (%d file didownload). Refresh halaman untuk pakai versi baru.\n", ver, newVer, n)
 	}()
 }
 
