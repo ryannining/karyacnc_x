@@ -54,6 +54,34 @@ func webCacheDir() string {
 	return filepath.Join(configDir(), "karyacnc", "web")
 }
 
+// cachePathFor maps a manifest path (frontend/... minisketch/... tools_invoice/...)
+// to its location in the cache dir.
+func cachePathFor(manifestPath string) string {
+	return filepath.Join(webCacheDir(), filepath.FromSlash(manifestPath))
+}
+
+// servePathFor maps an HTTP request path to a manifest path.
+//   /            -> frontend/index.html
+//   /app.js      -> frontend/app.js
+//   /sketcher/x  -> minisketch/x
+//   /invoice.html -> tools_invoice/invoice.html
+func servePathFor(reqPath string) (manifestPath string, ok bool) {
+	p := strings.TrimPrefix(filepath.ToSlash(reqPath), "/")
+	switch {
+	case p == "invoice.html" || strings.HasPrefix(p, "invoice/"):
+		return "tools_invoice/" + p, true
+	case p == "sketcher" || p == "sketcher/":
+		return "minisketch/index.html", true
+	case strings.HasPrefix(p, "sketcher/"):
+		return "minisketch/" + strings.TrimPrefix(p, "sketcher/"), true
+	default:
+		if p == "" {
+			p = "index.html"
+		}
+		return "frontend/" + p, true
+	}
+}
+
 // fetchManifest downloads manifest.json from GitHub (no token needed for public repo)
 func fetchManifest() (*manifest, error) {
 	client := updateHTTPClient
@@ -313,22 +341,38 @@ func webAssetHandler() http.Handler {
 	return serveWebAsset(dir, embedded)
 }
 
-// http handler: serve from cache dir if file exists there, else from embedded FS.
-// root is either http.FS(embedded) or os dir.
+// http handler: serve from cache (frontend/ minisketch/ tools_invoice/),
+// fallback ke embedded FS.
 func serveWebAsset(cacheDir string, embedded http.Handler) http.Handler {
+	msSub, _ := fs.Sub(minisketchWebFiles, "minisketch")
+	invSub, _ := fs.Sub(invoiceFiles, "tools_invoice")
+	embeddedMinisketch := http.FileServer(http.FS(msSub))
+	embeddedInvoice := http.FileServer(http.FS(invSub))
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(filepath.ToSlash(r.URL.Path), "/")
-		if p == "" {
-			p = "index.html"
-		}
-		full := filepath.Join(cacheDir, filepath.FromSlash(p))
-		if !strings.HasPrefix(full, cacheDir) { // path traversal guard
-			http.NotFound(w, r)
-			return
-		}
+		manifestPath, _ := servePathFor(r.URL.Path)
+		full := cachePathFor(manifestPath)
 		if st, err := os.Stat(full); err == nil && !st.IsDir() {
 			w.Header().Set("Cache-Control", "no-cache")
 			http.ServeFile(w, r, full)
+			return
+		}
+		// cache miss: fallback ke embedded
+		if strings.HasPrefix(manifestPath, "minisketch/") {
+			// sketcher: embedded serve butuh path tanpa prefix
+			r2 := new(http.Request)
+			*r2 = *r
+			r2.URL = new(url.URL)
+			*r2.URL = *r.URL
+			r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/sketcher")
+			if r2.URL.Path == "" || r2.URL.Path == "/" {
+				r2.URL.Path = "/index.html"
+			}
+			embeddedMinisketch.ServeHTTP(w, r2)
+			return
+		}
+		if strings.HasPrefix(manifestPath, "tools_invoice/") {
+			embeddedInvoice.ServeHTTP(w, r)
 			return
 		}
 		embedded.ServeHTTP(w, r)

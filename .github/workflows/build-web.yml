@@ -24,8 +24,28 @@ jobs:
           npm ci
           npm run build
 
+      # Satu paket update: frontend utama + minisketch + invoice.
+      # Path prefix dipakai untuk routing di app:
+      #   frontend/dist  -> /            (UI utama)
+      #   minisketch     -> /sketcher/
+      #   tools_invoice  -> /invoice.html
+      - name: Collect web bundle
+        run: |
+          mkdir -p bundle/frontend bundle/minisketch bundle/tools_invoice
+          cp -r frontend/dist/. bundle/frontend/
+          cp -r minisketch/. bundle/minisketch/
+          cp -r tools_invoice/. bundle/tools_invoice/
+          # junk filter (SMB leftovers, dsb)
+          find bundle -name ".__smb*" -delete 2>/dev/null || true
+          find bundle -name "._*" -delete 2>/dev/null || true
+          find bundle -name ".DS_Store" -delete 2>/dev/null || true
+          find bundle -name "Thumbs.db" -delete 2>/dev/null || true
+          find bundle -name "desktop.ini" -delete 2>/dev/null || true
+          find bundle -name "*.md" -delete 2>/dev/null || true
+          echo "bundle size: $(du -sh bundle | cut -f1), files: $(find bundle -type f | wc -l)"
+
       - name: Generate manifest.json (sha256 per file)
-        working-directory: frontend/dist
+        working-directory: bundle
         run: |
           export VERSION="$(date +%Y.%m.%d.%H%M)-${GITHUB_SHA::7}"
           node -e '
@@ -51,12 +71,6 @@ jobs:
           '
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Zip dist
-        run: |
-          cd frontend/dist
-          zip -qr ../web.zip .
-          cd ../..
-
       - name: Delete old release
         run: |
           gh release delete web-latest --yes --cleanup-tag 2>/dev/null || true
@@ -67,15 +81,15 @@ jobs:
         run: |
           gh release create web-latest \
             --title "Web $VERSION" \
-            --notes "Auto-generated web build $VERSION" \
+            --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload all dist files
+      - name: Upload all bundle files
         run: |
-          cd frontend/dist
+          cd bundle
           mkdir -p /tmp/upload
-          # flatten: assets/x.js -> assets__x.js
+          # flatten: minisketch/app.js -> minisketch__app.js
           (cd . && find . -type f | while read f; do
             rel="${f#./}"
             cp "$f" "/tmp/upload/${rel//\//__}"
