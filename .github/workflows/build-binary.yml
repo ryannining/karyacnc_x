@@ -38,8 +38,8 @@ jobs:
         if: matrix.name == 'linux'
         run: |
           GOROOT=$(go env GOROOT)
-          # Disable assembly math that requires x86-64-v3 (FMA): exp, exp2.
-          # Pure-Go fallbacks are used instead; perf hit negligible.
+          # math/archExp (exp_amd64.s) uses FMA (x86-64-v3). Remove the .s and
+          # provide a pure-Go fallback so the binary runs on any x86-64 CPU.
           rm -f "$GOROOT/src/math/exp_amd64.s"
           cat > "$GOROOT/src/math/exp_asm.go" << 'EOF'
           //go:build amd64
@@ -47,14 +47,22 @@ jobs:
           package math
 
           const haveArchExp = false
+
+          func archExp(x float64) float64 { return exp(x) }
           EOF
-          rm -f "$GOROOT/src/math/exp2_amd64.s" 2>/dev/null || true
+          # exp2 has no .s on amd64; restrict exp2_asm.go to archs that have one
           cat > "$GOROOT/src/math/exp2_asm.go" << 'EOF'
-          //go:build amd64
+          // Copyright 2021 The Go Authors. All rights reserved.
+          // Use of this source code is governed by a BSD-style
+          // license that can be found in the LICENSE file.
+
+          //go:build arm64 || loong64 || s390x
 
           package math
 
-          const haveArchExp2 = false
+          const haveArchExp2 = true
+
+          func archExp2(x float64) float64
           EOF
           go env -w GOAMD64=v1
           echo "GOROOT patched for x86-64-baseline"
