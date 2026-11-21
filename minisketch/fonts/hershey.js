@@ -78,32 +78,44 @@
   // line's start, x to the right, y up. Returns { strokes, width, height,
   // ascent, lineHeight } — strokes carry only geometry, no frame mapping.
   // multi-line uses the same leading rule as the outline path.
-  function layout(text, sizePx, lineHeightPx, align) {
-    const strokes = [];
-    let widest = 0;
+  function layout(text, sizePx, lineHeightPx, align, trackPx) {
     const lines = String(text == null ? '' : text).split('\n');
     const alignMode = align || 'left';
+    // pen space is reference px at size 1 (pass 2 scales by sizePx), while
+    // trackPx arrives already scaled to sizePx
+    const track = (trackPx || 0) / (sizePx || 1);
+    // Pass 1: measure every line before placing any, so alignment can use the
+    // slack against the WIDDEST line (the outline path's textLineOffsetX
+    // convention) — shifting by a line's own width pushed centered/right
+    // lines outside the box's left edge.
+    const perLine = [];
+    let widest = 0;
     for (let li = 0; li < lines.length; li++) {
       const line = lines[li];
       const pen = { v: 0 };
       const lineStrokes = [];
       for (const ch of line) {
-        if (ch === ' ') { pen.v += SPACE_ADVANCE; continue; }
+        if (ch === ' ') { pen.v += SPACE_ADVANCE + track; continue; }
         const code = ch.charCodeAt(0);
         const g = glyphOf('simplex', code) || glyphOf('script', code) || null;
-        if (!g) { pen.v += SPACE_ADVANCE * 0.6; continue; }
+        if (!g) { pen.v += SPACE_ADVANCE * 0.6 + track; continue; }
         for (const stroke of g.strokes) {
           lineStrokes.push(stroke.map(p => ({ x: p.x + pen.v, y: p.y })));
         }
-        pen.v += g.advance;
+        pen.v += g.advance + track;
       }
       const lineW = Math.max(1e-6, pen.v);
       if (lineW > widest) widest = lineW;
-      // align shifts the whole line inside the measured width
-      const dx = alignMode === 'center' ? (0 - lineW) / 2 : (alignMode === 'right' ? -lineW : 0);
-      for (const st of lineStrokes) {
-        // y is ALREADY canvas-style (down-positive): the baseline sits at 0 and
-        // a cap rises to -0.72 * size. Later lines step DOWN by the leading.
+      perLine.push({ strokes: lineStrokes, w: lineW });
+    }
+    // Pass 2: align inside [0, widest], then scale. y is ALREADY canvas-style
+    // (down-positive): the baseline sits at 0 and a cap rises to -0.72 * size.
+    // Later lines step DOWN by the leading.
+    const strokes = [];
+    for (let li = 0; li < perLine.length; li++) {
+      const L = perLine[li];
+      const dx = alignMode === 'center' ? (widest - L.w) / 2 : (alignMode === 'right' ? widest - L.w : 0);
+      for (const st of L.strokes) {
         strokes.push(st.map(p => ({ x: (p.x + dx) * sizePx, y: li * lineHeightPx - p.y * sizePx })));
       }
     }

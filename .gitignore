@@ -21,3 +21,4 @@ nul
 temp_canvas.txt
 tools/pdf2svg/*.pdf
 tools/pdf2svg/*.svg
+go1.23.6.linux-amd64.tar.gz

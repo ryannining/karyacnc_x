@@ -1517,6 +1517,9 @@
   // How far above the finger a touch-dragged point is lifted so the thumb does
   // not cover it (screen px).
   const TOUCH_LIFT_PX = 70;
+  // A press shorter than this never moves geometry: a trembling click (mouse
+  // jitter at press/release) stays a selection instead of becoming a micro-drag.
+  const DRAG_GATE_MS = 50;
   // Touch "lift": for DRAFTING, steer the pointer from a virtual cursor
   // ~TOUCH_LIFT_PX above the finger so the created point is not hidden by the
   // thumb. Returns the lifted world, or null to keep the real pointer.
@@ -4878,7 +4881,10 @@
     if (!c) return null;
     if (c.type === 'distance') {
       const a = P(c.p1), b = P(c.p2);
-      return a && b ? dist(a, b) : null;
+      if (!a || !b) return null;
+      if (c.axis === 'x') return Math.abs(b.x - a.x);
+      if (c.axis === 'y') return Math.abs(b.y - a.y);
+      return dist(a, b);
     }
     if (c.type === 'radius') {
       const e = state.entities[c.entity];
@@ -6010,27 +6016,47 @@
     // frozen and the array loses its live link on purpose.
     for (const id of newEntityIds) {
       const e = state.entities[id];
-      if (!e || e.type !== 'array' || !Array.isArray(e.masters)) continue;
+      if (!e || e.type !== 'array') continue;
       // Prefer a remapped COPY when the master travelled with the payload
       // (selected together); otherwise link back to the ORIGINAL master if it
       // still exists in this document, so pasting a clone does not duplicate
       // the master's geometry. Only when the original is gone (cross-document
       // paste) fall back to a detached snapshot.
       const remapped = [];
-      let hasLive = false;
-      for (const mid of e.masters) {
+      for (const mid of (e.masters || [])) {
         const mapped = eMap[+mid];
-        if (mapped != null) { remapped.push(mapped); hasLive = true; }
-        else if (state.entities[mid]) { remapped.push(+mid); hasLive = true; }
+        if (mapped != null) remapped.push(mapped);
+        else if (state.entities[mid]) remapped.push(+mid);
       }
-      // The anchor is a WORLD position captured when the clone was made. The
-      // pasted masters moved by (offsetX, offsetY), so the anchor must move with
-      // them — otherwise cloneInstanceOffsets reads a phantom master shift and
-      // cancels it, landing the copy somewhere else entirely.
+      // Does the geometry the instance matrices act on travel by (offsetX,
+      // offsetY)? True when the anchor-providing master was copied (its points
+      // moved) or when the array is a detached snapshot (shifted below). False
+      // when the clone links back to an ORIGINAL master that stayed put.
+      let shapeMoved = !remapped.length;
+      for (const mid of (e.masters || [])) {
+        const m = state.entities[mid];
+        if (m && entityPointIds(m).length) { shapeMoved = eMap[+mid] != null; break; }
+      }
       if (Array.isArray(e.instances)) {
         for (const inst of e.instances) {
-          if (!inst || !Array.isArray(inst.a) || inst.a.length !== 2) continue;
-          inst.a = [+inst.a[0] + offsetX, +inst.a[1] + offsetY];
+          if (!inst || !Array.isArray(inst.m) || inst.m.length !== 6) continue;
+          const m = inst.m;
+          if (shapeMoved) {
+            // The matrix acts on master coords that already moved by d, so to
+            // land the copy exactly +d the translation absorbs d - M_lin*d
+            // (a plain +d scatters ROTATED clones). The anchor follows the
+            // master so cloneInstanceOffsets' pinning compensation stays
+            // neutral instead of cancelling the paste offset.
+            m[4] += offsetX - (m[0] * offsetX + m[2] * offsetY);
+            m[5] += offsetY - (m[1] * offsetX + m[3] * offsetY);
+            if (Array.isArray(inst.a) && inst.a.length === 2) {
+              inst.a = [+inst.a[0] + offsetX, +inst.a[1] + offsetY];
+            }
+          } else {
+            // master stayed: only the copy itself moves
+            m[4] += offsetX;
+            m[5] += offsetY;
+          }
         }
       }
       if (remapped.length) {
@@ -6039,6 +6065,13 @@
         e.shapesEpoch = geometryEpoch;
       } else {
         delete e.masters;   // snapshot-only: no live link to foreign masters
+        // the frozen snapshot IS the geometry now: it must travel too, or the
+        // pasted array renders back at the source document's coordinates
+        for (const s of (e.shapes || [])) {
+          if (s && Array.isArray(s.pts)) {
+            for (const p of s.pts) { p[0] += offsetX; p[1] += offsetY; }
+          }
+        }
       }
     }
     for (const source of src.constraints) {
@@ -6758,6 +6791,60 @@
     if (cancel) cancel.disabled = !p;
     const lock = document.getElementById('xf-lock');
     if (lock) lock.disabled = !active;
+    // Live size of the selection's bounding box under the pending transform,
+    // next to the title: what the object will measure once Apply lands.
+    const sizeEl = document.getElementById('xf-size');
+    if (sizeEl) {
+      let text = '';
+      if (active) {
+        const src = p ? p.orig : null;
+        const pts = src ? src.points : (() => {
+          const m = {};
+          for (const id of selectionPointIds()) { const q = state.points[id]; if (q) m[id] = q; }
+          return m;
+        })();
+        const handles = src ? src.handles : (() => {
+          const m = {};
+          for (const e of selectedEntities()) {
+            if (e.type === 'spline' && e.hs) m[e.id] = e.hs;
+          }
+          return m;
+        })();
+        const radii = src ? src.radii : (() => {
+          const m = {};
+          for (const e of selectedEntities()) {
+            if (e.type === 'circle') m[e.id] = e.r;
+          }
+          return m;
+        })();
+        const map = p ? (x, y) => xfMapOriginal(x, y, p) : (x, y) => ({ x, y });
+        const rs = p ? Math.sqrt(Math.abs(p.sx * p.sy)) : 1;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        const add = (x, y) => {
+          const q = map(x, y);
+          if (q.x < minX) minX = q.x;
+          if (q.x > maxX) maxX = q.x;
+          if (q.y < minY) minY = q.y;
+          if (q.y > maxY) maxY = q.y;
+        };
+        for (const id in pts) { const o = pts[id]; add(o.x, o.y); }
+        for (const eid in handles) {
+          for (const h of (handles[eid].o || []).concat(handles[eid].i || [])) if (h) add(h.x, h.y);
+        }
+        for (const eid in radii) {
+          const e = state.entities[eid];
+          const c = e && P(e.c);
+          if (!c || radii[eid] == null) continue;
+          const q = map(c.x, c.y), r = radii[eid] * rs;
+          if (q.x - r < minX) minX = q.x - r;
+          if (q.x + r > maxX) maxX = q.x + r;
+          if (q.y - r < minY) minY = q.y - r;
+          if (q.y + r > maxY) maxY = q.y + r;
+        }
+        if (isFinite(minX)) text = fmt(maxX - minX) + ' × ' + fmt(maxY - minY);
+      }
+      sizeEl.textContent = text;
+    }
     panel.classList.toggle('inactive', !active);
     panel.classList.toggle('dirty', !!p);
   }
@@ -9688,7 +9775,7 @@
     // colour-consistent cycle — a pure BFS would happily take the first, shortest
     // path whatever its colours, and merge e.g. a black arc with one green edge
     // into a loop, destroying the green rectangle it spans.
-    const bfs = (start, goal, skipKey, startColor) => {
+    const bfs = (start, goal, skipKey, startColor, monoOnly) => {
       const dist = {};
       const prevEdge = {};
       const prevNode = {};
@@ -9720,6 +9807,7 @@
           const ent = state.entities[eg.entity];
           const ec = normColor(ent && ent.color);
           const w = (startColor && ec && ec === startColor) ? 0 : 1;
+          if (monoOnly && w) continue;
           const nd = d + w;
           if (dist[v] === undefined || nd < dist[v]) {
             dist[v] = nd;
@@ -9751,73 +9839,82 @@
     // it can never gain one while loops are extracted (edges are only removed),
     // so failed searches are remembered instead of repeated.
     const noLoop = new Set();
-    let guardLeft = edgeKeys.length + 1;
-    for (const [, compKeys] of edgesByComp) {
-      for (const startKey of compKeys) {
-        if (guardLeft-- <= 0) break;
-        if (usedEdges.has(startKey) || noLoop.has(startKey)) continue;
-        const startEdge = edges[startKey];
-        const startEnt = state.entities[startEdge.entity];
-        const startColor = normColor(startEnt && startEnt.color);
-        const path = bfs(startEdge.bNode, startEdge.aNode, startKey, startColor);
-        if (!path) { noLoop.add(startKey); continue; }
-        const found = { key: startKey, eg: startEdge, path };
-        const steps = [];
-        let cur = found.eg.aNode;
-        steps.push({ edge: found.eg, from: cur, to: found.eg.bNode });
-        cur = found.eg.bNode;
-        for (const key of found.path) {
-          const eg = edges[key];
-          const to = eg.aNode === cur ? eg.bNode : eg.aNode;
-          steps.push({ edge: eg, from: cur, to });
-          cur = to;
-        }
-        usedEdges.add(found.key);
-        for (const key of found.path) usedEdges.add(key);
+    const noLoopMono = new Set();
+    let guardLeft = 2 * (edgeKeys.length + 1);
+    // Two passes: monochrome cycles first, mixed-colour cycles only afterwards.
+    // Colour weights alone are not enough: in one greedy pass the first edge in
+    // document order can steal edges into a mixed cycle (a green chord across a
+    // black outline consumed half the outline before the outline's own turn),
+    // so colour priority has to be a pass order as well as a path weight.
+    for (const monoOnly of [true, false]) {
+      const failed = monoOnly ? noLoopMono : noLoop;
+      for (const [, compKeys] of edgesByComp) {
+        for (const startKey of compKeys) {
+          if (guardLeft-- <= 0) break;
+          if (usedEdges.has(startKey) || failed.has(startKey)) continue;
+          const startEdge = edges[startKey];
+          const startEnt = state.entities[startEdge.entity];
+          const startColor = normColor(startEnt && startEnt.color);
+          const path = bfs(startEdge.bNode, startEdge.aNode, startKey, startColor, monoOnly);
+          if (!path) { failed.add(startKey); continue; }
+          const found = { key: startKey, eg: startEdge, path };
+          const steps = [];
+          let cur = found.eg.aNode;
+          steps.push({ edge: found.eg, from: cur, to: found.eg.bNode });
+          cur = found.eg.bNode;
+          for (const key of found.path) {
+            const eg = edges[key];
+            const to = eg.aNode === cur ? eg.bNode : eg.aNode;
+            steps.push({ edge: eg, from: cur, to });
+            cur = to;
+          }
+          usedEdges.add(found.key);
+          for (const key of found.path) usedEdges.add(key);
 
-        const poly = [];
-        for (const step of steps) {
-          const e = state.entities[step.edge.entity];
-          if (!e) continue;
-          const forward = step.from === step.edge.aNode;
-          let pts = [];
-          if (e.type === 'line') {
-            const a = P(step.edge.pa);
-            const b = P(step.edge.pb);
-            if (!a || !b) continue;
-            // copies: a live point object would follow a later drag and leave a
-            // needle sticking out of the otherwise frozen loop polygon
-            const ac = { x: a.x, y: a.y };
-            const bc = { x: b.x, y: b.y };
-            pts = forward ? [ac, bc] : [bc, ac];
-          } else if (e.type === 'arc') {
-            const ad = arcData(e);
-            if (!ad) continue;
-            pts = sampleArc(ad.c, ad.r, ad.a0, ad.sweep, !forward);
-          } else if (e.type === 'spline') {
-            pts = splineSamplesOf(e);
-            if (!forward) pts = pts.slice().reverse();
-          }
-          for (const p of pts) {
-            if (!poly.length || Math.hypot(p.x - poly[poly.length - 1].x, p.y - poly[poly.length - 1].y) > 1e-9) {
-              poly.push(p);
+          const poly = [];
+          for (const step of steps) {
+            const e = state.entities[step.edge.entity];
+            if (!e) continue;
+            const forward = step.from === step.edge.aNode;
+            let pts = [];
+            if (e.type === 'line') {
+              const a = P(step.edge.pa);
+              const b = P(step.edge.pb);
+              if (!a || !b) continue;
+              // copies: a live point object would follow a later drag and leave a
+              // needle sticking out of the otherwise frozen loop polygon
+              const ac = { x: a.x, y: a.y };
+              const bc = { x: b.x, y: b.y };
+              pts = forward ? [ac, bc] : [bc, ac];
+            } else if (e.type === 'arc') {
+              const ad = arcData(e);
+              if (!ad) continue;
+              pts = sampleArc(ad.c, ad.r, ad.a0, ad.sweep, !forward);
+            } else if (e.type === 'spline') {
+              pts = splineSamplesOf(e);
+              if (!forward) pts = pts.slice().reverse();
+            }
+            for (const p of pts) {
+              if (!poly.length || Math.hypot(p.x - poly[poly.length - 1].x, p.y - poly[poly.length - 1].y) > 1e-9) {
+                poly.push(p);
+              }
             }
           }
-        }
-        if (poly.length > 2) {
-          if (Math.hypot(poly[0].x - poly[poly.length - 1].x, poly[0].y - poly[poly.length - 1].y) < 1e-6) poly.pop();
           if (poly.length > 2) {
-            let area = 0;
-            for (let i = 0; i < poly.length; i++) {
-              const a = poly[i];
-              const b = poly[(i + 1) % poly.length];
-              area += a.x * b.y - b.x * a.y;
+            if (Math.hypot(poly[0].x - poly[poly.length - 1].x, poly[0].y - poly[poly.length - 1].y) < 1e-6) poly.pop();
+            if (poly.length > 2) {
+              let area = 0;
+              for (let i = 0; i < poly.length; i++) {
+                const a = poly[i];
+                const b = poly[(i + 1) % poly.length];
+                area += a.x * b.y - b.x * a.y;
+              }
+              loops.push({ poly, area: Math.abs(area) / 2, steps });
             }
-            loops.push({ poly, area: Math.abs(area) / 2, steps });
           }
-        }
-      }   // end: for each start edge in this component
-    }     // end: for each component
+        }   // end: for each start edge in this component
+      }     // end: for each component
+    }       // end: monochrome pass, then mixed pass
 
     loopCache = loops;
     return loops;
@@ -10771,7 +10868,7 @@
     const lineHeight = textLineHeightPx(e, TEXT_REF);
     let width = 1;
     for (const line of lines) {
-      const w = window.MiniSketchHershey ? window.MiniSketchHershey.layout(line, TEXT_REF, lineHeight, e.align).width : 1;
+      const w = window.MiniSketchHershey ? window.MiniSketchHershey.layout(line, TEXT_REF, lineHeight, e.align, textTrackingPx(e, TEXT_REF)).width : 1;
       if (w > width) width = w;
     }
     // ascent/descent from the cap band: caps 0.72*size above baseline, no
@@ -11356,7 +11453,7 @@
     let m = mNow || textMetricsOf(e);
     if (!m) return []; // font still loading: no stroke layout this frame
     const lay = window.MiniSketchHershey
-      ? window.MiniSketchHershey.layout(e.text, TEXT_REF, m.lineHeight, e.align)
+      ? window.MiniSketchHershey.layout(e.text, TEXT_REF, m.lineHeight, e.align, textTrackingPx(e, TEXT_REF))
       : { strokes: [], width: 1, height: m.height };
     // layout y is already down-positive with the baseline at 0 (a cap is
     // negative); the local box wants y measured from its top, so the baseline
@@ -14185,7 +14282,6 @@
     if (againBtn) againBtn.disabled = !nestLastSpec;
   }
 
-
   function addPanelEntity(pts, color) {
     const clean = [];
     for (const p of pts) {
@@ -14412,14 +14508,17 @@
     const cHdim = newId();
     state.constraints[cHdim] = { id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 10 };
     const id = newId();
+    const font = typeof o.font === 'string' && o.font ? o.font : 'sans-serif';
     state.entities[id] = {
       id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
       text: t,
-      font: typeof o.font === 'string' && o.font ? o.font : 'sans-serif',
+      font,
       weight: isFinite(+o.weight) ? +o.weight : 400,
       italic: !!o.italic,
       tracking: isFinite(+o.tracking) ? clamp(+o.tracking, -30, 60) : 0,
+      leading: textStyleLeading(o.leading),
       align: o.align === 'center' || o.align === 'right' ? o.align : 'left',
+      single: HERSHEY_FAMILIES.includes(font),
       color: (o.color && /^#[0-9a-fA-F]{6}$/.test(o.color)) ? o.color : ui.color,
       fitCurve: loadTextFit()
     };
@@ -17704,12 +17803,28 @@
   // with the last-used styling instead of the hardcoded default, so the font
   // you picked stays picked across sessions.
   const TEXT_STYLE_KEY = 'minisketch.textStyle.v1';
+  function textStyleLeading(v) {
+    return isFinite(+v) ? clamp(+v, 50, 400) : 125;
+  }
+  function textStyleAlign(v) {
+    return v === 'center' || v === 'right' ? v : 'left';
+  }
+  // The dialog shows letter spacing like leading: 100% = normal. Internally
+  // tracking stays an offset in % of the font size (0 = normal), so stored
+  // documents and the generator API keep their meaning.
+  function textTrackingFromPct(v) {
+    return (isFinite(+v) ? clamp(+v, 70, 160) : 100) - 100;
+  }
   function loadTextStyle() {
     try {
       const s = JSON.parse(localStorage.getItem(TEXT_STYLE_KEY) || 'null');
-      if (s && typeof s === 'object') return s;
+      // older stored styles lack leading/align: normalize on read so every
+      // consumer gets the defaults without repeating the validation
+      if (s && typeof s === 'object') {
+        return Object.assign({}, s, { leading: textStyleLeading(s.leading), align: textStyleAlign(s.align) });
+      }
     } catch (err) {}
-    return { font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0 };
+    return { font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0, leading: 125, align: 'left' };
   }
   function saveTextStyle(s) {
     try {
@@ -17717,7 +17832,9 @@
         font: (s.font && typeof s.font === 'string') ? s.font : TEXT_DEFAULT_FONT,
         weight: isFinite(+s.weight) ? +s.weight : 400,
         italic: !!s.italic,
-        tracking: isFinite(+s.tracking) ? clamp(+s.tracking, -30, 60) : 0
+        tracking: isFinite(+s.tracking) ? clamp(+s.tracking, -30, 60) : 0,
+        leading: textStyleLeading(s.leading),
+        align: textStyleAlign(s.align)
       }));
     } catch (err) {}
   }
@@ -17759,8 +17876,11 @@
     const family = font ? font.value : 'sans-serif';
     const wt = weight ? weight.value : '400';
     const it = italic ? italic.value : '0';
-    const tr = tracking ? parseFloat(tracking.value) : 0;
-    const ld = leading ? parseFloat(leading.value) : 125;
+    const tr = textTrackingFromPct(tracking ? tracking.value : 100);
+    const ldRaw = leading ? parseFloat(leading.value) : 125;
+    const ld = isFinite(ldRaw) ? clamp(ldRaw, 50, 400) : 125;
+    const alignEl = document.getElementById('text-align');
+    const align = alignEl && ['left', 'center', 'right'].includes(alignEl.value) ? alignEl.value : 'left';
     const single = HERSHEY_FAMILIES.includes(family);
     // The preview canvas starts from a blank state: 'currentColor' is not a
     // valid canvas fillStyle (the assignment is ignored and black is kept),
@@ -17792,19 +17912,65 @@
     const boxH = cvs.height / dpr;
     ctx.save();
     ctx.scale(dpr, dpr);
-    ctx.fillStyle = ink;
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'center';
+    // Same layout rules as drawTextEntity: local box with a top-left origin,
+    // first baseline at the ascent, lines stepped by the leading, each line
+    // aligned inside the widest line's width. Fit the whole block (width AND
+    // height — two lines already overflow the fixed preview box) without ever
+    // magnifying short text.
     const size = boxH * 0.72;
-    ctx.font = (it === '1' ? 'italic ' : '') + wt + ' ' + size + 'px ' + family;
-    if ('letterSpacing' in ctx) ctx.letterSpacing = ((tr || 0) / 100) * size + 'px';
-    const measure = ctx.measureText(text);
-    const drawW = measure.width || size * text.length * 0.6;
-    const scale = Math.min(1, boxW / Math.max(drawW, 1));
-    ctx.translate(boxW / 2, boxH / 2);
+    const lineHeight = size * ld / 100;
+    const lines = text.split('\n');
+    let W = 1, H = 1, asc = size * 0.8;
+    let lay = null;
+    const widths = [];
+    if (single && window.MiniSketchHershey) {
+      lay = window.MiniSketchHershey.layout(text, size, lineHeight, align, tr / 100 * size);
+      W = Math.max(1, lay.width);
+      asc = size * 0.72;
+      H = asc + size * 0.05 + lineHeight * (lines.length - 1);
+    } else {
+      ctx.font = (it === '1' ? 'italic ' : '') + wt + ' ' + size + 'px ' + family;
+      if ('letterSpacing' in ctx) ctx.letterSpacing = ((tr || 0) / 100) * size + 'px';
+      for (const line of lines) {
+        const mw = ctx.measureText(line.length ? line : 'M').width;
+        widths.push(mw);
+        if (mw > W) W = mw;
+      }
+      const probe = ctx.measureText(lines.join('') || 'M');
+      asc = probe.fontBoundingBoxAscent || probe.actualBoundingBoxAscent || size * 0.8;
+      const desc = probe.fontBoundingBoxDescent || probe.actualBoundingBoxDescent || size * 0.2;
+      H = asc + desc + lineHeight * (lines.length - 1);
+    }
+    const scale = Math.min(1, boxW / W, boxH / Math.max(1, H));
+    ctx.translate((boxW - W * scale) / 2, (boxH - H * scale) / 2);
     ctx.scale(scale, scale);
-    ctx.fillText(text, 0, 0);
-    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    if (lay) {
+      // Hershey families are not canvas fonts: draw the real strokes, exactly
+      // as the canvas will (baseline shifted down by the ascent).
+      ctx.strokeStyle = ink;
+      ctx.lineWidth = 1 / scale;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const st of lay.strokes) {
+        if (!st.length) continue;
+        ctx.beginPath();
+        ctx.moveTo(st[0].x, asc + st[0].y);
+        for (let i = 1; i < st.length; i++) ctx.lineTo(st[i].x, asc + st[i].y);
+        ctx.stroke();
+      }
+    } else {
+      ctx.fillStyle = ink;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      let y = asc;
+      for (let i = 0; i < lines.length; i++) {
+        const x = align === 'center' ? Math.max(0, (W - widths[i]) / 2)
+          : (align === 'right' ? Math.max(0, W - widths[i]) : 0);
+        if (lines[i].length) ctx.fillText(lines[i], x, y);
+        y += lineHeight;
+      }
+      if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    }
     ctx.restore();
   }
 
@@ -17824,7 +17990,7 @@
     const italic = document.getElementById('text-italic');
     if (italic) italic.value = e.italic ? '1' : '0';
     const track = document.getElementById('text-tracking');
-    if (track) track.value = fmt(e.tracking || 0);
+    if (track) track.value = fmt((e.tracking || 0) + 100);
     const lead = document.getElementById('text-leading');
     if (lead) lead.value = fmt(textLeadingOf(e));
     const align = document.getElementById('text-align');
@@ -17911,8 +18077,7 @@
     const single = HERSHEY_FAMILIES.includes(family);
     if (!single) await ensureFontLoaded(family, applyBtn, weightEl ? +weightEl.value || 400 : 400,
       italicEl && italicEl.value === '1' ? 'italic' : 'normal');
-    const trackRaw = trackEl ? parseFloat(trackEl.value) : 0;
-    const tracking = isFinite(trackRaw) ? clamp(trackRaw, -30, 60) : 0;
+    const tracking = textTrackingFromPct(trackEl ? trackEl.value : 100);
     const leadRaw = leadEl ? parseFloat(leadEl.value) : 125;
     const leading = isFinite(leadRaw) ? clamp(leadRaw, 50, 400) : 125;
     pushHistory();
@@ -17925,7 +18090,7 @@
     e.leading = leading;
     e.align = alignEl && ['left', 'center', 'right'].includes(alignEl.value) ? alignEl.value : 'left';
     // Remember the font/style so a new text opens with the same look.
-    saveTextStyle({ font: family, weight: e.weight, italic: e.italic, tracking });
+    saveTextStyle({ font: family, weight: e.weight, italic: e.italic, tracking, leading, align: e.align });
     const tolEl = document.getElementById('text-tol');
     if (tolEl) {
       const t = parseFloat(tolEl.value);
@@ -19545,8 +19710,17 @@
     const sign = Math.sign(g.off) || 1;
     const nxs = g.nx * sign;
     const nys = -g.ny * sign;
-    const labelTxt = labelText || fmt(c.value);
+    const labelTxt = labelText || dimMeasureLabel(c, g);
     drawLabel(c.reference ? '(' + labelTxt + ')' : labelTxt, mx + nxs * 13, my + nys * 13, c.id, isSel);
+  }
+
+  // Label of a point-to-point measure: the axis letter (D/H/V) plus the value
+  // it measures — X span for H, Y span for V, straight distance for D.
+  function dimMeasureLabel(c, g) {
+    if (c.kind) return 'R ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value));
+    if (c.axis === 'x') return 'H ' + fmt(Math.abs(g.p2.x - g.p1.x));
+    if (c.axis === 'y') return 'V ' + fmt(Math.abs(g.p2.y - g.p1.y));
+    return 'D ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value));
   }
 
   function pointDimGeom(c) {
@@ -22851,6 +23025,7 @@
       return;
     }
     if (ev.button !== 0) return;
+    ui._downAt = performance.now();
     const pos = pointerPos(ev);
     if (ev.pointerType === 'touch') { ui._touchPress = { x: pos.x, y: pos.y }; ui._touching = true; }
     const world = s2w(pos.x, pos.y);
@@ -23396,6 +23571,7 @@
       state.entities[id] = {
         id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
         text: 'Text', font: def.font, weight: def.weight, italic: def.italic, tracking: def.tracking,
+        leading: def.leading, align: def.align, single: HERSHEY_FAMILIES.includes(def.font),
         color: ui.color, fitCurve: loadTextFit()
       };
       ensureTextAspect(state.entities[id]);
@@ -24657,6 +24833,24 @@ function cmdSplitCurve() {
 
     if (ui.drag) {
       const d = ui.drag;
+      // Time gate: ignore movement during the first DRAG_GATE_MS of the press.
+      // Once the gate opens, deltas are measured from startWorld, so a fast
+      // drag catches up to the cursor instead of losing the early movement.
+      // A release inside the window leaves moved=false → pointerup pops the
+      // history entry and the press behaves as a plain click.
+      if (!d.moved && ui._downAt && performance.now() - ui._downAt < DRAG_GATE_MS) {
+        // Keep the newest pointer sample and replay it when the gate opens: a
+        // fast flick that stops moving sends no later move events, and without
+        // the replay such a drag would never start at all.
+        d.gateEv = ev;
+        if (!d.gateTimer) {
+          d.gateTimer = setTimeout(() => {
+            d.gateTimer = 0;
+            if (ui.drag === d && !d.moved && d.gateEv) onPointerMove(d.gateEv);
+          }, DRAG_GATE_MS - (performance.now() - ui._downAt));
+        }
+        return;
+      }
       // Part marker drag — the bounded-correction model:
       //   dx,dy  = raw mouse delta from the press (the movement is ALWAYS
       //            this; the part never jumps to the cursor)
@@ -25256,7 +25450,6 @@ function cmdSplitCurve() {
       for (const key in state.entities) {
         const e = state.entities[key];
         if (!e) continue;
-        if (e.type === 'note') continue;
         if (!marqueeCovers(e, w0, w1)) continue;
         kill.add('entity:' + +key);
       }
@@ -25279,13 +25472,15 @@ function cmdSplitCurve() {
     // loop could ever be reached, while a plain click still worked.
     const picked = new Map(ui.selection.map(s => [s.kind + ':' + s.id, s]));
     if (!d.additive) picked.clear();
-    // Text/picture frames are container objects: their p0/pw/ph are the frame,
-    // not marquee point targets. They are picked as whole objects below (loop
-    // filter), so dragging a marquee never grabs a text by its corner points.
+    // Text/picture frames and notes/comments are container objects: their
+    // p0/pw/ph (or a note's anchor p) are the frame, not marquee point targets.
+    // They are picked as whole objects below (loop filter), so dragging a
+    // marquee never grabs a text by its corner points or a comment by its
+    // anchor alone.
     const framePointIds = new Set();
     for (const key in state.entities) {
       const e = state.entities[key];
-      if (!e || (e.type !== 'text' && e.type !== 'image')) continue;
+      if (!e || (e.type !== 'text' && e.type !== 'image' && e.type !== 'note')) continue;
       for (const pid of entityPointIds(e)) framePointIds.add(+pid);
     }
     for (const key in state.points) {
@@ -25305,12 +25500,14 @@ function cmdSplitCurve() {
     }
     // Objects with NO points of their own (a group/art, a clone array, a part)
     // can never be caught by the point rule, so they would be invisible to the
-    // marquee even when entirely inside it. Fully contained => selected.
+    // marquee even when entirely inside it. Framed objects and comments (text,
+    // image, note) are containers too: their anchor/frame points are not point
+    // targets, so they join this pass. Fully contained => selected.
     for (const key in state.entities) {
       const e = state.entities[key];
       if (!e) continue;
       if (e.type !== 'art' && e.type !== 'array' && e.type !== 'part' &&
-        e.type !== 'text' && e.type !== 'image') continue;
+        e.type !== 'text' && e.type !== 'image' && e.type !== 'note') continue;
       if (!d.crossLayer && !entityEditable(e)) continue;
       const bb = entityBounds(e);
       if (!bb) continue;
@@ -25388,6 +25585,7 @@ function cmdSplitCurve() {
       const e = state.entities[s.id];
       if (!e) { picked.delete(key); continue; }
       if (e.type === 'part') continue;               // parts never machine
+      if (e.type === 'note') continue;               // comments are annotations: like a click, never filter-gated
       if (e.type === 'art' || e.type === 'text' || e.type === 'image' || e.type === 'array') {
         if (!pickFilter.loop) picked.delete(key);    // filter 3: containers
         continue;
@@ -26223,6 +26421,7 @@ function cmdSplitCurve() {
     dragSolveSuppressed = false;
     cancelDragAutoSolve();
     ui._dragLift = false;
+    ui._downAt = 0;
     // Line draft on touch: the pending point locks on its first release, and the
     // second-and-later release commits a segment (tap = at the tapped spot,
     // drag = at the lifted tip).
@@ -27413,6 +27612,33 @@ function cmdSplitCurve() {
       updateUI();
       render();
       return;
+    }
+    // H/V/D on a selected point-to-point measure switches the axis it reports:
+    // H = X span, V = Y span, D = diagonal. Measure dimensions never touch the
+    // solver, so this only re-labels and re-measures.
+    if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey &&
+        (lower === 'h' || lower === 'v' || lower === 'd')) {
+      const dims = selectedConstraintIds().filter(cid => {
+        const c = state.constraints[cid];
+        return c && c.type === 'distance' && c.p1 != null && !c.kind;
+      });
+      if (dims.length === 1) {
+        ev.preventDefault();
+        const c = state.constraints[dims[0]];
+        const axis = lower === 'h' ? 'x' : lower === 'v' ? 'y' : null;
+        if ((c.axis || null) !== (axis || null)) {
+          const p1 = P(c.p1), p2 = P(c.p2);
+          if (p1 && p2) {
+            c.axis = axis;
+            c.value = round2(axis === 'x' ? Math.abs(p2.x - p1.x) :
+              axis === 'y' ? Math.abs(p2.y - p1.y) : dist(p1, p2));
+            refreshReferenceDimensions();
+            commit();
+            toast('Measure: ' + (axis === 'x' ? 'X (horizontal)' : axis === 'y' ? 'Y (vertical)' : 'diagonal'));
+          }
+        }
+        return;
+      }
     }
     if (key === 'Enter' && !ui.draft) {
       const dims = selectedConstraintIds().filter(cid => isDimensionConstraint(state.constraints[cid]));
@@ -29604,7 +29830,7 @@ function cmdSplitCurve() {
 
     // quickbar action icons that mirror keyboard-only features (tablet: no
     // Ctrl key): transform / dimension / offset need a selection, array too;
-    // nest & CNC are always allowed (they also download without selection)
+    // CNC is always allowed (it also downloads without selection)
     const qbClick = (id, fn) => {
       const el = document.getElementById(id);
       // arrow wrapper: the click event must never reach fn — pasteClipboard
@@ -29940,7 +30166,7 @@ function cmdSplitCurve() {
     const textApply = document.getElementById('text-apply');
     if (textApply) textApply.addEventListener('click', applyTextEditor);
     const textPreview = document.getElementById('text-preview');
-    const previewInputs = ['text-value','text-font','text-weight','text-italic','text-tracking','text-leading'];
+    const previewInputs = ['text-value','text-font','text-weight','text-italic','text-tracking','text-leading','text-align'];
     for (const id of previewInputs) {
       const el = document.getElementById(id);
       if (!el) continue;
@@ -30857,11 +31083,12 @@ function cmdSplitCurve() {
     }
     // Translate the merged import so its bbox centres on the ACTIVE viewport,
     // leaving the existing sketch where it is. Points get shifted above; here
-    // the curve geometry that lives in ENTITY data (not in points) follows too:
-    // spline handles (absolute world coords) and array snapshot shapes (world
-    // coords). Art contours/curveSrc are stored in the frame's LOCAL
-    // coordinates — they follow the p0/pw/ph anchors and must NOT be shifted
-    // (shifting them turns curves into long diagonal lines).
+    // the geometry that lives in ENTITY data (not in points) follows too:
+    // spline handles, array snapshot shapes, clone placement matrices/anchors,
+    // polar centres and part poses (all absolute world coords). Art
+    // contours/curveSrc are stored in the frame's LOCAL coordinates — they
+    // follow the p0/pw/ph anchors and must NOT be shifted (shifting them turns
+    // curves into long diagonal lines).
     if (isFinite(ix0) && isFinite(ix1)) {
       const dx = prev.view.ox - (ix0 + ix1) / 2;
       const dy = prev.view.oy - (iy0 + iy1) / 2;
@@ -30875,6 +31102,34 @@ function cmdSplitCurve() {
           if (Array.isArray(e.hs.i)) e.hs.i.forEach(sh);
         } else if (e.type === 'array' && Array.isArray(e.shapes)) {
           for (const s of e.shapes) if (s && Array.isArray(s.pts)) s.pts.forEach(shXY);
+        }
+        if (e.type === 'array' && e.kind === 'clone' && Array.isArray(e.instances)) {
+          // A clone matrix acts on the master's CURRENT world coords, which
+          // just moved by (dx, dy). To land the copy exactly +d as well, the
+          // translation must absorb d minus what the linear part already
+          // contributes: t' = t + d - M_lin*d. The anchor follows the master
+          // so the pinning compensation in cloneInstanceOffsets stays neutral
+          // (a stale anchor would cancel the shift and leave the clone at its
+          // original location).
+          for (const inst of e.instances) {
+            if (!inst || !Array.isArray(inst.m) || inst.m.length !== 6) continue;
+            const m = inst.m;
+            m[4] += dx - (m[0] * dx + m[2] * dy);
+            m[5] += dy - (m[1] * dx + m[3] * dy);
+            shXY(inst.a);
+          }
+        }
+        if (e.type === 'array' && e.kind === 'polar' && e.params &&
+            (isFinite(+e.params.cx) || isFinite(+e.params.cy))) {
+          e.params = Object.assign({}, e.params, {
+            cx: (+e.params.cx || 0) + dx, cy: (+e.params.cy || 0) + dy
+          });
+        }
+        if (e.type === 'part' && e.pose) {
+          e.pose.tx += dx; e.pose.ty += dy;
+          if (e.grounded && e.groundAt && isFinite(+e.groundAt.wx)) {
+            e.groundAt.wx += dx; e.groundAt.wy += dy;
+          }
         }
       }
     }
@@ -31047,7 +31302,6 @@ function cmdSplitCurve() {
   // to the old download path, so the button never dead-ends.
   const save = {
     handle: null,          // FileSystemFileHandle from the picker
-    suggested: '',         // last name, used to prefill the dialog
     name: null,            // basename of the document on disk (null = Untitled)
     busy: false
   };
@@ -31109,8 +31363,18 @@ function cmdSplitCurve() {
   }
 
   function saveSuggestName(ext) {
+    // The ACTIVE document's name wins over the remembered one: after a reload
+    // the autosave restores the document (and its caption) but FILENAME_KEY
+    // can still hold a file opened earlier — suggesting that stale name made
+    // Save write "box.sketch" while the user was editing "senapan".
     let base = '';
-    try { base = String(localStorage.getItem(FILENAME_KEY) || '').trim(); } catch (err) { base = ''; }
+    if (save.name) {
+      const dot = save.name.lastIndexOf('.');
+      base = (dot > 0 ? save.name.slice(0, dot) : save.name).trim();
+    }
+    if (!base) {
+      try { base = String(localStorage.getItem(FILENAME_KEY) || '').trim(); } catch (err) { base = ''; }
+    }
     if (!base) base = 'sketch';
     return base.replace(/[\\/:*?"<>|]/g, '_') + ext;
   }
@@ -31118,7 +31382,6 @@ function cmdSplitCurve() {
   function saveRememberName(name) {
     const dot = name.lastIndexOf('.');
     const base = dot > 0 ? name.slice(0, dot) : name;
-    save.suggested = base;
     try { localStorage.setItem(FILENAME_KEY, base); } catch (err) { /* ignore */ }
   }
 
@@ -31157,7 +31420,7 @@ function cmdSplitCurve() {
     }
     try {
       const handle = await window.showSaveFilePicker({
-        suggestedName: save.suggested ? save.suggested + ext : saveSuggestName(ext),
+        suggestedName: saveSuggestName(ext),
         types: [{ description: desc, accept: { 'application/octet-stream': [ext] } }]
       });
       if (!handle) return 'cancelled';
@@ -31678,6 +31941,10 @@ function cmdSplitCurve() {
         return;
       }
       if (ev.key === 'Enter') {
+        // A multi-line editor keeps Enter as a newline; its own keydown wiring
+        // turns Ctrl+Enter into the primary action.
+        const t = ev.target;
+        if (t && (t.tagName === 'TEXTAREA' || t.isContentEditable === true)) return;
         // Enter confirms: the primary button, else the last action button
         const actions = modal.querySelectorAll('.modal-actions button');
         const primary = modal.querySelector('.modal-actions .btn.primary') ||
@@ -31918,6 +32185,9 @@ function cmdSplitCurve() {
     let docName = null;
     try { docName = localStorage.getItem(DOCNAME_KEY); } catch (err) { docName = null; }
     setFileName(loaded ? docName : null);
+    // keep the remembered save name in step with the restored document, so a
+    // file opened in an earlier session cannot leak into the next Save dialog
+    if (loaded && docName) saveRememberName(docName);
     paintFileDirty(false);
 
     // Imported fonts register from IndexedDB; a load bumps FONT_EPOCH, which
