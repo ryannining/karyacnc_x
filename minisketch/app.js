@@ -5065,6 +5065,32 @@
     return ids;
   }
 
+  // Entity ids of the selection, plus the guide lines a framed object owns.
+  //
+  // The framed kinds (text / art / image) hold their frame together with
+  // constraints that live on the GUIDES, not on the framed entity itself:
+  // `horizontal` names a guide line (c.entity = guide id) and `perpendicular`
+  // names the guide pair (c.line1 / c.line2). An ownership test against the
+  // selected ids alone therefore never sees them — rotating a picture via the
+  // transform gizmo left the H constraint behind and the release solve rotated
+  // the frame straight back. selectionPointIds already extends to the guides
+  // for points; this is the same ownership rule for entity ids.
+  function selectionEntityIds() {
+    const ids = new Set();
+    for (const s of ui.selection) {
+      if (s.kind !== 'entity') continue;
+      const e = state.entities[s.id];
+      if (!e) continue;
+      ids.add(+e.id);
+      if ((e.type === 'art' || e.type === 'text' || e.type === 'image') && Array.isArray(e.guide)) {
+        for (const gid of e.guide) {
+          if (state.entities[gid]) ids.add(+gid);
+        }
+      }
+    }
+    return ids;
+  }
+
   function constraintInsideSet(c, pids, eids) {
     const hasP = id => id != null && pids.has(+id);
     const hasE = id => id != null && eids.has(+id);
@@ -5729,7 +5755,7 @@
     const b = selectionBounds();
     if (!b) { toast('Select objects first'); return; }
     const pids = selectionPointIds();
-    const eids = new Set(selectedEntities().map(e => +e.id));
+    const eids = selectionEntityIds();
     const hasPart = selectedEntities().some(e => e.type === 'part');
     if (hasPart) { toast('Parts rotate with the transform tool (R) — they are pose-driven'); return; }
     pushHistory();
@@ -6600,7 +6626,7 @@
       if (xfPivotCache.size > 64) xfPivotCache.delete(xfPivotCache.keys().next().value);
     }
     const pids = selectionPointIds();
-    const eids = new Set(selectedEntities().map(e => +e.id));
+    const eids = selectionEntityIds();
     let removed = 0;
     if (Math.abs(p.angle) > 1e-9) {
       for (const cid in state.constraints) {
@@ -15314,12 +15340,21 @@
     // geometry lands exactly where the image sits instead of at the cursor.
     const frameFrom = o.frameFrom || null;
     let p0, pwId, phId;
+    // Retrace bookkeeping: the source bitmap's pixel size (the tracer's SVG is
+    // in full bitmap pixels, see tools/trace.js — canvas = natural size,
+    // scale 1) and the side ratio the copied frame actually has.
+    let srcMapW = 0, srcMapH = 0, frameRatio = 0;
     if (frameFrom) {
       const q0 = P(frameFrom.p0), qw = P(frameFrom.pw), qh = P(frameFrom.ph);
       if (q0 && qw && qh) {
         p0 = privatePoint(q0.x, q0.y);
         pwId = privatePoint(qw.x, qw.y);
         phId = privatePoint(qh.x, qh.y);
+        srcMapW = +frameFrom.iw || 0;
+        srcMapH = +frameFrom.ih || 0;
+        const sideW = Math.hypot(qw.x - q0.x, qw.y - q0.y);
+        const sideH = Math.hypot(qh.x - q0.x, qh.y - q0.y);
+        if (sideW > 1e-9 && sideH > 1e-9) frameRatio = sideW / sideH;
       }
     }
     pushHistory();
@@ -15344,12 +15379,28 @@
       const cH = newId();
       state.constraints[cH] = { id: cH, type: 'horizontal', entity: idW };
     }
-    const contours = loops.map(loop => loop.map(pt => [(pt[0] - minX) / srcW, (pt[1] - minY) / srcH]));
+    // Fresh paste: the contours' own bounding box becomes the unit square and
+    // the frame is built around it, so the two agree by construction.
+    // Re-trace: normalise in BITMAP space instead. The picture renders every
+    // pixel through world = p0 + (px/iw)·A + (py/ih)·B, so dividing by the
+    // bitmap size puts each traced point exactly where its pixel sits in the
+    // picture — margins kept, nothing stretched. (The old bounding-box
+    // normalisation magnified the artwork across the whole frame and handed
+    // the solver a bbox ratio the copied frame could not satisfy: the solve
+    // then slid/turned the unanchored frame and the trace came out skewed.)
+    const isRetrace = frameRatio > 0 && srcMapW > 0 && srcMapH > 0;
+    const contours = isRetrace
+      ? loops.map(loop => loop.map(pt => [pt[0] / srcMapW, pt[1] / srcMapH]))
+      : loops.map(loop => loop.map(pt => [(pt[0] - minX) / srcW, (pt[1] - minY) / srcH]));
     const id = newId();
     state.entities[id] = {
       id, type: 'art', p0, pw: pwId, ph: phId, guide: [idW, idH],
       contours, closed: contours.map(() => true),
-      ratio: srcW / srcH,
+      // Retrace: the frame's OWN side ratio. The perpendicular + aspect pair
+      // is then satisfied exactly by the copied frame — zero residual — so the
+      // solver has nothing to reconcile and leaves the frame (and the trace
+      // drawn across it) precisely where the picture sits.
+      ratio: isRetrace ? frameRatio : srcW / srcH,
       color: o.color || ui.color
     };
     // the trace dialog's choice: -> Curve gives fitted splines, not lines
