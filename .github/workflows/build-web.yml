@@ -74,6 +74,12 @@ jobs:
       - name: Upload all dist files
         run: |
           cd frontend/dist
-          gh release upload web-latest $(find . -type f | sed 's|^\./||' | tr '\n' ' ') --clobber
+          mkdir -p /tmp/upload
+          # flatten: assets/x.js -> assets__x.js
+          (cd . && find . -type f | while read f; do
+            rel="${f#./}"
+            cp "$f" "/tmp/upload/${rel//\//__}"
+          done)
+          gh release upload web-latest /tmp/upload/* --clobber --repo ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

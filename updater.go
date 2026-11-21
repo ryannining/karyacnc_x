@@ -142,12 +142,13 @@ func ApplyUpdate() (newVersion string, downloaded int, err error) {
 				continue
 			}
 		}
-		// download
+		// download — release asset name is flat: "assets/x.js" -> "assets__x.js"
+		assetName := strings.ReplaceAll(f.Path, "/", "__")
 		dst := filepath.Join(tmpDir, filepath.FromSlash(f.Path))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return "", downloaded, err
 		}
-		resp, err := client.Get(baseURL + f.Path)
+		resp, err := client.Get(baseURL + assetName)
 		if err != nil {
 			return "", downloaded, fmt.Errorf("download %s gagal: %w", f.Path, err)
 		}
