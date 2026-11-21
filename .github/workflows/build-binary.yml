@@ -43,6 +43,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libnss3-dev libasound2-dev pkg-config
+          # Wails v2.11 hardcode webkit2gtk-4.0; ubuntu 24 ships 4.1 only
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
+          pkg-config --modversion webkit2gtk-4.0
 
       - name: Install Wails (Windows)
         if: matrix.name == 'windows'
