@@ -26,7 +26,8 @@ import (
 
 const (
 	updateRepo  = "ryannining/karyacnc_x"
-	manifestURL = "https://raw.githubusercontent.com/" + updateRepo + "/master/frontend/dist/manifest.json"
+	manifestURL = "https://github.com/" + updateRepo + "/releases/download/web-latest/manifest.json"
+	fileBaseURL = "https://github.com/" + updateRepo + "/releases/download/web-latest/"
 )
 
 var updateHTTPClient = &http.Client{Timeout: 15 * time.Second}
@@ -127,7 +128,7 @@ func ApplyUpdate() (newVersion string, downloaded int, err error) {
 		return "", 0, err
 	}
 
-	baseURL := "https://raw.githubusercontent.com/" + updateRepo + "/master/frontend/dist/"
+	baseURL := fileBaseURL
 	client := updateHTTPClient
 
 	for _, f := range remote.Files {

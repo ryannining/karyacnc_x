@@ -28,6 +28,7 @@ jobs:
         working-directory: frontend/dist
         run: |
           VERSION="$(date +%Y.%m.%d.%H%M)-${GITHUB_SHA::7}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
           node -e '
             const fs = require("fs"), crypto = require("crypto"), path = require("path");
             const files = [];
@@ -49,7 +50,6 @@ jobs:
             fs.writeFileSync("manifest.json", JSON.stringify(manifest, null, 2));
             console.log("manifest:", manifest.version, files.length, "files");
           '
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Zip dist
         run: |
