@@ -62,12 +62,12 @@ jobs:
         if: matrix.name == 'linux'
         run: |
           export GOAMD64=v1
-          wails build
+          wails build -debug
 
       - name: Build binary (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
-        run: wails build
+        run: wails build -debug
 
       - name: Rename binary
         shell: pwsh
