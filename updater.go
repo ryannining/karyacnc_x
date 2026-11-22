@@ -364,17 +364,22 @@ func currentWebVersion() string {
 }
 
 // webAssetHandler returns handler for Wails AssetServer: cache first, embedded fallback.
+// Cache dicek tiap request (bukan sekali di startup) agar update web yang
+// tiba (selama aplikasi hidup) segera diterima tanpa restart.
 func webAssetHandler() http.Handler {
 	sub, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		panic(err)
 	}
 	embedded := http.FileServer(http.FS(sub))
-	dir := webAssetDir()
-	if dir == "" {
-		return embedded // no cache yet: pure embedded
-	}
-	return serveWebAsset(dir, embedded)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dir := webAssetDir()
+		if dir == "" {
+			embedded.ServeHTTP(w, r)
+			return
+		}
+		serveWebAsset(dir, embedded).ServeHTTP(w, r)
+	})
 }
 
 // http handler: serve from cache (frontend/ minisketch/ tools_invoice/),

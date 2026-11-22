@@ -895,15 +895,19 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "" {
 				r.URL.Path = "/"
 			}
-			// serve dari cache web (auto-update) dulu, fallback dev folder, terakhir embedded
-			cachePath := filepath.Join(webCacheDir(), "minisketch", filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
-			if st, err := os.Stat(cachePath); err == nil && !st.IsDir() && readLocalManifest() != nil {
-				if SHOWDEBUG {
-					log.Printf("Serving minisketch from web cache: %s", cachePath)
+			// prioritas: cache web (auto-update) -> folder dev -> embedded.
+			// Folder dev hanya menang kalau cache TIDAK aktif (manifest lama/
+			// tidak ada) — untuk debugging dengan sync_minisketch.sh.
+			if readLocalManifest() != nil {
+				cachePath := filepath.Join(webCacheDir(), "minisketch", filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
+				if st, err := os.Stat(cachePath); err == nil && !st.IsDir() {
+					if SHOWDEBUG {
+						log.Printf("Serving minisketch from web cache: %s", cachePath)
+					}
+					w.Header().Set("Cache-Control", "no-cache")
+					http.ServeFile(w, r, cachePath)
+					return
 				}
-				w.Header().Set("Cache-Control", "no-cache")
-				http.ServeFile(w, r, cachePath)
-				return
 			}
 			devPath := "minisketch"
 			if _, err := os.Stat(devPath); err == nil {
