@@ -5976,28 +5976,50 @@
     const done = () => toast('Copied ' + countTxt +
       ' \u00b7 SVG, PNG & sketch on the clipboard');
     const armLegacy = () => {
-      // the copy event fires right after Ctrl+C; if it never comes (browser
-      // blocked it) do not hijack some later, unrelated copy
+      // the copy event fires right after Ctrl+C (or any native copy gesture);
+      // it must be armed SYNCHRONOUSLY, inside the keydown handler, or the
+      // event passes us by and the OS clipboard is never touched — this is
+      // what happens when the async Clipboard API is blocked by a permissions
+      // policy (e.g. MiniSketch embedded in KaryaCNC): the async write fails
+      // asynchronously, after the copy event is gone.
       clipCopyRequested = true;
       setTimeout(() => { clipCopyRequested = false; }, 800);
     };
+    // Always arm the legacy copy-event route first: it is not affected by the
+    // Clipboard API permissions policy and guarantees the OS clipboard still
+    // receives the SVG (text/plain + image/svg+xml) and the sketch payload
+    // (text/html). The async route is then attempted as an UPGRADE that adds
+    // the PNG flavour — if it succeeds it replaces the copy-event payload with
+    // the full set; if it fails (policy, focus, …) the copy-event payload
+    // already written stands.
+    armLegacy();
     if (canWriteAsyncClipboard()) {
       writeMultiFormatClipboard(clipboard, svg, json, pngPromise)
-        .then(ok => { if (!ok) armLegacy(); done(); })
-        .catch(() => { armLegacy(); done(); });
+        .then(() => done())
+        .catch(() => done());
     } else {
-      armLegacy();
       done();
     }
   }
 
-  // True when the async clipboard API is present on a secure context. The
-  // keydown handler runs inside the user gesture, so the write inherits the
-  // activation that the API requires.
+  // True when the async clipboard API is present on a secure context and not
+  // blocked by a permissions policy. The keydown handler runs inside the user
+  // gesture, so the write inherits the activation that the API requires.
+  // When the current document is embedded (iframe) the host can deny
+  // "clipboard-write" via Permissions Policy — the async API then violates on
+  // every call, so prefer the copy-event route there.
   function canWriteAsyncClipboard() {
-    return typeof ClipboardItem === 'function' &&
-      navigator.clipboard && typeof navigator.clipboard.write === 'function' &&
-      (typeof window === 'undefined' || window.isSecureContext !== false);
+    if (typeof ClipboardItem !== 'function' ||
+        !navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
+      return false;
+    }
+    if (typeof window !== 'undefined' && window.isSecureContext === false) return false;
+    try {
+      if (document.featurePolicy && typeof document.featurePolicy.allowsFeature === 'function') {
+        if (!document.featurePolicy.allowsFeature('clipboard-write')) return false;
+      }
+    } catch (err) { /* policy introspection unavailable — allow the attempt */ }
+    return true;
   }
 
   // A minimal SVG for a point-only selection (exportSVG draws nothing for
@@ -13082,6 +13104,67 @@
     toast('Cloned — edit the master to reshape it, R to place it');
   }
 
+  // Clone-split (Ctrl+Shift+L): manual nesting without the wait. It runs the
+  // SAME part decomposition the nest engine is fed at start — nestCollectLoops
+  // (document loops fully covered by the selection; green sheet loops separated
+  // out; a not-yet-ungrouped text stays the one atomic part it is for nesting)
+  // and nestGroupParts (a loop inside another loop is that part's hole) — then
+  // creates ONE live clone per compound part, shifted right of the selection's
+  // bounding box. Each part is its own clone object, so wall drag can move AND
+  // rotate it while packing by hand; edit the original and the part follows.
+  // Ctrl+L stays the whole-selection single clone (cmdClone above).
+  function cmdCloneSplit() {
+    if (xfBlock()) return;
+    // the exact input stage of Start nesting:
+    const { sheetLoops, partLoops } = nestCollectLoops();
+    const objects = nestGroupParts(partLoops);
+    if (!objects.length) {
+      toast(sheetLoops.length
+        ? 'Only sheet (green) loops in the selection — select the parts to arrange'
+        : 'Select the shapes to clone');
+      return;
+    }
+    // every part lands one selection-width to the right, arranged as the
+    // original (the shift cmdClone uses) — ready to be dragged into place
+    const b = selectionBounds();
+    const gap = 10;
+    const mat = [1, 0, 0, 1, b ? (b.maxX - b.minX) + gap : 50, 0];
+
+    pushHistory();
+    const newIds = [];
+    for (const obj of objects) {
+      // the same masters a nest-result part carries: the outer loop's entities
+      // plus every hole's
+      const partMasters = obj.outer.entityIds
+        .concat(...obj.holeRecs.map(h => h.entityIds))
+        .filter(id => state.entities[id]);
+      if (!partMasters.length) continue;
+      const inst = { m: mat.slice() };
+      const anchor = nestAnchorOf(partMasters);
+      if (anchor) inst.a = anchor;
+      const id = newId();
+      state.entities[id] = {
+        id, type: 'array', kind: 'clone',
+        params: { origin: 'split' },
+        color: colorOf(state.entities[partMasters[0]]),
+        layer: ui.activeLayer,
+        masters: partMasters,
+        instances: [inst]
+      };
+      delete state.entities[id].shapes;
+      newIds.push(id);
+    }
+    if (!newIds.length) {
+      toast('Nothing to split — the selection has no nestable parts');
+      return;
+    }
+    ui.selection = newIds.map(id => ({ kind: 'entity', id }));
+    invalidateLoops();
+    commit();
+    toast(newIds.length + ' part' + (newIds.length === 1 ? '' : 's') +
+      ' to the right \u2014 drag each into place, R to rotate');
+  }
+
   function arrayInstanceOffsets(e) {
     const out = [];
     if (e.kind === 'clone') return cloneInstanceOffsets(e);
@@ -13255,6 +13338,14 @@
   // is what keeps a big array cheap to draw.
   function arrayEnsureShapes(e) {
     if (e.shapes && e.shapesEpoch === geometryEpoch) return;
+    // A detached snapshot array (a clone-split piece, a pasted copy) has no
+    // masters to rebuild from — its shapes ARE the payload, so an epoch bump
+    // re-stamps the epoch and nothing else. Rebuilding from the empty master
+    // list would erase the piece.
+    if (e.shapes && (!Array.isArray(e.masters) || !e.masters.length)) {
+      e.shapesEpoch = geometryEpoch;
+      return;
+    }
     e.shapes = arrayBuildShapes(e.masters);
     e.shapesEpoch = geometryEpoch;
     arrayReanchorGuide(e);
@@ -13262,8 +13353,8 @@
 
   // The grid array's guide (the two green construction lines) exists only to
   // show the dx/dy spacing, anchored at the master's bounding-box TOP-LEFT
-  // (minX, maxY in world coords — Y is down, so maxY is the top edge). The
-  // anchor is a private point with no geometric link to the master, so when
+  // (minX, minY in world coords — Y is down, so minY is the top edge).
+  // The anchor is a private point with no geometric link to the master, so when
   // the master moves or reshapes the guide would stay behind (or drift when
   // the solver runs). Every time the master geometry changes we translate the
   // three guide points together by the delta to the master's current top-left,
@@ -13289,7 +13380,8 @@
       }
     }
     if (!any || !isFinite(minX)) return;
-    const tx = minX - p0.x, ty = maxY - p0.y;
+    // (minX, minY) is the master's visual top-left — Y runs down
+    const tx = minX - p0.x, ty = minY - p0.y;
     if (Math.abs(tx) < 1e-9 && Math.abs(ty) < 1e-9) return;
     p0.x += tx; p0.y += ty;
     pw.x += tx; pw.y += ty;
@@ -14958,7 +15050,10 @@
       }
     }
     const p0x = isFinite(minX) ? minX : 0;
-    const p0y = isFinite(maxY) ? maxY : 0;
+    // World Y runs DOWN (canvas), so the visual top edge is minY — the guide
+    // anchor is the master's TOP-LEFT corner. (Before the 2026-11-08 Y-axis
+    // flip this read maxY, which anchored the guides at the bottom-left.)
+    const p0y = isFinite(minY) ? minY : 0;
     const dx = isFinite(+params.dx) && Math.abs(+params.dx) > 1e-4 ? +params.dx : 10;
     const dy = isFinite(+params.dy) && Math.abs(+params.dy) > 1e-4 ? +params.dy : 10;
 
@@ -18389,7 +18484,7 @@
       { title: { en: 'Tools', id: 'Alat' }, keys: ['Shift+B', 'B', '*', 'A', 'E', 'R', 'T', 'I', 'Shift+E', 'Ctrl+M'] },
       { title: { en: 'Dimensions', id: 'Dimensi' }, keys: ['D', 'Shift+D'] },
       { title: { en: 'Constraints', id: 'Constraint' }, keys: ['G', 'O', 'H', 'V', 'P', '[', 'Q', '.', 'M', 'F', 'J', '\\', 'Alt+T'] },
-      { title: { en: 'Edit', id: 'Edit' }, keys: ['Z', 'N', 'Shift+L', 'Alt+W', 'Ctrl+J', 'Ctrl+K', 'Ctrl+Shift+M', 'Ctrl+G', 'Ctrl+U', 'Ctrl+L'] },
+      { title: { en: 'Edit', id: 'Edit' }, keys: ['Z', 'N', 'Shift+L', 'Alt+W', 'Ctrl+J', 'Ctrl+K', 'Ctrl+Shift+M', 'Ctrl+G', 'Ctrl+U', 'Ctrl+L', 'Ctrl+Shift+L'] },
       { title: { en: 'Boolean', id: 'Boolean' }, keys: ['Ctrl++', 'Ctrl+-', 'Ctrl+0'] },
       { title: { en: 'View & solve', id: 'Tampilan' }, keys: ['#', '%', '3', 'F1', 'F2', 'F3', 'Alt+1', 'Alt+2', 'Alt+3', 'Shift+F', 'F9', '?', 'Shift+Z'] },
       { title: { en: 'Machine', id: 'Mesin' }, keys: ['Alt+Q', 'Alt+C'] },
@@ -28012,6 +28107,7 @@ function cmdSplitCurve() {
     { key: 'Ctrl+G', chip: 'Ct+G', label: 'Group', match: 'rb-group', kind: 'cmd' },
     { key: 'Ctrl+U', chip: 'Ct+U', label: 'Ungroup', match: 'rb-ungroup', kind: 'cmd' },
     { key: 'Ctrl+L', chip: 'Ct+L', label: 'Clone', match: 'rb-clone', kind: 'cmd' },
+    { key: 'Ctrl+Shift+L', chip: 'Ct+Sh+L', label: 'Clone as nest parts', match: '', kind: 'cmd' },
     { key: 'Ctrl++', chip: 'Ct++', label: 'Union', match: 'union', kind: 'cmd' },
     { key: 'Ctrl+-', chip: 'Ct+-', label: 'Cut', match: 'cut', kind: 'cmd' },
     { key: 'Ctrl+0', chip: 'Ct+0', label: 'Intersect', match: 'intersect', kind: 'cmd' }
@@ -28307,9 +28403,10 @@ function cmdSplitCurve() {
       return;
     }
     if ((ev.ctrlKey || ev.metaKey) && lower === 'l') {
-      // Ctrl+L is the browser's address bar: claim it for Clone
+      // Ctrl+L claims the browser's address bar: Clone; Shift splits it per loop
       ev.preventDefault();
-      cmdClone();
+      if (ev.shiftKey) cmdCloneSplit();
+      else cmdClone();
       return;
     }
     if ((ev.ctrlKey || ev.metaKey) && lower === 'k') {
