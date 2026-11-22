@@ -81,7 +81,8 @@ jobs:
         run: |
           gh release create web-latest \
             --title "Web $VERSION" \
-            --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)"
+            --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" \
+            --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
