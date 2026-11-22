@@ -5982,47 +5982,22 @@
       setTimeout(() => { clipCopyRequested = false; }, 800);
     };
     if (canWriteAsyncClipboard()) {
-      clipboardWriteAllowed().then(allowed => {
-        if (!allowed) { armLegacy(); done(); return; }
-        return writeMultiFormatClipboard(clipboard, svg, json, pngPromise)
-          .then(ok => { if (!ok) armLegacy(); done(); })
-          .catch(() => { armLegacy(); done(); });
-      }).catch(() => { armLegacy(); done(); });
+      writeMultiFormatClipboard(clipboard, svg, json, pngPromise)
+        .then(ok => { if (!ok) armLegacy(); done(); })
+        .catch(() => { armLegacy(); done(); });
     } else {
       armLegacy();
       done();
     }
   }
 
-  // Probe whether the async clipboard write is allowed by the permissions
-  // policy of this document. Returns a promise<boolean>; false when the
-  // Permissions API is unavailable (treat as allowed, the write itself will
-  // fall back via catch).
-  function clipboardWriteAllowed() {
-    try {
-      if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
-        return Promise.resolve(true);
-      }
-      return navigator.permissions.query({ name: 'clipboard-write' })
-        .then(st => st.state === 'granted' || st.state === 'prompt')
-        .catch(() => true);
-    } catch (err) {
-      return Promise.resolve(true);
-    }
-  }
-
   // True when the async clipboard API is present on a secure context. The
   // keydown handler runs inside the user gesture, so the write inherits the
   // activation that the API requires.
-  // Note: on plain http:// (LAN access) Chromium blocks the async clipboard
-  // via permissions policy AND logs a console violation on every call — so we
-  // probe with the Permissions API first and only take Route A when it is
-  // actually granted, keeping the console clean.
   function canWriteAsyncClipboard() {
-    if (typeof ClipboardItem === 'function' ||
-        !navigator.clipboard || typeof navigator.clipboard.write !== 'function') return false;
-    if (typeof window !== 'undefined' && window.isSecureContext === false) return false;
-    return true;
+    return typeof ClipboardItem === 'function' &&
+      navigator.clipboard && typeof navigator.clipboard.write === 'function' &&
+      (typeof window === 'undefined' || window.isSecureContext !== false);
   }
 
   // A minimal SVG for a point-only selection (exportSVG draws nothing for
