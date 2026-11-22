@@ -8890,6 +8890,7 @@
 
   function entityScreenDistance(e, sx, sy) {
     if (!layerVisible(e) || !entityEditable(e)) return Infinity;
+    if (e._draft) return Infinity;   // a text draft is not on the canvas yet
     if (e.type === 'note') {
       const p = P(e.p);
       if (!p) return Infinity;
@@ -18378,6 +18379,7 @@
       // unreachable. Weight and Style in the row below pick the face.
       for (const cat of reg.categories()) {
         if (cat === 'Imported' && !reg.imported().length) continue;
+        if (cat === 'System' && !(reg.systemList && reg.systemList().length)) continue;
         const g = document.createElement('optgroup');
         g.label = cat;
         sel.appendChild(g);
@@ -18390,6 +18392,11 @@
         if (cat === 'Imported') {
           for (const f of reg.imported()) addOpt(g, f.family, f.family);
         }
+        if (cat === 'System') {
+          // remembered family names from the Local Font Access scan; the bytes
+          // of one are read the moment it is applied
+          for (const f of reg.systemList()) addOpt(g, f.family, f.family);
+        }
       }
     } else {
       // registry not loaded (font files missing): plain generic families so
@@ -18400,6 +18407,7 @@
       for (const f of ['sans-serif', 'serif', 'monospace']) addOpt(g, f, f);
     }
     if (selValue != null) setTextFontValue(sel, selValue);
+    fontPickSync();
   }
 
   function setTextFontValue(sel, want) {
@@ -18417,6 +18425,225 @@
       group.appendChild(o);
     }
     sel.value = want;
+    fontPickSync();
+  }
+
+  // ---- Font picker: a filterable list over the #text-font state holder ----
+  // Hundreds of installed families do not fit the dialog, and a native select
+  // popup can neither be filtered nor scrolled comfortably. The <select> stays
+  // the STATE HOLDER (hidden): preview wiring, Apply and the lazy face load
+  // all keep reading it; the picker renders its options as a searchable panel
+  // and writes the choice back through the select's own change event, so no
+  // existing consumer changes.
+  const FONT_PICK_MAX_ROWS = 400;
+  let fontPickBound = false;
+  let fontPickKb = -1;   // keyboard-highlighted row index over the visible rows
+
+  // The rows the panel should show right now: filter by the typed name, drop
+  // the System group when the checkbox says so, and always keep the applied
+  // family reachable even when its group is filtered off.
+  function fontPickVisibleRows() {
+    const sel = document.getElementById('text-font');
+    if (!sel) return [];
+    const box = document.getElementById('font-pick-box');
+    const q = (box && box.value || '').trim().toLowerCase();
+    const sysEl = document.getElementById('font-pick-system');
+    const sysOn = !sysEl || sysEl.checked;
+    const current = sel.value;
+    const rows = [];
+    let seenCurrent = false;
+    for (const node of sel.children) {
+      const isGroup = node.tagName === 'OPTGROUP';
+      const group = isGroup ? (node.label || '') : '';
+      if (isGroup && group === 'System' && !sysOn) continue;
+      const opts = isGroup ? node.querySelectorAll('option') : [node];
+      for (const o of opts) {
+        const v = o.value || o.textContent;
+        if (v === current) seenCurrent = true;
+        if (q && v.toLowerCase().indexOf(q) < 0) continue;
+        rows.push({ group, value: v });
+      }
+    }
+    if (current && !seenCurrent) rows.unshift({ group: '', value: current, pinned: true });
+    return rows;
+  }
+
+  function fontPickRender() {
+    const list = document.getElementById('font-pick-list');
+    const sel = document.getElementById('text-font');
+    if (!list || list.hidden || !sel) return;
+    const rows = fontPickVisibleRows();
+    const curIdx = rows.findIndex(r => r.value === sel.value);
+    if (fontPickKb < 0 || fontPickKb >= rows.length) fontPickKb = curIdx >= 0 ? curIdx : (rows.length ? 0 : -1);
+    list.innerHTML = '';
+    let lastGroup = null;
+    let shown = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (shown >= FONT_PICK_MAX_ROWS) {
+        const more = document.createElement('div');
+        more.className = 'font-pick-empty';
+        more.textContent = '+' + (rows.length - shown) + ' more \u2014 keep typing';
+        list.appendChild(more);
+        break;
+      }
+      shown++;
+      if ((r.group || '') !== lastGroup) {
+        lastGroup = r.group || '';
+        const head = document.createElement('div');
+        head.className = 'font-pick-head';
+        head.textContent = r.pinned ? 'current' : (lastGroup || 'Fonts');
+        list.appendChild(head);
+      }
+      const row = document.createElement('div');
+      row.className = 'font-pick-row' +
+        (r.value === sel.value ? ' active' : '') +
+        (i === fontPickKb ? ' kb' : '');
+      row.textContent = r.value;
+      row.title = r.value;
+      row.addEventListener('click', () => fontPickChoose(r.value));
+      list.appendChild(row);
+    }
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'font-pick-empty';
+      empty.textContent = 'No font matches';
+      list.appendChild(empty);
+    }
+  }
+
+  function fontPickChoose(value) {
+    const sel = document.getElementById('text-font');
+    const box = document.getElementById('font-pick-box');
+    if (!sel) return;
+    if (sel.value !== value) {
+      sel.value = value;
+      // the select's own input/change listeners repaint the preview and lazy-
+      // load the face — dispatching keeps that plumbing untouched
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (box) box.value = value;
+    fontPickOpen(false);
+  }
+
+  // position: fixed escapes the modal's overflow-y clipping; re-anchored to
+  // the input box every time it opens (and while the dialog scrolls). It
+  // drops below the box by default and flips ABOVE it when the viewport has
+  // no room left underneath.
+  function fontPickPosition() {
+    const list = document.getElementById('font-pick-list');
+    const box = document.getElementById('font-pick-box');
+    if (!list || list.hidden || !box) return;
+    const r = box.getBoundingClientRect();
+    list.style.width = Math.max(r.width, 230) + 'px';
+    const spaceBelow = window.innerHeight - r.bottom;
+    const spaceAbove = r.top;
+    if (spaceBelow < 250 && spaceAbove > spaceBelow) {
+      list.style.top = '';
+      list.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+    } else {
+      list.style.bottom = '';
+      list.style.top = (r.bottom + 4) + 'px';
+    }
+    list.style.left = r.left + 'px';
+  }
+
+  function fontPickOpen(open) {
+    const list = document.getElementById('font-pick-list');
+    const box = document.getElementById('font-pick-box');
+    if (!list) return;
+    if (open) {
+      // a fresh open shows the WHOLE catalogue with the applied family
+      // highlighted; the filter starts empty and narrows only when typing
+      if (box) box.value = '';
+      fontPickKb = -1;
+      list.hidden = false;
+      fontPickRender();
+      fontPickPosition();
+    } else {
+      list.hidden = true;
+      fontPickKb = -1;
+      // without a choice the box goes back to showing the applied family
+      fontPickSync();
+    }
+  }
+
+  // keep the input display and (open) panel in step with the select — called
+  // wherever the select's options or value are rebuilt
+  function fontPickSync() {
+    const sel = document.getElementById('text-font');
+    const box = document.getElementById('font-pick-box');
+    if (sel && box) box.value = sel.value || '';
+    const list = document.getElementById('font-pick-list');
+    if (list && !list.hidden) fontPickRender();
+  }
+
+  function fontPickInit() {
+    if (fontPickBound) return;
+    const box = document.getElementById('font-pick-box');
+    const sys = document.getElementById('font-pick-system');
+    const pick = document.getElementById('font-pick');
+    if (!box || !sys || !pick) return;
+    fontPickBound = true;
+    // click, not just focus: .focus() does NOT fire again on an already
+    // focused field, so re-opening the panel by clicking the box would break.
+    // Both must NOT re-open while the panel is already open — fontPickOpen
+    // clears the box, which would wipe a half-typed filter.
+    const reopenIfClosed = () => {
+      const l = document.getElementById('font-pick-list');
+      if (l && l.hidden) { fontPickKb = -1; fontPickOpen(true); }
+    };
+    box.addEventListener('click', reopenIfClosed);
+    box.addEventListener('focus', reopenIfClosed);
+    box.addEventListener('input', () => {
+      fontPickKb = -1;
+      const l = document.getElementById('font-pick-list');
+      if (l && l.hidden) fontPickOpen(true);
+      else fontPickRender();
+    });
+    box.addEventListener('keydown', (ev) => {
+      const list = document.getElementById('font-pick-list');
+      if (ev.key === 'Escape') {
+        // Escape closes the panel first; only a second Escape reaches the
+        // dialog's own cancel path
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (list && !list.hidden) fontPickOpen(false);
+        else box.blur();
+        return;
+      }
+      const rows = fontPickVisibleRows();
+      if (!rows.length) return;
+      // a stored highlight indexes the PREVIOUS row set: clamp it before use
+      // or Enter could resolve to nothing after the filter changed the list
+      fontPickKb = Math.min(fontPickKb, rows.length - 1);
+      if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        if (!list || list.hidden) fontPickOpen(true);
+        const delta = ev.key === 'ArrowDown' ? 1 : -1;
+        fontPickKb = fontPickKb < 0
+          ? (delta > 0 ? 0 : rows.length - 1)
+          : Math.max(0, Math.min(rows.length - 1, fontPickKb + delta));
+        fontPickRender();
+        const kb = list && list.querySelector('.font-pick-row.kb');
+        if (kb) kb.scrollIntoView({ block: 'nearest' });
+        return;
+      }
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        const pick0 = rows[fontPickKb];
+        if (pick0) fontPickChoose(pick0.value);
+      }
+    });
+    sys.addEventListener('change', () => { fontPickKb = -1; fontPickOpen(true); });
+    document.addEventListener('pointerdown', (ev) => {
+      if (pick.contains(ev.target)) return;
+      fontPickOpen(false);
+    });
+    window.addEventListener('resize', fontPickPosition);
+    const modal = document.getElementById('text-modal');
+    if (modal) modal.addEventListener('scroll', fontPickPosition, true);
   }
 
   // A bundled family must have its bytes registered before the canvas may
@@ -18440,7 +18667,14 @@
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = prev; }
     }
-    return reg.registered(family, w, st);
+    const ok = reg.registered(family, w, st);
+    // An installed family whose bytes were never read (permission not granted
+    // this session) cannot load from here: say what unlocks it instead of
+    // failing silently into a fallback-font trace.
+    if (!ok && reg.systemList && reg.systemList().some(f => f.family === family)) {
+      toast('Installed font "' + family + '" needs access — press "System fonts\u2026" once');
+    }
+    return ok;
   }
 
   const HELP_LANG_KEY = 'minisketch.help.lang';
@@ -18609,6 +18843,28 @@
     const c = { type: 'distance', p1: +e.p0, p2: +e.ph, value: hMm, offset: 10 };
     c.id = newId();
     state.constraints[c.id] = c;
+  }
+
+  // Two real guide lines: they carry the H/V/angle/tangent constraints and are
+  // green, which KaryaCNC reads as "do not machine this path". Attached at
+  // APPLY, not at placement — a pending draft must draw nothing at all, so the
+  // guides and their horizontal / perpendicular constraints only exist once
+  // the text does.
+  function attachTextGuides(e) {
+    if (Array.isArray(e.guide) && e.guide.length) return;   // already attached
+    const p0 = P(e.p0), pw = P(e.pw), ph = P(e.ph);
+    if (!p0 || !pw || !ph) return;
+    const idW = newId();
+    state.entities[idW] = { id: idW, type: 'line', a: e.p0, b: e.pw, color: '#00ff00' };
+    const idH = newId();
+    state.entities[idH] = { id: idH, type: 'line', a: e.p0, b: e.ph, color: '#00ff00' };
+    // The two guides start horizontal + perpendicular, so a fresh text sits
+    // level and square; both are ordinary constraints (H / [ remove them).
+    const cH = newId();
+    state.constraints[cH] = { id: cH, type: 'horizontal', entity: idW };
+    const cPerp = newId();
+    state.constraints[cPerp] = { id: cPerp, type: 'perpendicular', line1: idW, line2: idH };
+    e.guide = [idW, idH];
   }
 
   function renderTextPreview() {
@@ -18861,6 +19117,10 @@
         applyTextHeightDimension(e, hMm);
       }
     }
+    // the draft becomes a real object here: from this moment it draws on the
+    // workspace, hits, saves and undoes as one step back to the pre-text state
+    delete e._draft;
+    attachTextGuides(e);
     ensureTextAspect(e);
     requestSolve();
     commit();
@@ -18980,6 +19240,9 @@
 
   function drawOneEntity(e, bulk, manySelected, lw, selLw, selBatch, batch) {
     if (!layerVisible(e)) return;
+    // a text draft (dialog open, Apply pending) exists in state but must not
+    // show on the workspace until the user commits it
+    if (e._draft) return;
     if (!entityOnScreen(e)) return;
     if (e.type === 'text') {
       drawTextEntity(e);
@@ -21697,7 +21960,6 @@
     updateConstraintButtons();
     bindConstraintTools();
     updateConstraintList();
-    updateArrayList();
     updatePartsList();
     updateObjectTree();
     updateNestPanel();
@@ -22211,10 +22473,12 @@
       row.appendChild(caret('', false));
       const name = document.createElement('span');
       name.className = 'name';
-      name.textContent = (e.name || '').trim() || (e.type + ' ' + id);
+      // A clone is its own thing, not "array": name and type label say Clone.
+      const otLabel = e.type === 'array' ? (e.kind === 'clone' ? 'clone' : 'array') : e.type;
+      name.textContent = (e.name || '').trim() || (otLabel + ' ' + id);
       const meta = document.createElement('span');
       meta.className = 'meta';
-      meta.textContent = e.type;
+      meta.textContent = otLabel;
       row.appendChild(name);
       row.appendChild(meta);
       row.addEventListener('click', () => {
@@ -22286,6 +22550,7 @@
     const loose = [];
     for (const eid in state.entities) {
       const id = +eid;
+      if (state.entities[eid]._draft) continue;   // a pending text draft is not an object yet
       if (t.boundary.has(id) || t.owner.has(id)) continue;
       if (onlyCur && layerOf(state.entities[eid]) !== ui.activeLayer) continue;
       loose.push(id);
@@ -22475,59 +22740,6 @@
         : 'Mate: click a marker or an edge midpoint of the second part\u2026';
       list.appendChild(li);
     }
-  }
-
-  function updateArrayList() {
-    const list = document.getElementById('array-list');
-    if (!list) return;
-    const rows = [];
-    for (const id in state.entities) {
-      const e = state.entities[id];
-      if (e.type === 'array') rows.push(e);
-    }
-    const countEl = document.getElementById('array-count');
-    if (countEl) countEl.textContent = String(rows.length);
-    const arrSig = 'a' + geometryEpoch + '|' +
-      rows.map(e => e.id + (selected('entity', +e.id) ? 'S' : '') + JSON.stringify(e.params || null) + (e.kind || '')).join(',');
-    if (listUnchanged(list, arrSig)) return;
-    list.innerHTML = '';
-    for (const e of rows) {
-      const li = document.createElement('li');
-      li.className = 'clickable' + (selected('entity', +e.id) ? ' active' : '');
-      li.dataset.array = e.id;
-      li.title = 'Click to edit the array parameters and refresh the clones';
-      const name = document.createElement('span');
-      name.className = 'name';
-      const kinds = (e.masters || [])
-        .map(mid => state.entities[mid])
-        .filter(Boolean)
-        .map(m => m.type === 'art' ? 'group' : m.type);
-      const kindTag = kinds.length === 1 ? kinds[0] : kinds.length + ' objects';
-      name.textContent = 'Array ' + e.id + ' \u00b7 ' + kindTag;
-      const meta = document.createElement('span');
-      meta.className = 'meta';
-      const p = e.params || {};
-      meta.textContent = (e.kind === 'polar' || e.kind === 'guide')
-        ? Math.round(+p.count || 0) + ' \u00d7 ' + (e.kind === 'guide' && p.rotate ? 'rotated' : 'on guide')
-        : Math.round(+p.rows || 1) + '\u00d7' + Math.round(+p.cols || 1) +
-          ' \u00b7 ' + round2(isFinite(+p.dx) ? +p.dx : 0) + ', ' + round2(isFinite(+p.dy) ? +p.dy : 0);
-      li.appendChild(name);
-      li.appendChild(meta);
-      const del = document.createElement('button');
-      del.className = 'mini-del';
-      del.title = 'Delete this array';
-      del.textContent = '\u00d7';
-      del.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        pushHistory();
-        removeEntities([+e.id]);
-        commit();
-        toast('Array deleted');
-      });
-      li.appendChild(del);
-      list.appendChild(li);
-    }
-    list.dataset.empty = 'No clone arrays yet';
   }
 
   function updateLoopFillRow() {
@@ -24374,36 +24586,22 @@
       const p0 = materializePoint(snap);
       const pwId = privatePoint(snap.x + 60, snap.y);
       const phId = privatePoint(snap.x, snap.y + thH);
-      // Two real guide lines: they carry the H/V/angle/tangent constraints and
-      // are green, which KaryaCNC reads as "do not machine this path".
-      const idW = newId();
-      state.entities[idW] = { id: idW, type: 'line', a: p0, b: pwId, color: '#00ff00' };
-      const idH = newId();
-      state.entities[idH] = { id: idH, type: 'line', a: p0, b: phId, color: '#00ff00' };
-      // The two guides start horizontal + perpendicular, so a fresh text sits
-      // level and square; both are ordinary constraints (H / [ remove them).
-      const cH = newId();
-      state.constraints[cH] = { id: cH, type: 'horizontal', entity: idW };
-      const cPerp = newId();
-      state.constraints[cPerp] = { id: cPerp, type: 'perpendicular', line1: idW, line2: idH };
-      // The vertical guide is born dimensioned to the remembered text height
-      const cHdim = newId();
-      state.constraints[cHdim] = {
-        id: cHdim, type: 'distance', p1: p0, p2: phId, value: thH, offset: 10
-      };
       const id = newId();
       const def = loadTextStyle();
       state.entities[id] = {
-        id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
+        id, type: 'text', p0, pw: pwId, ph: phId, guide: [],
         text: 'Text', font: def.font, weight: def.weight, italic: def.italic, tracking: def.tracking,
         leading: def.leading, align: def.align, single: HERSHEY_FAMILIES.includes(def.font),
-        color: ui.color, fitCurve: loadTextFit()
+        color: ui.color, fitCurve: loadTextFit(),
+        // DRAFT: the object exists only so the editor and its live preview have
+        // something to read. It draws nowhere and hits nothing until Apply
+        // clears the flag, attaches the green guide frame and commits; Cancel
+        // pops the history entry above and the workspace never showed it.
+        _draft: true
       };
       ensureTextAspect(state.entities[id]);
       ui.selection = [{ kind: 'entity', id }];
       setTool('select');
-      requestSolve();
-      commit();
       openTextEditor(id, true);
       return;
     }
@@ -27783,6 +27981,11 @@ function cmdSplitCurve() {
         return;
       }
       if (ent && ent.type === 'array') {
+        // A CLONE stays silent on double-click: its parameters are empty on
+        // purpose (the instance matrix IS the placement), so the array dialog
+        // would only offer rows/cols fields that mean nothing here. Only a
+        // real array (grid / polar / guide) re-opens its dialog.
+        if (ent.kind === 'clone') return;
         ui.selection = [{ kind: 'entity', id: eh }];
         updateUI();
         render();
@@ -30929,17 +31132,11 @@ function cmdSplitCurve() {
       render();
     });
 
-    const arrayList = document.getElementById('array-list');
-    if (arrayList) arrayList.addEventListener('click', ev => {
-      const li = ev.target.closest('[data-array]');
-      if (!li) return;
-      const ent = state.entities[+li.dataset.array];
-      if (!ent) return;
-      ui.selection = [{ kind: 'entity', id: +ent.id }];
-      updateUI();
-      render();
-      openArrayDialog(ent.id, ent.masters);
-    });
+    // (The old "Arrays" side list is gone: the Object Tree already lists every
+    // array and clone, and with clone-split producing many clones the duplicate
+    // list was dead weight. Double-clicking an array on the canvas still opens
+    // this dialog.)
+
     document.querySelectorAll('[data-cmd]').forEach(btn => {
       btn.addEventListener('click', () => {
         const cmd = btn.dataset.cmd;
@@ -31091,6 +31288,7 @@ function cmdSplitCurve() {
     const textApply = document.getElementById('text-apply');
     if (textApply) textApply.addEventListener('click', applyTextEditor);
     const textPreview = document.getElementById('text-preview');
+    fontPickInit();
     const previewInputs = ['text-value','text-font','text-weight','text-italic','text-tracking','text-leading','text-align'];
     for (const id of previewInputs) {
       const el = document.getElementById(id);
@@ -31232,6 +31430,34 @@ function cmdSplitCurve() {
     if (textImport) textImport.addEventListener('click', () => {
       const input = document.getElementById('text-font-input');
       if (input) input.click();
+    });
+    // System fonts… — every family installed on this computer, through
+    // Chromium's Local Font Access. One permission dialog per origin; the
+    // family names land in the dropdown, a chosen family's bytes are read on
+    // demand (exact outlines included), so nothing needs importing by hand.
+    const textSystem = document.getElementById('text-system-fonts');
+    if (textSystem) textSystem.addEventListener('click', async () => {
+      const reg = window.MiniSketchFonts;
+      if (!reg || typeof reg.importSystemFonts !== 'function') {
+        toast('System fonts need Chrome or Edge (Local Font Access)');
+        return;
+      }
+      const prev = textSystem.textContent;
+      textSystem.disabled = true;
+      textSystem.textContent = 'Reading\u2026';
+      try {
+        const n = await reg.importSystemFonts();
+        toast(n ? n + ' system famil' + (n === 1 ? 'y' : 'ies') + ' listed'
+                : 'No system fonts found');
+        const fontSel = document.getElementById('text-font');
+        fillTextFonts(fontSel ? fontSel.value : null);
+        render();
+      } catch (err) {
+        toast('System fonts unavailable: ' + (err && err.message ? err.message : err));
+      } finally {
+        textSystem.disabled = false;
+        textSystem.textContent = prev;
+      }
     });
     const fontInput = document.getElementById('text-font-input');
     if (fontInput) fontInput.addEventListener('change', async () => {
