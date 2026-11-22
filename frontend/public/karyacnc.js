@@ -2949,8 +2949,8 @@ setclick('btOpenDevTools', async function () {
 // ============================================================
 
 var APP_TAB_URLS = {
-    sketcher: 'http://localhost:3000/sketcher/',
-    invoice: 'http://localhost:3000/invoice.html'
+    sketcher: '/sketcher/',
+    invoice: '/invoice.html'
 };
 var APP_TAB_FRAMES = {
     sketcher: ['panelSketcher', 'sketcherFrame'],
