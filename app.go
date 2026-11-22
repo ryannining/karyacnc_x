@@ -895,6 +895,16 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "" {
 				r.URL.Path = "/"
 			}
+			// serve dari cache web (auto-update) dulu, fallback dev folder, terakhir embedded
+			cachePath := filepath.Join(webCacheDir(), "minisketch", filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
+			if st, err := os.Stat(cachePath); err == nil && !st.IsDir() && readLocalManifest() != nil {
+				if SHOWDEBUG {
+					log.Printf("Serving minisketch from web cache: %s", cachePath)
+				}
+				w.Header().Set("Cache-Control", "no-cache")
+				http.ServeFile(w, r, cachePath)
+				return
+			}
 			devPath := "minisketch"
 			if _, err := os.Stat(devPath); err == nil {
 				if SHOWDEBUG {
@@ -1066,12 +1076,24 @@ func (a *App) serveInvoiceFile(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	devPath := filepath.Join("tools_invoice", clean)
-	if _, err := os.Stat(devPath); err == nil {
+	if st, err := os.Stat(devPath); err == nil && !st.IsDir() {
 		if SHOWDEBUG {
 			log.Printf("Serving invoice asset from dev folder: %s", devPath)
 		}
 		http.ServeFile(w, r, devPath)
 		return true
+	}
+	// cache web (auto-update) sebelum embedded
+	cachePath := filepath.Join(webCacheDir(), "tools_invoice", filepath.FromSlash(clean))
+	if readLocalManifest() != nil {
+		if st, err := os.Stat(cachePath); err == nil && !st.IsDir() {
+			if SHOWDEBUG {
+				log.Printf("Serving invoice asset from web cache: %s", cachePath)
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeFile(w, r, cachePath)
+			return true
+		}
 	}
 	embedPath := "tools_invoice/" + clean
 	data, err := invoiceFiles.ReadFile(embedPath)
