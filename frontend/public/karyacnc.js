@@ -1460,11 +1460,14 @@ document.getElementById('btCheckUpdate').addEventListener('click', async () => {
             st.textContent = 'update ' + r.latestVersion + ' tersedia, downloading...';
             const res = await window.go.main.App.ApplyWebUpdate();
             st.textContent = res.message;
+            alert(res.message);
         } else {
             st.textContent = 'sudah versi terbaru (' + r.currentVersion + ')';
+            alert('Sudah versi terbaru (' + r.currentVersion + ')');
         }
     } catch (error) {
         st.textContent = 'gagal: ' + error;
+        alert('Cek update gagal: ' + error);
     }
 });
 
