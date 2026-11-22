@@ -270,6 +270,41 @@ func webAssetDir() string {
 	return ""
 }
 
+// StartUpdateCheckBlocking: cek + apply update SEBELUM UI dibuka.
+// Dipanggil sinkron dari runBrowserMode / wails OnStartup:
+// - online + ada update: download dulu (delta), lalu UI load versi baru
+// - offline / gagal: lanjut pakai cache/embed, UI tetap muncul
+// Timeout keseluruhan 20s supaya user tidak menunggu lama di layar kosong.
+func StartUpdateCheckBlocking() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ver, ok, err := CheckForUpdate()
+		if err != nil {
+			fmt.Println("[update] offline / gagal cek (pakai cache/embed):", err)
+			return
+		}
+		if !ok {
+			if m := readLocalManifest(); m != nil {
+				currentWebVer = m.Version
+			}
+			fmt.Println("[update] web sudah versi terbaru", ver)
+			return
+		}
+		newVer, n, err := ApplyUpdate()
+		if err != nil {
+			fmt.Println("[update] apply gagal (pakai cache lama/embed):", err)
+			return
+		}
+		fmt.Printf("[update] web %s -> %s (%d file didownload). UI memuat versi baru.\n", ver, newVer, n)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		fmt.Println("[update] timeout 20s — lanjut pakai cache/embed, update lanjut di background")
+	}
+}
+
 // UpdateStartup runs in background at startup: check + apply.
 func StartUpdateCheck() {
 	go func() {

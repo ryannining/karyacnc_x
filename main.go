@@ -70,7 +70,9 @@ func main() {
 		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
 		OnStartup: func(ctx context.Context) {
 			app.startup(ctx)
-			StartUpdateCheck()
+			// webview: asset server sudah jalan — update blocking di sini akan
+			// menunda render UI pertama, tapi memastikan UI versi baru.
+			StartUpdateCheckBlocking()
 		},
 		Bind: []interface{}{
 			app,
