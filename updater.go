@@ -10,7 +10,6 @@ package main
 //   {"version":"1.2.3","files":[{"path":"index.html","sha256":"...","size":123},...]}
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -331,20 +330,20 @@ func StartUpdateCheck() {
 }
 
 // CheckWebUpdate cek update frontend dari GitHub (dipanggil dari UI).
-func (a *App) CheckWebUpdate(ctx context.Context) (map[string]interface{}, error) {
+func (a *App) CheckWebUpdate() (map[string]interface{}, error) {
 	ver, ok, err := CheckForUpdate()
 	if err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{
-		"latestVersion": ver,
-		"updateAvailable": ok,
-		"currentVersion": currentWebVersion(),
+		"latestVersion":        ver,
+		"updateAvailable":      ok,
+		"currentVersion":       currentWebVersion(),
 	}, nil
 }
 
 // ApplyWebUpdate download + apply update frontend (dipanggil dari UI).
-func (a *App) ApplyWebUpdate(ctx context.Context) (map[string]interface{}, error) {
+func (a *App) ApplyWebUpdate() (map[string]interface{}, error) {
 	ver, n, err := ApplyUpdate()
 	if err != nil {
 		return nil, err
