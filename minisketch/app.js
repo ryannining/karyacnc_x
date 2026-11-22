@@ -11374,13 +11374,18 @@
     ctx.translate(o.x, o.y);
     ctx.transform(gg.A.x * zx, gg.A.y * zx, gg.B.x * zy, gg.B.y * zy, 0, 0);
     // Wireframe like every other entity: outline only, one device pixel wide,
-    // in the stroke colour the user picked (no fill).
+    // in the stroke colour the user picked (no fill). A SELECTED text reads
+    // like every other picked object: glyphs take the amber selection mix and
+    // stroke at the Selected line width — the old draw kept the glyphs at the
+    // exact plain colour, so a picked text was only told apart by its faint
+    // dashed frame (and brightening could not show on a white/black themed
+    // glyph at all: pushing white toward white changes nothing).
     const scaleX = Math.hypot(gg.A.x * zx, gg.A.y * zx) || 1;
     const scaleY = Math.hypot(gg.B.x * zy, gg.B.y * zy) || 1;
-    ctx.lineWidth = 1 / Math.max(1e-6, Math.min(scaleX, scaleY));
+    ctx.lineWidth = (isSel ? SEL_WIDTH : 1) / Math.max(1e-6, Math.min(scaleX, scaleY));
     ctx.lineJoin = 'round';
     ctx.miterLimit = 2;
-    ctx.strokeStyle = colorOf(e);
+    ctx.strokeStyle = isSel ? selectMixColor(themedCanvasColor(colorOf(e))) : colorOf(e);
     if (isSingleLineFont(e)) {
       // open polylines straight from the glyph table — no canvas text
       ctx.lineCap = 'round';
@@ -18824,7 +18829,8 @@
     const tracking = textTrackingFromPct(trackEl ? trackEl.value : 100);
     const leadRaw = leadEl ? parseFloat(leadEl.value) : 125;
     const leading = isFinite(leadRaw) ? clamp(leadRaw, 50, 400) : 125;
-    pushHistory();
+    // a new text's undo target is the placement snapshot Cancel pops — no second push
+    if (!ed.isNew) pushHistory();
     e.text = text;
     e.font = family;
     e.single = single;
@@ -24193,6 +24199,23 @@
           updateUI();
           render();
           return;
+        }
+        // A press inside an ALREADY-SELECTED framed object (text, image, art —
+        // the kinds whose whole box is the grab area) moves the selection
+        // IMMEDIATELY, no dwell. A text frame is big and mostly empty, so
+        // every natural quick drag over it kept turning into a marquee and the
+        // text felt nearly undraggable. The same "move my selection" press a
+        // marquee-selected line above, a clone and a selected loop follow.
+        if (!addMod && !subMod && !wantGroup && selected('entity', eh) &&
+          (hitEnt.type === 'text' || hitEnt.type === 'image' || hitEnt.type === 'art')) {
+          const body = selectionBodyDragFor(world);
+          if (body) {
+            pushHistory();
+            ui.drag = body;
+            updateUI();
+            render();
+            return;
+          }
         }
         // THE GESTURE IS DECIDED BY TIME AND MOVEMENT (mouse/pen): a drag
         // that starts within PRESS_DWELL_MS of the press becomes a marquee —
