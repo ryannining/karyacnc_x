@@ -74,9 +74,26 @@ for f in "${FILES[@]}"; do
         exit 1
     fi
     mkdir -p "$DST/$(dirname "$f")"
-    if [ -f "$DST/$f" ] && cmp -s "$SRC/$f" "$DST/$f"; then
-        echo "  sama        : $f"
-        continue
+    # index.html di DST punya tab-shortcut bridge ter-inject di akhir file
+    # (tidak ada di SRC) — strip sebelum compare agar sync idempoten.
+    if [ -f "$DST/$f" ]; then
+        if [ "$f" = "index.html" ] && grep -q "karyacnc-tab-shortcut" "$DST/$f"; then
+            src_cmp=$(mktemp)
+            dst_cmp=$(mktemp)
+            cp "$SRC/$f" "$src_cmp"
+            # buang blok bridge dari DST: 10 baris terakhir
+            # (<script> ... </script> yang di-inject heredoc)
+            head -n -10 "$DST/$f" > "$dst_cmp"
+            if cmp -s "$src_cmp" "$dst_cmp"; then
+                echo "  sama        : $f"
+                rm -f "$src_cmp" "$dst_cmp"
+                continue
+            fi
+            rm -f "$src_cmp" "$dst_cmp"
+        elif cmp -s "$SRC/$f" "$DST/$f"; then
+            echo "  sama        : $f"
+            continue
+        fi
     fi
     old_size=$([ -f "$DST/$f" ] && wc -c < "$DST/$f" || echo 0)
     cp "$SRC/$f" "$DST/$f"
