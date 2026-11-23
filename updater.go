@@ -393,8 +393,17 @@ func serveWebAsset(cacheDir string, embedded http.Handler) http.Handler {
 		manifestPath, _ := servePathFor(r.URL.Path)
 		full := cachePathFor(manifestPath)
 		if st, err := os.Stat(full); err == nil && !st.IsDir() {
+			// ServeContent, bukan ServeFile: ServeFile me-redirect
+			// /x/index.html -> /x/ (canonical) dan /x/ 404 di handler ini
+			// (tidak ada directory listing).
+			f, err := os.Open(full)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			defer f.Close()
 			w.Header().Set("Cache-Control", "no-cache")
-			http.ServeFile(w, r, full)
+			http.ServeContent(w, r, filepath.Base(full), st.ModTime(), f)
 			return
 		}
 		// cache miss: fallback ke embedded

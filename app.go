@@ -904,8 +904,16 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 					if SHOWDEBUG {
 						log.Printf("Serving minisketch from web cache: %s", cachePath)
 					}
+					// ServeContent, bukan ServeFile: ServeFile me-redirect
+					// /x/index.html -> /x/ (canonical) yang 404 di handler ini.
+					f, err := os.Open(cachePath)
+					if err != nil {
+						http.NotFound(w, r)
+						return
+					}
+					defer f.Close()
 					w.Header().Set("Cache-Control", "no-cache")
-					http.ServeFile(w, r, cachePath)
+					http.ServeContent(w, r, filepath.Base(cachePath), st.ModTime(), f)
 					return
 				}
 			}
