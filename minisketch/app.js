@@ -302,10 +302,13 @@
     return Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2]);
   }
 
-  // Nearest KaryaCNC stroke code; ties fall back to black (cut).
-  function nearestCncColor(hex) {
+  // Nearest KaryaCNC stroke code; ties fall back to black (cut). White (the
+  // paper/canvas colour) is not a stroke code: it must never be mapped to a
+  // light operation, so it always becomes Cut.
+  function nearestCncColorDist(hex) {
     const rgb = hexToRgb(hex);
-    if (!rgb) return '#000000';
+    if (!rgb) return { code: '#000000', dist: Infinity };
+    if (rgb[0] >= 240 && rgb[1] >= 240 && rgb[2] >= 240) return { code: '#000000', dist: 0 };
     let best = '#000000';
     let bestD = Infinity;
     for (const code of CNC_CODES) {
@@ -314,7 +317,26 @@
       const d = colorDistanceLab(rgb, c);
       if (d < bestD - 1e-9) { bestD = d; best = code; }
     }
-    return best;
+    return { code: best, dist: bestD };
+  }
+
+  function nearestCncColor(hex) {
+    return nearestCncColorDist(hex).code;
+  }
+
+  // A colour taken from an imported file (PDF/CDR/DXF/SVG) must land on a real
+  // KaryaCNC stroke code: the colour IS the operation. Anything the workflow
+  // cannot express is snapped to its nearest code, and a colour with no
+  // reasonable match (or white — the paper colour) becomes Cut.
+  const CNC_MATCH_MAX_DIST = 46;   // Lab distance; beyond = no match -> Cut
+  function importColorNormalized(hex) {
+    if (!hex) return null;
+    const rgb = hexToRgb(hex);
+    if (!rgb) return '#000000';
+    if (rgb[0] >= 240 && rgb[1] >= 240 && rgb[2] >= 240) return '#000000';
+    if (CNC_CODES.indexOf(hex) >= 0) return hex;
+    const n = nearestCncColorDist(hex);
+    return n.dist <= CNC_MATCH_MAX_DIST ? n.code : '#000000';
   }
 
 
@@ -998,7 +1020,7 @@
       cache.set(key, id);
       return id;
     };
-    const colorOfSrc = (hex) => colorMap[hex] || hex;
+    const colorOfSrc = (hex) => colorMap[hex] || importColorNormalized(hex);
     const made = { entities: [], groups: new Set(), lines: 0, splines: 0, circles: 0, framed: 0, notes: 0 };
     const groupBag = new Map();
 
@@ -15917,23 +15939,24 @@
     const made = [];
     for (const pr of prims) {
       const id = newId();
+      const fileColor = importColorNormalized(pr.color);
       if (pr.type === 'line') {
         state.entities[id] = {
-          id, type: 'line', color: pr.color || ui.color,
+          id, type: 'line', color: fileColor || ui.color,
           a: addPoint(pr.x1, pr.y1), b: addPoint(pr.x2, pr.y2)
         };
       } else if (pr.type === 'circle') {
-        state.entities[id] = { id, type: 'circle', color: pr.color || ui.color, c: addPoint(pr.cx, pr.cy), r: pr.r };
+        state.entities[id] = { id, type: 'circle', color: fileColor || ui.color, c: addPoint(pr.cx, pr.cy), r: pr.r };
       } else if (pr.type === 'arc') {
         state.entities[id] = {
-          id, type: 'arc', color: pr.color || ui.color,
+          id, type: 'arc', color: fileColor || ui.color,
           c: addPoint(pr.cx, pr.cy),
           s: addPoint(pr.cx + pr.r * Math.cos(pr.a1), pr.cy + pr.r * Math.sin(pr.a1)),
           e: addPoint(pr.cx + pr.r * Math.cos(pr.a0), pr.cy + pr.r * Math.sin(pr.a0))
         };
       } else if (pr.type === 'spline') {
         const pts = pr.pts.map(p => addPoint(p[0], p[1]));
-        const ent = { id, type: 'spline', color: pr.color || ui.color, pts, closed: !!pr.closed };
+        const ent = { id, type: 'spline', color: fileColor || ui.color, pts, closed: !!pr.closed };
         if (pts.length >= 2) ent.hs = autoHandles(pts.map(p => state.points[p]), !!pr.closed);
         state.entities[id] = ent;
       } else {
@@ -16239,11 +16262,11 @@
         if (imgId) made++;
         continue;
       }
-      // keep-original off: every line snaps to the nearest MiniSketch (KaryaCNC
-      // operation) colour and nothing keeps a fill — same shape, machine ready
-      const color = o.keepColors === false
-        ? ((pr.color ? nearestCncColor(pr.color) : null) || ui.color)
-        : (pr.color || ui.color);
+      // Every colour must land on a real KaryaCNC stroke code: palette codes
+      // stay as-is, other file colours snap to their nearest operation, a
+      // colour with no reasonable match (or white) becomes Cut, and a colour
+      // the file never states falls back to the working colour.
+      const color = importColorNormalized(pr.color) || ui.color;
       if (pr.kind === 'circle') {
         const id = newId();
         state.entities[id] = { id, type: 'circle', c: addPoint([pr.cx, pr.cy]), r: pr.r * scale, color };
@@ -20938,16 +20961,21 @@
     const nxs = g.nx * sign;
     const nys = -g.ny * sign;
     const labelTxt = labelText || dimMeasureLabel(c, g);
-    drawLabel(c.reference ? '(' + labelTxt + ')' : labelTxt, mx + nxs * 13, my + nys * 13, c.id, isSel);
+    // dimMeasureLabel already carries its own parentheses; the plain labelText
+    // path (point-to-line) keeps the reference wrapper as before.
+    drawLabel(labelText && c.reference ? '(' + labelTxt + ')' : labelTxt,
+      mx + nxs * 13, my + nys * 13, c.id, isSel);
   }
 
   // Label of a point-to-point measure: the axis letter (D/H/V) plus the value
-  // it measures — X span for H, Y span for V, straight distance for D.
+  // it measures — X span for H, Y span for V, straight distance for D. D is
+  // the default measure and carries no letter, and the whole label is one pair
+  // of parentheses: (100), (H 100), (V 100) — never nested.
   function dimMeasureLabel(c, g) {
     if (c.kind) return 'R ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value));
-    if (c.axis === 'x') return 'H ' + fmt(Math.abs(g.p2.x - g.p1.x));
-    if (c.axis === 'y') return 'V ' + fmt(Math.abs(g.p2.y - g.p1.y));
-    return 'D ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value));
+    if (c.axis === 'x') return '(H ' + fmt(Math.abs(g.p2.x - g.p1.x)) + ')';
+    if (c.axis === 'y') return '(V ' + fmt(Math.abs(g.p2.y - g.p1.y)) + ')';
+    return '(' + fmt(c.reference ? c.value : Math.hypot(g.p2.x - g.p1.x, g.p2.y - g.p1.y)) + ')';
   }
 
   function pointDimGeom(c) {
@@ -31115,10 +31143,8 @@ function cmdSplitCurve() {
       if (modal) modal.classList.add('hidden');
       pendingCdr = null;
       const sel = document.getElementById('cdr-text-mode');
-      const keep = document.getElementById('cdr-keep-color');
       await importPrimsIntoDocument(filterImportPages(prims, pages, 100), 1, 'CDR', {
         textMode: sel ? sel.value : 'comment',
-        keepColors: keep ? keep.checked : true,
         flipY: true,
         avoidExisting: true,
         ...importJoinOpts('cdr')
