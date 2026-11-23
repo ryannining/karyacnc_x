@@ -11135,7 +11135,21 @@
   }
 
   function textStyleString(e, sizePx) {
-    return (e.italic ? 'italic ' : '') + (e.weight || 400) + ' ' + sizePx + 'px ' + (e.font || 'sans-serif');
+    // Ask for a weight/style the family REALLY has. Requesting a member the
+    // family lacks (Bold on a Regular-only font) makes Chrome synthesize it —
+    // it re-draws the glyph offset and stroked, so the canvas trace captures
+    // nested double contours and -> Curve (the real single outline) then
+    // disagrees with what was on screen. Resolving to the closest REGISTERED
+    // member keeps every path on real letterforms; the Weight/Style controls
+    // still record the user's choice on the entity.
+    const reg = window.MiniSketchFonts;
+    let weight = e.weight || 400;
+    let style = e.italic ? 'italic' : 'normal';
+    if (reg && reg.resolveFace) {
+      const face = reg.resolveFace(e.font || 'sans-serif', weight, style);
+      if (face) { weight = face.weight; style = face.style; }
+    }
+    return (style === 'italic' ? 'italic ' : '') + weight + ' ' + sizePx + 'px ' + (e.font || 'sans-serif');
   }
 
   function textTrackingPx(e, sizePx) {
@@ -11156,7 +11170,10 @@
   function textMetricsOf(e) {
     if (isSingleLineFont(e)) return textMetricsSingle(e);
     const reg = window.MiniSketchFonts;
-    if (reg && !reg.registered(e.font || 'sans-serif')) return null; // font not loaded yet: skip, frame only
+    // Family-level gate, not per-member: a system face whose bytes registered
+    // under a non-400 weight would fail a bare registered(family) check (that
+    // keys to 400|normal) and draw an empty frame though the face is loaded.
+    if (reg && !reg.registeredAny(e.font || 'sans-serif')) return null; // font not loaded yet: skip, frame only
     const key = [e.text, e.font, e.weight, e.italic ? 1 : 0, e.tracking || 0, e.align || '', textLeadingOf(e), fontEpoch()].join('|');
     const cached = textMeasureCache.get(key);
     if (cached) return cached;
@@ -18590,7 +18607,11 @@
       // unreachable. Weight and Style in the row below pick the face.
       for (const cat of reg.categories()) {
         if (cat === 'Imported' && !reg.imported().length) continue;
-        if (cat === 'System' && !(reg.systemList && reg.systemList().length)) continue;
+        // The System group lists only families this machine has that the
+        // catalogue does NOT bundle; a bundled family that is also installed
+        // (Carlito) shows once under its own category and must not create an
+        // empty System group or answer the System checkbox.
+        if (cat === 'System' && !(reg.systemList && reg.systemList().some(f => !reg.known(f.family)))) continue;
         const g = document.createElement('optgroup');
         g.label = cat;
         sel.appendChild(g);
@@ -18605,8 +18626,13 @@
         }
         if (cat === 'System') {
           // remembered family names from the Local Font Access scan; the bytes
-          // of one are read the moment it is applied
-          for (const f of reg.systemList()) addOpt(g, f.family, f.family);
+          // of one are read the moment it is applied. A family the catalogue
+          // already bundles (Carlito) is skipped: it is listed once under its
+          // bundled category and always loads from its bundled bytes, so it is
+          // not a "system font" here and must not answer the System checkbox.
+          for (const f of reg.systemList()) {
+            if (!reg.known(f.family)) addOpt(g, f.family, f.family);
+          }
         }
       }
     } else {
@@ -18650,9 +18676,37 @@
   let fontPickBound = false;
   let fontPickKb = -1;   // keyboard-highlighted row index over the visible rows
 
+  // ---- Favourite fonts ------------------------------------------------------
+  // With hundreds of installed families the filter alone is slow to use when you
+  // keep reaching for the same handful. A star on each row toggles a favourite;
+  // favourites float to a group at the top of the list (and survive a reload via
+  // localStorage). Stored as family NAMES, keyed the same way the picker lists
+  // them, so bundled / imported / system families all work.
+  const FONT_FAV_KEY = 'minisketch.fontFavorites.v1';
+  let fontFavorites = new Set();
+  try {
+    const raw = JSON.parse(localStorage.getItem(FONT_FAV_KEY) || '[]');
+    if (Array.isArray(raw)) fontFavorites = new Set(raw.filter(x => typeof x === 'string'));
+  } catch (err) { /* private mode / corrupt: start empty */ }
+
+  function fontFavSave() {
+    try { localStorage.setItem(FONT_FAV_KEY, JSON.stringify([...fontFavorites])); }
+    catch (err) { /* private mode: favourites just do not persist */ }
+  }
+  const fontFavIs = (family) => fontFavorites.has(family);
+  function fontFavToggle(family) {
+    if (fontFavorites.has(family)) fontFavorites.delete(family);
+    else fontFavorites.add(family);
+    fontFavSave();
+    // the visible list re-orders (favourites float up) and the star flips
+    fontPickKb = -1;
+    fontPickRender();
+  }
+
   // The rows the panel should show right now: filter by the typed name, drop
-  // the System group when the checkbox says so, and always keep the applied
-  // family reachable even when its group is filtered off.
+  // the System group when the checkbox says so, always keep the applied family
+  // reachable even when its group is filtered off, and float FAVOURITES to a
+  // group at the top so a hand-picked shortlist survives a long catalogue.
   function fontPickVisibleRows() {
     const sel = document.getElementById('text-font');
     if (!sel) return [];
@@ -18672,11 +18726,19 @@
         const v = o.value || o.textContent;
         if (v === current) seenCurrent = true;
         if (q && v.toLowerCase().indexOf(q) < 0) continue;
-        rows.push({ group, value: v });
+        rows.push({ group, value: v, fav: fontFavIs(v) });
       }
     }
-    if (current && !seenCurrent) rows.unshift({ group: '', value: current, pinned: true });
-    return rows;
+    if (current && !seenCurrent) rows.unshift({ group: '', value: current, pinned: true, fav: fontFavIs(current) });
+    // Float favourites into one group at the very top (the applied/current row
+    // stays pinned above them). Non-favourites keep their category order.
+    const pinned = rows.filter(r => r.pinned);
+    const favs = rows.filter(r => !r.pinned && r.fav);
+    const rest = rows.filter(r => !r.pinned && !r.fav);
+    const out = pinned.slice();
+    if (favs.length) for (const f of favs) out.push({ group: 'Favorites', value: f.value, fav: true });
+    for (const r of rest) out.push(r);
+    return out;
   }
 
   function fontPickRender() {
@@ -18710,8 +18772,22 @@
       row.className = 'font-pick-row' +
         (r.value === sel.value ? ' active' : '') +
         (i === fontPickKb ? ' kb' : '');
-      row.textContent = r.value;
       row.title = r.value;
+      // Star toggles the favourite; it must not also choose the font, so the
+      // click stops here before the row's own choose handler.
+      const star = document.createElement('span');
+      star.className = 'font-pick-star' + (r.fav ? ' on' : '');
+      star.textContent = r.fav ? '\u2605' : '\u2606';
+      star.title = r.fav ? 'Remove from favourites' : 'Add to favourites';
+      star.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        fontFavToggle(r.value);
+      });
+      row.appendChild(star);
+      const label = document.createElement('span');
+      label.className = 'font-pick-name';
+      label.textContent = r.value;
+      row.appendChild(label);
       row.addEventListener('click', () => fontPickChoose(r.value));
       list.appendChild(row);
     }
@@ -19136,14 +19212,21 @@
     ctx.fillStyle = ink;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
     if (!text) return;
+    const wantW = +wt || 400;
+    const wantS = it === '1' ? 'italic' : 'normal';
     if (!single && window.MiniSketchFonts &&
-      !window.MiniSketchFonts.registered(family, +wt || 400, it === '1' ? 'italic' : 'normal')) {
+      window.MiniSketchFonts.hasMember(family, wantW, wantS) &&
+      !window.MiniSketchFonts.registered(family, wantW, wantS)) {
       // An imported / bundled face may still be arriving: paint the fallback
-      // now, then repaint once it lands. Only repaint when the load actually
-      // registered the face — otherwise an unknown family would re-schedule
-      // itself forever. The member matters: a Bold-only family would report
-      // itself unregistered for a Regular request and repaint in a loop.
-      window.MiniSketchFonts.load(family, +wt || 400, it === '1' ? 'italic' : 'normal').then((ok) => {
+      // now, then repaint once it lands. Gate on `hasMember` — a member the
+      // family actually ships — AND not-yet-registered. Scheduling on the bare
+      // exact-member check alone froze the tab: for a weight the family does
+      // not have (Light on a Regular-only pick) `load` resolves true off a
+      // fallback member but the requested member never registers, so this
+      // re-scheduled itself in an endless promise loop. `hasMember` is false
+      // for such a request, so there is nothing to wait for — the browser
+      // renders the closest face the family does have.
+      window.MiniSketchFonts.load(family, wantW, wantS).then((ok) => {
         if (!ok) return;
         const f2 = document.getElementById('text-font');
         if (f2 && f2.value === family && ui.textEdit) renderTextPreview();
@@ -19171,7 +19254,16 @@
       asc = size * 0.72;
       H = asc + size * 0.05 + lineHeight * (lines.length - 1);
     } else {
-      ctx.font = (it === '1' ? 'italic ' : '') + wt + ' ' + size + 'px ' + family;
+      // Resolve to a member the family really has, so the preview shows the real
+      // letterforms (no Chrome synthetic bold) and matches what -> Curve will
+      // produce for the same family/weight.
+      const regP = window.MiniSketchFonts;
+      let useW = +wt || 400, useS = it === '1' ? 'italic' : 'normal';
+      if (regP && regP.resolveFace) {
+        const face = regP.resolveFace(family, useW, useS);
+        if (face) { useW = face.weight; useS = face.style; }
+      }
+      ctx.font = (useS === 'italic' ? 'italic ' : '') + useW + ' ' + size + 'px ' + family;
       if ('letterSpacing' in ctx) ctx.letterSpacing = ((tr || 0) / 100) * size + 'px';
       for (const line of lines) {
         const mw = ctx.measureText(line.length ? line : 'M').width;
@@ -33701,6 +33793,19 @@ function cmdSplitCurve() {
         if (e.type === 'text' && e.font && window.MiniSketchFonts.known(e.font)) {
           wanted.add(e.font + '|' + (e.weight || 400) + '|' + (e.italic ? 'italic' : 'normal'));
         }
+      }
+      // A text in a SYSTEM font is not "known" (it is not in the bundled
+      // catalogue), so the loop above skipped it — after a restart its face was
+      // never read, textMetricsOf returned null and the canvas drew an empty
+      // frame until the user pressed Apply again (which is what finally called
+      // loadSystem). Ask for those here too: the local-fonts permission, once
+      // granted, persists across a reload, so loadSystem can read the bytes
+      // silently at startup and the text renders on the first paint.
+      for (const e of Object.values(state.entities)) {
+        if (e.type !== 'text' || !e.font || window.MiniSketchFonts.known(e.font)) continue;
+        const sys = window.MiniSketchFonts.systemList ? window.MiniSketchFonts.systemList() : [];
+        if (!sys.some(f => f.family === e.font)) continue;
+        wanted.add(e.font + '|' + (e.weight || 400) + '|' + (e.italic ? 'italic' : 'normal'));
       }
       for (const key of wanted) {
         const [fam, w, st] = key.split('|');
