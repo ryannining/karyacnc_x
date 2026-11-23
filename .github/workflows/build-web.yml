@@ -71,21 +71,25 @@ jobs:
           '
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Delete old release
+      - name: Ensure release exists (published)
         run: |
-          gh release delete web-latest --yes --cleanup-tag 2>/dev/null || true
+          # Release web-latest dibuat SEKALI lalu dipertahankan — tidak pernah
+          # di-delete/recreate. Delete+create berulang menyebabkan race yang
+          # meninggalkan release dalam status draft (tidak bisa diakses publik
+          # via URL download). Asset di-update dengan --clobber.
+          if ! gh release view web-latest > /dev/null 2>&1; then
+            gh release create web-latest \
+              --title "Web (rolling)" \
+              --notes "Auto-generated web build (frontend + minisketch + invoice)" \
+              --latest
+          fi
+          gh release edit web-latest --draft=false --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create release with assets
+      - name: Update release notes
         run: |
-          gh release create web-latest \
-            --title "Web $VERSION" \
-            --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" \
-            --latest
-          # GITHUB_TOKEN kadang membuat release sebagai draft saat tag baru —
-          # publish eksplisit supaya raw download URL langsung bisa diakses.
-          gh release edit web-latest --draft=false --latest
+          gh release edit web-latest --title "Web $VERSION" --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
