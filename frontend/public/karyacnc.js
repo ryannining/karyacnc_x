@@ -1154,7 +1154,7 @@ var hdr2CSS = sheet.cssRules[i];
 i = sheet.insertRule('button {border-radius:6px;margin:1px;background:var(--panel2);color:var(--ink);border:1px solid var(--border)}', sheet.cssRules.length);
 var buttonCSS = sheet.cssRules[i];
 
-i = sheet.insertRule('.smallwindow {	text-align:  right;background: var(--panel2);color:var(--ink);display:none;position:absolute;border:1px solid var(--border);border-radius:5px;box-shadow: 2px 4px 10px rgba(0,0,0,0.5);padding:5px;z-index:1000;}', sheet.cssRules.length);
+i = sheet.insertRule('.smallwindow {	text-align:  right;background: var(--panel2);color:var(--ink);display:none;position:absolute;border:3px solid #0e7490;border-radius:5px;box-shadow: 0 0 0 1px rgba(255,255,255,0.12), 0 8px 32px rgba(0,0,0,0.85), 0 0 24px rgba(0,0,0,0.6);padding:5px;z-index:1000;}', sheet.cssRules.length);
 var smallWCSS = sheet.cssRules[i];
 
 // ============================================================
@@ -2948,10 +2948,21 @@ setclick('btOpenDevTools', async function () {
 // APP TABS (KaryaCnc / Sketcher / Invoice)
 // ============================================================
 
-var APP_TAB_URLS = {
-    sketcher: '/sketcher/',
-    invoice: '/invoice.html'
-};
+// Sketcher/invoice iframe. Production (binary serve UI di :8321, webview Wails
+// wails://): same-origin relative — local-fonts/clipboard tidak butuh
+// delegasi permission. wails dev (UI dari Vite :34115, tanpa sketcher):
+// fallback ke HTTP server binary Go di :3000 (cross-origin, butuh allow di
+// iframe — sudah ada).
+var APP_TAB_URLS = (function () {
+    var devMode = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    var isVite = devMode && (location.port === '34115' || location.port === '5173');
+    var proto = location.protocol === 'https:' ? 'https:' : 'http:';
+    var base = isVite ? (proto + '//127.0.0.1:3000') : '';
+    return {
+        sketcher: base + '/sketcher/',
+        invoice: base + '/invoice.html'
+    };
+})();
 var APP_TAB_FRAMES = {
     sketcher: ['panelSketcher', 'sketcherFrame'],
     invoice: ['panelInvoice', 'invoiceFrame']
