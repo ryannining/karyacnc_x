@@ -49,6 +49,16 @@ for extra in app.js core.js styles.css; do
     [ -f "$SRC/$extra" ] && FILES+=("$extra")
 done
 
+# Folder docs/ (halaman help + css/js/img): diakses via help → docs/index.html.
+# Seluruh isinya ikut disalin; file sementara (PLANNING.md dkk) tetap ikut —
+# ringan dan tidak mengganggu.
+if [ -d "$SRC/docs" ]; then
+    while IFS= read -r f; do
+        rel="${f#"$SRC"/}"
+        FILES+=("$rel")
+    done < <(find "$SRC/docs" -type f | sort)
+fi
+
 # Aset RUNTIME: fonts/fonts.js menyuntik fonts/<slug>.js lewat <script> saat
 # sebuah family dipilih — file itu TIDAK dirujuk index.html, jadi discovery
 # tag melewatkannya. Tanpa ikut tersalin, salinan embed (KaryaCNC/Windows)
