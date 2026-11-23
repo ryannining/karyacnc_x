@@ -83,6 +83,9 @@ jobs:
             --title "Web $VERSION" \
             --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" \
             --latest
+          # GITHUB_TOKEN kadang membuat release sebagai draft saat tag baru —
+          # publish eksplisit supaya raw download URL langsung bisa diakses.
+          gh release edit web-latest --draft=false --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
