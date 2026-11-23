@@ -2954,10 +2954,15 @@ setclick('btOpenDevTools', async function () {
 // fallback ke HTTP server binary Go di :3000 (cross-origin, butuh allow di
 // iframe — sudah ada).
 var APP_TAB_URLS = (function () {
-    var devMode = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-    var isVite = devMode && (location.port === '34115' || location.port === '5173');
-    var proto = location.protocol === 'https:' ? 'https:' : 'http:';
-    var base = isVite ? (proto + '//127.0.0.1:3000') : '';
+    // Production: binary serve UI sendiri (8321 / wails://) — same-origin.
+    // Dev (wails dev): UI dari Vite — /sketcher/ tidak ada di situ, jadi
+    // iframe ke HTTP server binary Go di 127.0.0.1:3000.
+    var host = (location.hostname || '').toLowerCase();
+    var isBinaryServer = (host === '127.0.0.1' && location.port === '8321') ||
+        host.indexOf('wails') < 0 && host !== '' && location.protocol !== 'file:';
+    var isViteDev = host.indexOf('wails') >= 0 || location.port === '34115' || location.port === '5173';
+    var base = isViteDev ? 'http://127.0.0.1:3000' : '';
+    void isBinaryServer;
     return {
         sketcher: base + '/sketcher/',
         invoice: base + '/invoice.html'
