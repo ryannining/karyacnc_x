@@ -132,6 +132,20 @@ jobs:
         with:
           path: artifacts
 
+      - name: Delete old binary releases
+        run: |
+          # simpan hanya release binary terbaru — versi lama dihapus biar
+          # customer tidak salah download.
+          CURRENT="${{ github.event.inputs.version }}"
+          gh release list --limit 50 --json tagName,isDraft --jq '.[] | select(.tagName | test("^v[0-9]+\\.")) | .tagName' | while read -r tag; do
+            if [ "$tag" != "$CURRENT" ]; then
+              echo "hapus release lama: $tag"
+              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create release
         run: |
           gh release create ${{ github.event.inputs.version }} \
