@@ -337,6 +337,7 @@ func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBr
 
 	content := &strings.Builder{}
 	reasoning := &strings.Builder{}
+	var streamErr error
 	err = sseLines(resp.Body, 120*time.Second, func(data string) {
 		var ev struct {
 			Candidates []struct {
@@ -351,7 +352,11 @@ func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBr
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			return
 		}
-		if ev.Error != nil || len(ev.Candidates) == 0 {
+		if ev.Error != nil {
+			streamErr = fmt.Errorf("gemini stream: %s", ev.Error.Message)
+			return
+		}
+		if len(ev.Candidates) == 0 {
 			return
 		}
 		for _, part := range ev.Candidates[0].Content.Parts {
@@ -377,6 +382,9 @@ func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBr
 	})
 	if err != nil {
 		return out, err
+	}
+	if streamErr != nil {
+		return out, streamErr
 	}
 	out.Content = content.String()
 	out.Reasoning = reasoning.String()

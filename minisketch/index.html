@@ -334,6 +334,12 @@
             <button class="btn small" data-chat-tab="log">Log</button>
             <button class="btn small" id="chat-new" title="Pindahkan percakapan ini ke LOG dan mulai chat baru (geometri di worksheet tidak disentuh)">New</button>
           </div>
+          <div class="row chat-model-row">
+            <span class="muted">Model</span>
+            <select id="chat-model-sel" title="Pilih model untuk provider aktif (klik 🔄 untuk memuat daftar)" style="flex:1 1 auto;min-width:0;font:inherit;font-size:11px;padding:2px 5px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--ink)"></select>
+            <button class="btn small" id="chat-model-refresh" title="Muat daftar model dari provider aktif">🔄</button>
+            <button class="btn small" id="chat-fork" style="margin-left:10px" title="Fork: salin perintah pertama (teks + gambar tertanam) ke sesi baru — berguna setelah ganti model. Sesi saat ini dipindahkan ke LOG, lalu perintah langsung dikirim ke AI.">Fork</button>
+          </div>
           <ul class="list" id="chat-log"></ul>
           <div class="chat-pending" id="chat-pending" hidden></div>
           <div class="row" id="chat-input-row" style="margin-top:6px">

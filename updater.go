@@ -375,9 +375,14 @@ func webAssetHandler(app *App) http.Handler {
 	embedded := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// AI chat proxy di webview: location.origin bukan http://localhost:3000,
-		// jadi /api/chat dilayani langsung di sini (policy-free, lihat ai_bridge.go).
+		// jadi /api/chat & /api/models dilayani langsung di sini (policy-free,
+		// lihat ai_bridge.go).
 		if r.URL.Path == "/api/chat" {
 			app.HandleAIChat(w, r)
+			return
+		}
+		if r.URL.Path == "/api/models" {
+			app.HandleAIModels(w, r)
 			return
 		}
 		dir := webAssetDir()

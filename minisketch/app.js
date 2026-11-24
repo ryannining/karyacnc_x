@@ -1681,6 +1681,19 @@
     } catch (err) { /* private mode: the values just are not remembered */ }
   }
 
+  // Dipanggil dari pemilih model di panel AI chat: simpan pilihan model ke
+  // settings + sinkronkan field di modal Settings (bila terbuka) + judul panel.
+  window.setAiModelFromChat = function (name) {
+    const s = String(name == null ? '' : name).trim();
+    settings.aiModel = s;
+    saveSettings();
+    const el = document.getElementById('set-aiModel');
+    if (el) el.value = s;
+    try {
+      if (window.MiniSketchAI && window.MiniSketchAI.updateTitle) window.MiniSketchAI.updateTitle();
+    } catch (err) { /* ignore */ }
+  };
+
   // Push the numbers into the working constants.
   function applySettings() {
     TEXT_TOL_MM = settings.textTol;
@@ -2160,23 +2173,25 @@
         ev.stopPropagation();
         btn.disabled = true;
         btn.textContent = '…';
+        const baseNow = effBase();
+        const hostLabel = (() => { try { return new URL(baseNow).host; } catch (e) { return 'provider'; } })();
         try {
           const r = await fetch('/api/models', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ settings: { baseUrl: effBase(), apiKey: effKey() } })
+            body: JSON.stringify({ settings: { baseUrl: baseNow, apiKey: effKey() } })
           });
           const j = await r.json().catch(() => ({}));
           if (Array.isArray(j.models) && j.models.length) {
             fillList(j.models);
             placeDd();
             dd.classList.remove('hidden');
-            toast(j.models.length + ' model dimuat — pilih dari daftar');
+            toast(j.models.length + ' model dimuat dari ' + hostLabel + ' — pilih dari daftar');
           } else {
-            toast('Gagal memuat model: ' + ((j && j.error) || 'respons tidak dikenal'));
+            toast('Gagal memuat model (' + hostLabel + '): ' + ((j && j.error) || 'respons tidak dikenal'));
           }
         } catch (err) {
-          toast('Gagal memuat model: ' + String(err && err.message || err));
+          toast('Gagal memuat model (' + hostLabel + '): ' + String(err && err.message || err));
         } finally {
           btn.disabled = false;
           btn.textContent = 'Muat daftar model';

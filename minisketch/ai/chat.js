@@ -23,6 +23,29 @@
   // <svg> instead of driving MiniSketch's tools. Preview + import buttons.
   NS.svgMode = () => !!(api && api.settings && api.settings.aiModeSvg);
 
+  // Daftar model dari provider AKTIF (Gemini: ListModels; OpenAI-compatible:
+  // GET {base}/models). Dipakai oleh pemilih model di panel chat.
+  async function fetchProviderModels() {
+    if (!api) return null;
+    const g = !!(api.settings && api.settings.aiProviderGoogle);
+    const base = g
+      ? 'https://generativelanguage.googleapis.com/v1beta'
+      : String((api.settings && api.settings.aiApiUrl) || '').trim();
+    const key = String((api.settings && api.settings.aiApiKey) || '').trim();
+    if (!base || !key) return null;
+    try {
+      const r = await fetch('/api/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: { baseUrl: base, apiKey: key } })
+      });
+      const j = await r.json().catch(() => ({}));
+      return (Array.isArray(j.models) && j.models.length) ? j.models : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
   // Panel title shows the provider/model in use ("AI Chat · Google gemini-…").
   // Called from mount() and from app.js applySettings() after Settings Apply.
   NS.updateTitle = () => {
@@ -211,19 +234,23 @@
         }
       });
     }
-    // Paste an image from ANYWHERE — caret in the chat box, or focus out on the
-    // canvas/sidebar. One CAPTURE-phase document listener wins over every other
-    // paste handler:
+    // Paste an image INTO THE CHAT ONLY when the cursor is active in the chat
+    // panel. Otherwise leave the paste to the workspace (app.js onPasteEvent →
+    // Image Trace). One CAPTURE-phase document listener wins over every other
+    // paste handler when the chat owns it:
     //   • capture runs before the workspace's own bubble-phase paste handler
     //     (app.js onPasteEvent), which otherwise grabs the image for Image Trace
     //     and opens its dialog;
     //   • stopImmediatePropagation() keeps that trace handler from also firing.
-    // When the caret IS a text field we still claim the image (so pasting a
-    // screenshot into the chat box works and doesn't double-attach via a second
-    // listener) but leave text-only pastes to the field.
     document.addEventListener('paste', (ev) => {
       const imgs = imagesFromClipboard(ev.clipboardData);
       if (!imgs.length) return;                         // nothing image-y: not ours
+      const active = document.activeElement;
+      const inChat = !!(active && (
+        active.id === 'chat-input' ||
+        (active.closest && active.closest('#chat-panel'))
+      ));
+      if (!inChat) return;                              // worksheet owns it: Image Trace
       ev.preventDefault();
       ev.stopImmediatePropagation();                    // block workspace Image Trace
       addImageFiles(imgs);
@@ -1602,6 +1629,8 @@
 
   // Insert a pasted SVG into the worksheet, the same way the executor's
   // import_svg does (one undo step, real editable text for <text>).
+  // Placement: top-RIGHT of the current workspace content + 20mm gap to the
+  // right, so repeated inserts never pile up on top of existing geometry.
   async function importUserSvg(svgText) {
     if (typeof api.svgImportParse !== 'function' || typeof api.svgImportInsert !== 'function') return -1;
     try {
@@ -1612,8 +1641,24 @@
         flipY: true
       });
       if (!ir.items || !ir.items.length) return 0;
+      const bb = ir.bounds || null;
+      let center = null;
+      try {
+        const ws = api.contentBounds ? api.contentBounds() : null;
+        if (ws && bb && isFinite(bb.maxX)) {
+          const w = bb.maxX - bb.minX;
+          const h = bb.maxY - bb.minY;
+          const right = isFinite(ws.maxX) ? ws.maxX : 0;
+          const top = isFinite(ws.minY) ? ws.minY : 0;
+          center = { x: right + 20 + w / 2, y: top + h / 2 };
+        }
+      } catch (err) { /* fall back to default placement */ }
       api.pushHistory();
-      const made = api.svgImportInsert(ir, { keepGroups: true, textMode: 'text' });
+      const made = api.svgImportInsert(ir, {
+        keepGroups: true,
+        textMode: 'text',
+        ...(center ? { center } : {})
+      });
       api.commit();
       const ids = (made && made.entities) || [];
       if (ids.length) api.ui.selection = ids.map(id => ({ kind: 'entity', id }));
@@ -1642,12 +1687,12 @@
     status.className = 'muted chat-svg-status';
     const paste = document.createElement('button');
     paste.className = 'btn small';
-    paste.textContent = 'Masukkan ke MiniSketch';
-    paste.title = 'Impor SVG ini ke worksheet (satu Undo)';
+    paste.textContent = 'Insert to workspace';
+    paste.title = 'Impor SVG ini ke worksheet: posisi top-right dari konten saat ini + gap kanan 20mm (satu Undo)';
     paste.addEventListener('click', async () => {
       const n = await importUserSvg(svg);
       if (n > 0) {
-        status.textContent = '✓ ' + n + ' objek dimasukkan.';
+        status.textContent = '✓ ' + n + ' objek dimasukkan (top-right + 20mm).';
         try { api.render && api.render(); } catch (err) { /* ignore */ }
       } else if (n === 0) {
         status.textContent = 'Tidak ada bentuk vektor yang terbaca.';
@@ -1655,25 +1700,8 @@
         status.textContent = 'Impor gagal (SVG tidak valid?).';
       }
     });
-    const copy = document.createElement('button');
-    copy.className = 'btn small';
-    copy.textContent = 'Salin SVG';
-    copy.title = 'Salin kode SVG ke clipboard';
-    copy.addEventListener('click', async () => {
-      const done = () => { status.textContent = '✓ SVG disalin.'; };
-      try {
-        await navigator.clipboard.writeText(svg);
-        done();
-      } catch (err) {
-        const ta = document.createElement('textarea');
-        ta.value = svg; document.body.appendChild(ta); ta.select();
-        try { document.execCommand('copy'); } catch (e2) { /* ignore */ }
-        ta.remove(); done();
-      }
-    });
     row.appendChild(img);
     row.appendChild(paste);
-    row.appendChild(copy);
     row.appendChild(status);
     li.appendChild(row);
   }
@@ -1721,6 +1749,44 @@
     document.querySelectorAll('[data-chat-tab]').forEach(b => {
       b.addEventListener('click', () => setTab(b.dataset.chatTab));
     });
+    // Pemilih model di panel chat: 🔄 memuat daftar dari provider aktif,
+    // pilih -> tersimpan ke settings (judul panel ikut terupdate).
+    const modelSel = document.getElementById('chat-model-sel');
+    const modelRefresh = document.getElementById('chat-model-refresh');
+    if (modelSel) {
+      const fill = (models) => {
+        const cur = String((api.settings && api.settings.aiModel) || '').trim();
+        modelSel.innerHTML = '';
+        const ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = cur || 'pilih model…';
+        modelSel.appendChild(ph);
+        for (const n of models) {
+          const o = document.createElement('option');
+          o.value = n;
+          o.textContent = n;
+          modelSel.appendChild(o);
+        }
+        modelSel.value = cur;
+      };
+      const loadM = (silent) => {
+        return fetchProviderModels().then(models => {
+          if (models) fill(models);
+          else if (!silent && modelSel) modelSel.title = 'Gagal memuat model — cek provider/key di Settings';
+        });
+      };
+      if (modelRefresh) {
+        modelRefresh.addEventListener('click', () => {
+          modelRefresh.disabled = true;
+          loadM(false).finally(() => { modelRefresh.disabled = false; });
+        });
+      }
+      modelSel.addEventListener('change', () => {
+        const v = modelSel.value;
+        if (v && window.setAiModelFromChat) window.setAiModelFromChat(v);
+      });
+      loadM(true);   // isi otomatis saat panel dibuka (jika daftar tersedia)
+    }
     const input = document.getElementById('chat-input');
     const btn = document.getElementById('chat-send');
     const stopBtn = document.getElementById('chat-stop');
@@ -1736,6 +1802,33 @@
       // The Send button keeps its own label. Flipping it to "Stop" as well put
       // two Stop buttons next to each other while a request was running.
     };
+    // Fork: salin perintah PERTAMA (teks + gambar tertanam) sebagai seed sesi
+    // baru. Sesi saat ini diarsipkan ke LOG dulu — jadi tidak ada yang hilang,
+    // dan Anda bisa ganti model lalu melanjutkan dari awal.
+    const forkBtn = document.getElementById('chat-fork');
+    if (forkBtn) forkBtn.addEventListener('click', () => {
+      if (NS.activeAbort) return;
+      const firstUser = NS.log.find(m => m && m.role === 'user');
+      if (!firstUser) return;
+      const seedText = String(firstUser.text || '');
+      const seedImages = (Array.isArray(firstUser.images) && firstUser.images.length)
+        ? firstUser.images.slice()        // salinan penuh data-URL
+        : null;
+      archiveCurrentSession().then(() => {
+        NS.log = [];
+        NS.sessionId = newSessionId();
+        NS.sessionAt = Date.now();
+        lsSet(CURRENT_ID_KEY, NS.sessionId);
+        // stage gambar seed lalu langsung kirim ke AI (send() memakai pendingImages)
+        NS.pendingImages = seedImages || [];
+        renderPending();
+        setTab('chat');
+        renderLog();
+        scheduleSave();
+        send(seedText);
+      });
+    });
+
     const newBtn = document.getElementById('chat-new');
     if (newBtn) newBtn.addEventListener('click', () => {
       // never archive/clear mid-turn: the streaming entry is not finished yet
