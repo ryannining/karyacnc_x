@@ -629,11 +629,15 @@
         ? svgLenToMm(fsRaw)
         : (isFinite(fsNum) ? fsNum : 16) * mScale;
       const color = svgColorToHex(style.fill) || '#000000';
+      // text-anchor: start|middle|end -> left|center|right (kept through import)
+      const anchorRaw = String(el.getAttribute('text-anchor') || style.textAnchor || '').toLowerCase();
+      const anchor = anchorRaw === 'middle' ? 'center'
+        : anchorRaw === 'end' ? 'right' : 'left';
       // SVG y is the baseline; a comment/text frame hangs from its top-left,
       // so lift the anchor to the cap line (0.75 em)
       const anchorY = p.y - size * 0.75;
       ctx.items.push({ kind: 'note', x: p.x, y: anchorY, text: raw, size,
-        color, group, source: 'text' });
+        color, group, source: 'text', anchor });
       ctx.colors.set(color, (ctx.colors.get(color) || 0) + 1);
       ctx.textCount = (ctx.textCount || 0) + 1;
       return;
@@ -1089,7 +1093,7 @@
         if (o.textMode === 'skip') continue;
         if (o.textMode === 'text') {
           const id = addImportedTextObject(item.x + off.x, item.y + off.y, text,
-            item.size || 5, { ux: 1, uy: 0, vx: 0, vy: -1 });
+            item.size || 5, { ux: 1, uy: 0, vx: 0, vy: -1 }, item.anchor);
           made.entities.push(id);
           made.framed++;
         } else {
@@ -1478,12 +1482,19 @@
       help: 'One number, shown in both this window and the KaryaCNC window: circles and arcs are flattened so they never deviate more than this. Smaller = smoother and more points; 0.05 mm is a good laser default, 0.02 mm for fine detail.' },
     { group: 'AI chat', key: 'aiBridgeUrl', label: 'AI bridge URL', unit: '', text: true, def: '',
       help: 'AI bridge server (server/serve.js), e.g. http://127.0.0.1:8090. Empty = the same server that served MiniSketch (needs the app served over http, not opened as a file). With no server at all the chat tab falls back to offline mode: it parses simple Indonesian/English commands directly, no LLM needed.' },
+    { group: 'AI chat', key: 'aiProviderGoogle', label: 'Google Gemini', unit: '', bool: true, def: false,
+      help: 'Pakai Google Gemini sebagai provider: cukup isi AI API key dan model (mis. gemini-2.5-flash). Base URL otomatis ke https://generativelanguage.googleapis.com/v1beta — field AI API base URL diabaikan. Matikan centang ini untuk endpoint OpenAI-compatible biasa (z.ai, DeepSeek, dst.) dengan base URL sendiri.' },
     { group: 'AI chat', key: 'aiApiUrl', label: 'AI API base URL', unit: '', text: true, def: '',
-      help: 'The OpenAI-compatible endpoint YOUR key belongs to, without /chat/completions. Empty = the bridge uses its own server/.env value. Fill this in together with the API key below.' },
+      help: 'The OpenAI-compatible endpoint YOUR key belongs to, without /chat/completions (mis. https://api.z.ai/api/coding/paas/v4). Empty = the bridge uses its own server/.env value. Fill this in together with the API key below. Toe Google Gemini, centang "Google Gemini" — kolom ini tidak perlu diisi.' },
     { group: 'AI chat', key: 'aiApiKey', label: 'AI API key', unit: '', password: true, def: '',
-      help: 'Your own key for that service. It is sent to the bridge with each request and is never stored by the bridge (it forgets it when it stops). A key that is baked into the source code leaks with the source, so there is none here — you set it.' },
+      help: 'Your own key for that service (Google Gemini: AIza…). It is sent to the bridge with each request and is never stored by the bridge (it forgets it when it stops). A key that is baked into the source code leaks with the source, so there is none here — you set it.' },
     { group: 'AI chat', key: 'aiModel', label: 'AI model', unit: '', text: true, def: '',
-      help: 'Model name to ask for, e.g. glm-5.3-flash or deepseek-v4.1-flash-1017. Empty = the bridge uses its own default.' },
+      help: 'Model name to ask for, e.g. glm-5.3-flash, deepseek-v4.1-flash-1017, atau gemini-2.5-flash (Google). Empty = the bridge uses its own default.' },
+    { group: 'AI chat', key: 'aiThinkLevel', label: 'AI reasoning level', unit: '',
+      choices: [['off', 'Off'], ['low', 'Low'], ['normal', 'Normal']], def: 'normal',
+      help: 'Off = model menjawab langsung, tanpa berpikir (paling cepat/murah). Low = reasoning singkat — disarankan untuk glm/Gemini agar tidak terlalu lama "mikir" pada permintaan biasa. Normal = reasoning penuh (lebih teliti untuk tugas rumit, lebih lambat/mahal).' },
+    { group: 'AI chat', key: 'aiModeSvg', label: 'Mode SVG (tanpa tools)', unit: '', bool: true, def: false,
+      help: 'AI fokus murni menghasilkan SATU <svg> — tanpa tool MiniSketch (cocok untuk model yang belum dilatih dengan tools ini, mis. Gemini). Hasil muncul sebagai pratinjau + tombol "Masukkan ke MiniSketch" dan "Salin SVG". Matikan untuk mode agen penuh (tool calls).' },
     { group: 'AI chat', key: 'aiMaxRounds', label: 'AI agent rounds', unit: '×',
       def: 4, min: 1, max: 8, step: 1,
       help: 'How many times the agent may loop (emit tool calls → execute → verify) before it must give a final answer. Each round is one provider request. 2–3 is cheaper; more rounds give the model more chances to self-correct complex jobs.' }
@@ -1627,6 +1638,7 @@
   }
 
   function clampSetting(sp, value) {
+    if (sp.bool) return !!value;
     if (sp.text || sp.password) {
       const s = value == null ? '' : String(value).trim();
       return s || sp.def;
@@ -1748,6 +1760,15 @@
     const bodies = {};
     let idx = 0;
     for (const sp of SETTINGS_SPEC) {
+      // KaryaCNC serves the AI chat through its own built-in Go proxy
+      // (/api/chat), so it has no separate Node bridge to point at. It hides
+      // the "AI bridge URL" row by setting window.MiniSketchUI.showBridgeUrl
+      // = false in its app-specific ai/ui-flags.js (never synced). Upstream
+      // MiniSketch leaves the flag unset -> defaults to true -> row shows.
+      if (sp.key === 'aiBridgeUrl' &&
+          window.MiniSketchUI && window.MiniSketchUI.showBridgeUrl === false) {
+        continue;
+      }
       // P1-13: hidden keys (lives in a menu toggle) still show as a readonly
       // "menu-linked" row, so every key is searchable in one place.
       const linked = !!sp.hidden;
@@ -1771,7 +1792,8 @@
         idx++;
       }
       const row = document.createElement('div');
-      row.className = 'settings-row' + (linked ? ' linked' : '');
+      row.className = 'settings-row' + (linked ? ' linked' : '') +
+        ((sp.text || sp.password) ? ' wide' : '');
       row.dataset.search = (sp.label + ' ' + sp.key + ' ' + sp.group + ' ' + (sp.unit || '')).toLowerCase();
       const name = document.createElement('span');
       name.className = 'settings-name';
@@ -1797,6 +1819,13 @@
           opt.value = pair[0];
           opt.textContent = pair[1];
           input.appendChild(opt);
+        }
+      } else if (sp.bool) {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        if (sp.key === 'aiProviderGoogle') {
+          // live-update the URL row without waiting for Apply
+          input.addEventListener('change', syncProviderRows);
         }
       } else if (sp.text) {
         input = document.createElement('input');
@@ -1938,7 +1967,267 @@
       const el = document.getElementById('set-' + sp.key);
       if (!el) continue;
       const value = settings[sp.key] != null ? settings[sp.key] : sp.def;
-      el.value = String(value);
+      if (sp.bool) el.checked = !!value;
+      else el.value = String(value);
+    }
+  }
+
+  // ---- AI provider presets ---------------------------------------------
+  // Pasangan {baseUrl, apiKey} (dan model opsional) disimpan sebagai preset di
+  // localStorage; memilih preset mengisi kolom AI API base URL + key + model.
+  // Key disimpan polos — sama seperti key yang sudah tersimpan di settings
+  // (minisketch.settings.v1), hanya di lokasi sendiri agar mudah dipilih
+  // tanpa perlu mengingat URL/menyalin key.
+  const AI_PROVIDERS_KEY = 'minisketch.ai.providers.v1';
+  const GOOGLE_DEFAULT_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+  function loadAiProviders() {
+    try {
+      const raw = localStorage.getItem(AI_PROVIDERS_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.filter(p => p && p.name && p.baseUrl) : [];
+    } catch (err) { return []; }
+  }
+  function saveAiProviders() {
+    try { localStorage.setItem(AI_PROVIDERS_KEY, JSON.stringify(aiProviders)); } catch (err) { /* private mode */ }
+  }
+  let aiProviders = loadAiProviders();
+  const isGeminiBaseUrl = (base) => /generativelanguage\.googleapis\.com|generativelanguage\.google\.com/.test(String(base || ''));
+
+  // "Google Gemini" checked => the base URL row is not needed (the bridge uses
+  // the Google endpoint automatically). Grey the row out and show the default.
+  function syncProviderRows() {
+    const cb = document.getElementById('set-aiProviderGoogle');
+    const google = cb ? !!cb.checked : !!settings.aiProviderGoogle;
+    const urlInput = document.getElementById('set-aiApiUrl');
+    const urlRow = urlInput ? urlInput.closest('.settings-row') : null;
+    if (urlRow) urlRow.classList.toggle('off', google);
+    if (urlInput) urlInput.disabled = google;
+    if (urlRow) {
+      const unit = urlRow.querySelector('.settings-unit');
+      if (unit) unit.textContent = google ? 'otomatis: generativelanguage.googleapis.com' : '';
+    }
+    // ---- AI provider presets + model list (semua provider) --------------
+    const modelInput = document.getElementById('set-aiModel');
+    const modelRow = modelInput ? modelInput.closest('.settings-row') : null;
+    const groupHost = modelRow ? (modelRow.parentElement || modelRow) : null;
+
+    const effGoogle = () => {
+      const cbEl = document.getElementById('set-aiProviderGoogle');
+      return cbEl ? !!cbEl.checked : !!settings.aiProviderGoogle;
+    };
+    const effBase = () => {
+      if (effGoogle()) return GOOGLE_DEFAULT_BASE;
+      const el = document.getElementById('set-aiApiUrl');
+      return String((el && el.value) || settings.aiApiUrl || '').trim();
+    };
+    const effKey = () => {
+      const el = document.getElementById('set-aiApiKey');
+      return String((el && el.value) || settings.aiApiKey || '').trim();
+    };
+
+    // Pemilih preset provider (pilih -> kolom URL/key/model terisi otomatis)
+    let sel = document.getElementById('ai-provider-sel');
+    if (groupHost && !sel) {
+      const prow = document.createElement('div');
+      prow.className = 'settings-row';
+      prow.style.gridTemplateColumns = 'max-content 1fr auto auto';
+      prow.style.alignItems = 'center';
+      const lab = document.createElement('span');
+      lab.className = 'settings-name';
+      lab.textContent = 'Provider tersimpan';
+      sel = document.createElement('select');
+      sel.id = 'ai-provider-sel';
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.className = 'btn small';
+      saveBtn.textContent = 'Simpan preset';
+      saveBtn.title = 'Simpan pasangan base URL + API key saat ini sebagai preset';
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'btn small';
+      delBtn.textContent = '✕';
+      delBtn.title = 'Hapus preset terpilih';
+      prow.appendChild(lab);
+      prow.appendChild(sel);
+      prow.appendChild(saveBtn);
+      prow.appendChild(delBtn);
+      groupHost.appendChild(prow);
+
+      const fillSel = () => {
+        sel.innerHTML = '';
+        const ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = '— pilih provider —';
+        sel.appendChild(ph);
+        for (const p of aiProviders) {
+          const opt = document.createElement('option');
+          opt.value = p.id;
+          let host = '';
+          try { host = new URL(p.baseUrl).host; } catch (e) { host = p.baseUrl; }
+          opt.textContent = p.name + ' · ' + host;
+          sel.appendChild(opt);
+        }
+      };
+      fillSel();
+
+      sel.addEventListener('change', () => {
+        const p = aiProviders.find(x => x.id === sel.value);
+        if (!p) return;
+        const urlEl = document.getElementById('set-aiApiUrl');
+        const keyEl = document.getElementById('set-aiApiKey');
+        const gcbEl = document.getElementById('set-aiProviderGoogle');
+        if (p.baseUrl) urlEl.value = p.baseUrl;
+        if (p.apiKey != null) keyEl.value = p.apiKey;
+        if (p.model) modelInput.value = p.model;
+        if (gcbEl) gcbEl.checked = isGeminiBaseUrl(p.baseUrl);
+        syncProviderRows();   // cukup state URL-row/dll. (id sudah ada → tidak duplikat)
+      });
+
+      saveBtn.addEventListener('click', () => {
+        let nameSugg = 'provider';
+        try { nameSugg = new URL(effBase()).host; } catch (e) { /* keep */ }
+        const name = (window.prompt('Nama preset provider:', nameSugg) || '').trim();
+        if (!name) return;
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'provider';
+        const base = effBase();
+        const rec = {
+          id,
+          name,
+          baseUrl: base,
+          apiKey: effKey(),
+          model: String(modelInput ? modelInput.value : '').trim()
+        };
+        const idx = aiProviders.findIndex(x => x.baseUrl === base);
+        if (idx >= 0) aiProviders[idx] = rec; else aiProviders.push(rec);
+        saveAiProviders();
+        fillSel();
+        sel.value = id;
+        toast('Preset “' + name + '” disimpan.');
+      });
+
+      delBtn.addEventListener('click', () => {
+        const p = aiProviders.find(x => x.id === sel.value);
+        if (!p) return;
+        aiProviders = aiProviders.filter(x => x.id !== p.id);
+        saveAiProviders();
+        fillSel();
+        sel.value = '';
+        toast('Preset “' + p.name + '” dihapus.');
+      });
+    }
+
+    // Muat daftar model dari provider AKTIF (base URL + key dari kolom).
+    // Bisa Gemini (ListModels) maupun OpenAI-compatible (/models).
+    let dd = document.getElementById('ai-model-dd');
+    let btn = document.getElementById('ai-models-refresh');
+    if (!dd) {
+      // rendered on document.body with fixed coordinates so the settings
+      // panel's overflow can never clip it
+      dd = document.createElement('div');
+      dd.id = 'ai-model-dd';
+      dd.className = 'settings-dd hidden';
+      dd.style.position = 'fixed';
+      document.body.appendChild(dd);
+    }
+    if (modelRow && !btn) {
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'ai-models-refresh';
+      btn.className = 'btn small ai-model-load';
+      btn.textContent = '🔄';
+      btn.title = 'Muat daftar model dari provider aktif (base URL + API key yang terisi)';
+      // kecil, di sebelah kiri kolom AI model (segaris dengan input)
+      modelRow.appendChild(btn);
+      modelRow.insertBefore(btn, modelInput);
+      if (modelInput) modelRow.style.gridTemplateColumns = 'max-content auto 1fr 24px';
+      const fillList = (names) => {
+        dd.innerHTML = '';
+        for (const name of names) {
+          const opt = document.createElement('button');
+          opt.type = 'button';
+          opt.value = name;
+          opt.textContent = name;
+          opt.addEventListener('click', () => {
+            if (modelInput) modelInput.value = name;
+            dd.classList.add('hidden');
+          });
+          dd.appendChild(opt);
+        }
+      };
+      btn.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        btn.disabled = true;
+        btn.textContent = '…';
+        try {
+          const r = await fetch('/api/models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ settings: { baseUrl: effBase(), apiKey: effKey() } })
+          });
+          const j = await r.json().catch(() => ({}));
+          if (Array.isArray(j.models) && j.models.length) {
+            fillList(j.models);
+            placeDd();
+            dd.classList.remove('hidden');
+            toast(j.models.length + ' model dimuat — pilih dari daftar');
+          } else {
+            toast('Gagal memuat model: ' + ((j && j.error) || 'respons tidak dikenal'));
+          }
+        } catch (err) {
+          toast('Gagal memuat model: ' + String(err && err.message || err));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Muat daftar model';
+        }
+      });
+    }
+    if (btn) btn.style.display = '';
+
+    // document-level click closes the dropdown; helper bound once
+    if (!window.__aiModelDdClose) {
+      window.__aiModelDdClose = (ev) => {
+        const d = document.getElementById('ai-model-dd');
+        if (d && !d.contains(ev.target) &&
+            !(ev.target.id === 'ai-models-refresh') &&
+            !(ev.target.id === 'set-aiModel')) {
+          d.classList.add('hidden');
+        }
+      };
+      document.addEventListener('click', window.__aiModelDdClose, true);
+    }
+    const placeDd = () => {
+      if (!dd || !modelInput) return;
+      const r = modelInput.getBoundingClientRect();
+      dd.style.top = Math.round(r.bottom + 4) + 'px';
+      dd.style.left = Math.round(r.left) + 'px';
+      dd.style.width = Math.max(140, Math.round(r.width)) + 'px';
+      dd.style.right = 'auto';
+    };
+    const openDd = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (dd && dd.children.length && dd.classList.contains('hidden')) {
+        placeDd();
+        dd.classList.remove('hidden');
+      }
+    };
+    modelInput.removeEventListener('focus', openDd);
+    modelInput.addEventListener('focus', openDd);
+    modelInput.addEventListener('click', openDd);
+    // any scroll/resize OUTSIDE the dropdown closes it; scrolling INSIDE the
+    // dropdown's own list must keep it open (the wheel/scrollbar is how the
+    // user reads long model lists).
+    if (!window.__aiModelDdScroll) {
+      window.__aiModelDdScroll = (ev) => {
+        const d = document.getElementById('ai-model-dd');
+        if (!d) return;
+        if (ev && ev.target && d.contains(ev.target)) return;
+        d.classList.add('hidden');
+      };
+      document.addEventListener('scroll', window.__aiModelDdScroll, true);
+      window.addEventListener('resize', window.__aiModelDdScroll);
     }
   }
 
@@ -1948,6 +2237,7 @@
     if (Object.keys(settings).length !== SETTINGS_SPEC.length) loadSettings();
     buildSettingsForm();
     fillSettingsForm();
+    syncProviderRows();
     refreshLinkedSettings();
     const modal = document.getElementById('settings-modal');
     if (modal) modal.classList.remove('hidden');
@@ -1970,7 +2260,8 @@
       if (sp.hidden) continue;   // menu-linked rows are readonly
       const el = document.getElementById('set-' + sp.key);
       if (!el) continue;
-      settings[sp.key] = clampSetting(sp, el.value === '' ? sp.def : el.value);
+      if (sp.bool) settings[sp.key] = !!el.checked;
+      else settings[sp.key] = clampSetting(sp, el.value === '' ? sp.def : el.value);
     }
     applySettings();
     saveSettings();
@@ -1978,6 +2269,8 @@
     refreshLinkedSettings();
     syncWallIndicator();
     render();
+    // keep the AI chat panel title in sync (provider/model shown there)
+    try { if (window.MiniSketchAI && window.MiniSketchAI.updateTitle) window.MiniSketchAI.updateTitle(); } catch (err) { /* ignore */ }
     // P1-13: Apply keeps the modal open — the search + tweak loop stays alive.
     // Close explicitly with Close / Esc / backdrop.
     toast('Settings applied');
@@ -15871,7 +16164,8 @@
         center: ui.lastWorld ? { x: ui.lastWorld.x, y: ui.lastWorld.y } : s2w(W / 2, H / 2),
         fillMode: 'gray',
         colorMap,
-        textMode: 'comment'
+        // pasted <text> becomes a real editable text object, not a yellow note
+        textMode: 'text'
       });
     } catch (err) {
       // the pushed snapshot stays: the insert may have written geometry before it
@@ -16005,18 +16299,24 @@
   // to the real font metrics so the glyphs keep the PDF's size instead of being
   // stretched to a guessed box. Callers load the face first (importPrimsIntoDocument
   // awaits it) so the glyphs are on the first render.
-  function addImportedTextObject(x, y, text, sizeMm, dir) {
+  function addImportedTextObject(x, y, text, sizeMm, dir, align) {
     const d = dir || {};
     const ux = isFinite(d.ux) ? d.ux : 1, uy = isFinite(d.uy) ? d.uy : 0;
     const vx = isFinite(d.vx) ? d.vx : 0, vy = isFinite(d.vy) ? d.vy : 1;
     const h = clamp(sizeMm, 0.5, 500);
     const w = Math.max(h, String(text).length * h * 0.55);
+    // SVG text-anchor (start|middle|end) -> entity align (left|center|right).
+    // The anchor X is the reference point; shift the whole frame left so the
+    // centered/right-aligned line lands at that anchor.
+    const al = align === 'center' || align === 'right' ? align : 'left';
+    const off = al === 'center' ? w / 2 : al === 'right' ? w : 0;
+    const ax = x - ux * off, ay = y - uy * off;
     const p0 = newId();
-    state.points[p0] = { id: p0, x, y };
+    state.points[p0] = { id: p0, x: ax, y: ay };
     const pwId = newId();
-    state.points[pwId] = { id: pwId, x: x + ux * w, y: y + uy * w };
+    state.points[pwId] = { id: pwId, x: ax + ux * w, y: ay + uy * w };
     const phId = newId();
-    state.points[phId] = { id: phId, x: x - vx * h, y: y - vy * h };
+    state.points[phId] = { id: phId, x: ax - vx * h, y: ay - vy * h };
     const idW = newId();
     state.entities[idW] = { id: idW, type: 'line', a: p0, b: pwId, color: '#00ff00' };
     const idH = newId();
@@ -16040,7 +16340,7 @@
     const ent = {
       id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
       text: String(text), font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0,
-      color: ui.color
+      color: ui.color, align: al
     };
     state.entities[id] = ent;
     const fit = () => {

@@ -8,6 +8,12 @@
 # dibaca dari index.html sumber, jadi dependensi baru (help.js, tools/*.js, dst)
 # otomatis ikut tersalin. Aset yang dimuat RUNTIME (fonts/<slug>.js disuntik
 # fonts/fonts.js saat family dipilih) ikut disapu lewat glob fonts/*.js.
+#
+# SATU pengecualian: ai/ui-strings.js TIDAK pernah disinkron. Itu satu-satunya
+# file ai/ yang sengaja berbeda — KaryaCNC memakai proxy Go bawaan (/api/chat),
+# master memakai Node bridge (server/serve.js), dan chat.js membaca kata-kata
+# panduannya dari window.MiniSketchAIStrings. chat.js sendiri tetap identik di
+# kedua repo, jadi tetap aman disinkron (lihat guard di loop salin di bawah).
 
 set -euo pipefail
 
@@ -71,6 +77,16 @@ for f in "$SRC"/fonts/*.js; do
     FILES+=("fonts/$(basename "$f")")
 done
 
+# Aset RUNTIME ai/: prompt.js mem-fetch ai/system-prompt*.txt, tools.json dan
+# skills.js lewat fetch() saat kirim — TIDAK dirujuk index.html, jadi discovery
+# tag melewatkannya (system-prompt-svg.txt baru sempat terlewat dan hilang di
+# salinan KaryaCNC). Salin SEMUA file ai/ KECUALI ui-strings.js/ui-flags.js
+# (dilewati oleh guard di loop salin di bawah).
+while IFS= read -r f; do
+    rel="${f#"$SRC"/}"
+    FILES+=("$rel")
+done < <(find "$SRC/ai" -maxdepth 2 -type f \( -name '*.js' -o -name '*.txt' -o -name '*.json' \) | sort)
+
 # Buang duplikat, jaga urutan
 FILES=($(printf '%s\n' "${FILES[@]}" | awk '!seen[$0]++'))
 
@@ -79,6 +95,15 @@ echo "Target : $DST"
 echo ""
 
 for f in "${FILES[@]}"; do
+    # KaryaCNC-specific: ai/ui-strings.js sengaja BERBEDA dari master (app ini
+    # memakai proxy Go bawaan di /api/chat, bukan Node bridge server/serve.js).
+    # chat.js membacanya lewat window.MiniSketchAIStrings dan fallback ke default
+    # master, jadi file chat.js tetap identik & aman disinkron — hanya
+    # ui-strings.js yang tidak boleh ditimpa. Lewati, pertahankan versi lokal.
+    if [ "$f" = "ai/ui-strings.js" ] || [ "$f" = "ai/ui-flags.js" ]; then
+        echo "  dilewati    : $f (spesifik KaryaCNC — proxy Go, bukan Node bridge)"
+        continue
+    fi
     if [ ! -s "$SRC/$f" ]; then
         echo "ERROR: $SRC/$f kosong — salinan lama dijadikan sebagai fallback."
         exit 1
@@ -91,9 +116,13 @@ for f in "${FILES[@]}"; do
             src_cmp=$(mktemp)
             dst_cmp=$(mktemp)
             cp "$SRC/$f" "$src_cmp"
-            # buang blok bridge dari DST: 10 baris terakhir
-            # (<script> ... </script> yang di-inject heredoc)
-            head -n -10 "$DST/$f" > "$dst_cmp"
+            # buang DUA blok KaryaCNC-only dari DST agar compare idempoten:
+            #   1) tab-shortcut bridge: 10 baris terakhir (di-inject heredoc)
+            #   2) tag <script src="ai/ui-flags.js"> (di-inject sed, ber-marker)
+            # Tanpa membuang ui-flags, compare selalu gagal dan index.html
+            # di-copy+inject ulang tiap sync (tak pernah konvergen).
+            head -n -10 "$DST/$f" \
+                | grep -v 'karyacnc-ui-flags' > "$dst_cmp"
             if cmp -s "$src_cmp" "$dst_cmp"; then
                 echo "  sama        : $f"
                 rm -f "$src_cmp" "$dst_cmp"
@@ -135,6 +164,19 @@ window.addEventListener('keydown', function (e) {
 </script>
 EOF
     echo "  di-inject   : tab-shortcut bridge ke index.html"
+fi
+
+# Inject <script src="ai/ui-flags.js"> ke index.html KaryaCNC. File ini
+# KaryaCNC-specific (menyembunyikan baris "AI bridge URL" — app ini pakai proxy
+# Go bawaan), jadi TIDAK ada di master dan akan hilang tiap kali sync menimpa
+# index.html. Ber-marker komentar sehingga idempoten (tak menumpuk saat sync
+# dijalankan berulang); disisipkan sebelum ai/chat.js agar flag terpasang dulu.
+UIFLAGS_MARKER="karyacnc-ui-flags"
+if grep -q "$UIFLAGS_MARKER" "$IDX"; then
+    echo "  sudah ada   : ai/ui-flags.js script tag"
+else
+    sed -i "s#<script src=\"ai/chat.js\"></script>#<script src=\"ai/ui-flags.js\"></script> <!-- $UIFLAGS_MARKER -->\n<script src=\"ai/chat.js\"></script>#" "$IDX"
+    echo "  di-inject   : ai/ui-flags.js script tag ke index.html"
 fi
 
 echo ""

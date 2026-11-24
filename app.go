@@ -867,6 +867,14 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 	case "/api/shop-config":
 		a.handleShopConfig(w, r)
 		return
+	case "/api/chat":
+		// MiniSketch AI chat: proxy streaming murni ke provider (policy-free).
+		a.HandleAIChat(w, r)
+		return
+	case "/api/models":
+		// Daftar model Gemini (Settings > AI chat > "Muat daftar model").
+		a.HandleAIModels(w, r)
+		return
 	case "/api/profiles", "/profiles":
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", 405)

@@ -365,13 +365,21 @@ func currentWebVersion() string {
 // webAssetHandler returns handler for Wails AssetServer: cache first, embedded fallback.
 // Cache dicek tiap request (bukan sekali di startup) agar update web yang
 // tiba (selama aplikasi hidup) segera diterima tanpa restart.
-func webAssetHandler() http.Handler {
+// Menerima *App agar bisa menyajikan endpoint proxy AI (/api/chat) di webview,
+// yang location.origin-nya bukan http://localhost:3000.
+func webAssetHandler(app *App) http.Handler {
 	sub, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		panic(err)
 	}
 	embedded := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// AI chat proxy di webview: location.origin bukan http://localhost:3000,
+		// jadi /api/chat dilayani langsung di sini (policy-free, lihat ai_bridge.go).
+		if r.URL.Path == "/api/chat" {
+			app.HandleAIChat(w, r)
+			return
+		}
 		dir := webAssetDir()
 		if dir == "" {
 			embedded.ServeHTTP(w, r)

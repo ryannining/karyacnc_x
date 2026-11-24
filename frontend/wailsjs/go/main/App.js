@@ -38,6 +38,14 @@ export function GetRajaOngkirKey() {
   return window['go']['main']['App']['GetRajaOngkirKey']();
 }
 
+export function HandleAIChat(arg1, arg2) {
+  return window['go']['main']['App']['HandleAIChat'](arg1, arg2);
+}
+
+export function HandleAIModels(arg1, arg2) {
+  return window['go']['main']['App']['HandleAIModels'](arg1, arg2);
+}
+
 export function InstallInkscapeExtension() {
   return window['go']['main']['App']['InstallInkscapeExtension']();
 }
