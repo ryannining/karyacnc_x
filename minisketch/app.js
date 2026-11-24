@@ -1605,6 +1605,34 @@
   // A press shorter than this never moves geometry: a trembling click (mouse
   // jitter at press/release) stays a selection instead of becoming a micro-drag.
   const DRAG_GATE_MS = 50;
+  // Ribbon feedback: when the drag gate passes, the Select tool icon flashes
+  // (brighter) so a drag started too early is visibly acknowledged.
+  const DRAG_READY_FLASH_MS = 600;
+  let dragReadyFlashTimer = null;
+  function flashSelectToolReady(on, why) {
+    const el = document.querySelector('.tool-btn[data-tool="select"]');
+    if (on) console.log('[drag-ready] flash ON (' + why + ') button=' + (el ? 'found' : 'MISSING'));
+    clearTimeout(dragReadyFlashTimer);
+    if (on) {
+      el.classList.add('drag-ready');
+      dragReadyFlashTimer = setTimeout(() => el.classList.remove('drag-ready'), DRAG_READY_FLASH_MS);
+    } else {
+      el.classList.remove('drag-ready');
+    }
+  }
+  // Arm the "ready" feedback at PRESS time (not on first move): the flash
+  // fires the moment the press passes its readiness threshold — the drag gate
+  // for a plain marquee, the dwell for a press inside a loop — even when the
+  // pointer has not moved yet (holding still inside a loop must still show it).
+  function armDragFeedback(d, ms, why) {
+    clearTimeout(d.armedTimer);
+    d.armedTimer = setTimeout(() => {
+      if (ui.drag === d) {
+        d.armedFlashed = true;
+        flashSelectToolReady(true, why);
+      }
+    }, ms);
+  }
   // Press-and-hold disambiguation (mouse/pen) for a press ON an object:
   // dragging away within PRESS_DWELL_MS reads as "start a marquee here";
   // holding the press first arms the object drag — select + move, exactly
@@ -22436,32 +22464,9 @@
     ctx.restore();
   }
 
-  // Gate flash: a short expanding ring at the press point, shown the moment
-  // the drag gate (DRAG_GATE_MS) passes — the drag is armed now. It fades out
-  // in ~400 ms and clears itself. Screen coordinates (ui.gateFlash.x/y are the
-  // press position in canvas px).
-  const GATE_FLASH_MS = 400;
-  function drawGateFlash() {
-    const f = ui.gateFlash;
-    if (!f) return;
-    const age = performance.now() - f.t;
-    if (age > GATE_FLASH_MS) { ui.gateFlash = null; return; }
-    const k = age / GATE_FLASH_MS;
-    const r = 6 + 22 * k;
-    ctx.save();
-    ctx.globalAlpha = Math.max(0, 0.9 * (1 - k));
-    ctx.strokeStyle = '#2563eb';
-    ctx.lineWidth = 2.5 * (1 - k) + 0.75;
-    ctx.beginPath();
-    ctx.arc(f.x, f.y, r, 0, TAU);
-    ctx.stroke();
-    ctx.globalAlpha = Math.max(0, 0.55 * (1 - k));
-    ctx.fillStyle = '#2563eb';
-    ctx.beginPath();
-    ctx.arc(f.x, f.y, 2.5, 0, TAU);
-    ctx.fill();
-    ctx.restore();
-  }
+  // (removed) gate flash: the old canvas ring at the press point when the drag
+  // gate passed. Feedback now lives on the Select tool ribbon icon (see
+  // flashSelectToolReady / armDragFeedback).
 
   function drawEmptyState() {
     if (Object.keys(state.entities).length) return;
@@ -22601,7 +22606,6 @@
     prof('segmentHighlight', () => drawSegmentHighlight());
     prof('preview', () => drawPreview());
     prof('rubber', () => drawRubber());
-    prof('gateFlash', () => drawGateFlash());
     prof('scaleBar', () => drawScaleBar());
     if (ui.drag && ui.drag.snap) drawSnapMarker(ui.drag.snap, ui.drag.snap.coincident);
     // the part drag shows its own snap ring when it hovers another part's
@@ -24777,6 +24781,14 @@
         const sel = selectionBodyDragFor(world);
         if (sel) ui.drag = sel;
       }
+      // The drag is armed (dwell served / touch immediate): acknowledge it on
+      // the Select ribbon icon — covers text, notes and every other entity.
+      // The press-time timer (armDragFeedback) may have flashed already at the
+      // dwell boundary; don't flash twice for the same press.
+      if (ui.drag && !d.armedFlashed) {
+        d.armedFlashed = true;
+        flashSelectToolReady(true, 'entity-dwell');
+      }
     }
     updateUI();
     render();
@@ -25123,6 +25135,9 @@
             moved: false,
             startWorld: world
           };
+          // point drag: arms right after the drag gate — flash at press time
+          // so a held press shows it even before any movement
+          armDragFeedback(ui.drag, DRAG_GATE_MS, 'point-gate');
           updateUI();
           render();
         }
@@ -25320,6 +25335,9 @@
           if (body) {
             pushHistory();
             ui.drag = body;
+            // selected framed object: the drag is armed immediately — flash
+            // the Select ribbon icon so text/notes give the same cue
+            flashSelectToolReady(true, 'framed-immediate');
             updateUI();
             render();
             return;
@@ -25347,6 +25365,9 @@
           },
           moved: false
         };
+        // press on an entity (line / text / note / ...): the drag arms at the
+        // dwell — flash at press time so holding still shows it too
+        armDragFeedback(ui.drag, PRESS_DWELL_MS, 'pressEntity-dwell');
         render();
         return;
       }
@@ -25375,6 +25396,7 @@
         const editableLoop = loopEntities(loop)
           .some(eid => { const e = state.entities[eid]; return e && entityEditable(e); });
         if (!editableLoop) {
+          // locked/non-editable loop: plain marquee — no drag-ready flash
           ui.drag = { kind: 'rubber', start: pos, additive: addMod || subMod, subtract: ev.altKey };
           render();
           return;
@@ -25399,6 +25421,11 @@
           mouse: ev.pointerType !== 'touch',
           crossLayer: !!(ev.ctrlKey && ev.shiftKey)
         };
+        // held press inside a loop: the "ready" moment is the dwell — after
+        // PRESS_DWELL_MS a drag selects and moves the loop (before that it is
+        // the rectangle selection). Arm the feedback at press time so holding
+        // still still flashes when the threshold passes.
+        armDragFeedback(ui.drag, PRESS_DWELL_MS, 'loop-dwell');
         render();
         return;
       }
@@ -25417,6 +25444,7 @@
           Math.abs(pos.y - lastTap.y) < DOUBLE_TAP_SLOP;
         if (dbl) {
           lastTap = null;
+          // double-tap rubber marquee — no drag-ready flash
           ui.drag = {
             kind: 'rubber', start: pos, additive: false, subtract: ev.altKey || ui.altToggle,
             crossLayer: false
@@ -25433,6 +25461,8 @@
       // rectangle selection: Shift adds to the selection (the classic), Ctrl
       // adds too, Alt takes the rectangle's contents back out. Ctrl+Shift is
       // cross-layer: it reaches into every visible, unlocked layer.
+      // No drag-ready flash here: this is a pure marquee (selection) gesture —
+      // the flash is reserved for presses that arm an object drag.
       ui.drag = { kind: 'rubber', start: pos, additive: addMod || subMod, subtract: ev.altKey || ui.altToggle, crossLayer: !!(ev.ctrlKey && ev.shiftKey) };
       return;
     }
@@ -26762,6 +26792,7 @@ function cmdSplitCurve() {
         if (performance.now() - d.downAt < PRESS_DWELL_MS) {
           // Same modifier language as a press on empty space: Ctrl or Shift
           // adds to the marquee, Alt takes the rectangle's contents out.
+          // This is a pure marquee (selection) gesture — no drag-ready flash.
           ui.drag = {
             kind: 'rubber',
             start: d.start,
@@ -26798,15 +26829,10 @@ function cmdSplitCurve() {
           d.gateTimer = setTimeout(() => {
             d.gateTimer = 0;
             if (ui.drag === d && !d.moved) {
-              // The gate has passed: the drag is armed. Flash the press point
-              // so a drag started too early is visibly acknowledged (the early
-              // movement is replayed below, so the gesture is never lost). A
-              // plain press+release is a click — the flash still marks where
-              // it was registered.
-              if (d.kind === 'rubber') {
-                ui.gateFlash = { x: d.start.x, y: d.start.y, t: performance.now() };
-                scheduleRender();
-              }
+              // The gate has passed: replay the earliest movement so a drag
+              // started too early is never lost. The "ready" feedback itself
+              // is armed at press time (armDragFeedback), so it shows even
+              // when the pointer never moved.
               if (d.gateEv) onPointerMove(d.gateEv);
             }
           }, DRAG_GATE_MS - (performance.now() - ui._downAt));
