@@ -233,24 +233,27 @@
           addImageFiles(ev.dataTransfer.files);
         }
       });
+      // Klik di luar panel chat mencabut fokus dari input chat — jadi paste
+      // berikutnya (teks/gambar) mendarat di target aslinya, bukan di chat.
+      document.addEventListener('pointerdown', (ev) => {
+        const t = ev.target;
+        if (t && t.closest && t.closest('#chat-panel')) return;
+        if (document.activeElement === input) input.blur();
+      }, true);
     }
-    // Paste an image INTO THE CHAT ONLY when the cursor is active in the chat
-    // panel. Otherwise leave the paste to the workspace (app.js onPasteEvent →
-    // Image Trace). One CAPTURE-phase document listener wins over every other
-    // paste handler when the chat owns it:
+    // Paste an image INTO THE CHAT ONLY while the cursor is truly in the chat
+    // input (document.activeElement === #chat-input). Anywhere else — canvas,
+    // kolom lain, select model, dll. — paste diserahkan ke target aslinya
+    // (workspace Image Trace, atau field teks yang sedang fokus). Satu listener
+    // CAPTURE-phase menang sebelum handler workspace:
     //   • capture runs before the workspace's own bubble-phase paste handler
     //     (app.js onPasteEvent), which otherwise grabs the image for Image Trace
     //     and opens its dialog;
     //   • stopImmediatePropagation() keeps that trace handler from also firing.
     document.addEventListener('paste', (ev) => {
+      if (document.activeElement !== input) return;     // hanya saat kursor di input chat
       const imgs = imagesFromClipboard(ev.clipboardData);
       if (!imgs.length) return;                         // nothing image-y: not ours
-      const active = document.activeElement;
-      const inChat = !!(active && (
-        active.id === 'chat-input' ||
-        (active.closest && active.closest('#chat-panel'))
-      ));
-      if (!inChat) return;                              // worksheet owns it: Image Trace
       ev.preventDefault();
       ev.stopImmediatePropagation();                    // block workspace Image Trace
       addImageFiles(imgs);

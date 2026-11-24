@@ -2223,7 +2223,7 @@ function dxfEmitVerts(verts, closed, t, out, color) {
     const p0 = dxfPt(t, v0.x, v0.y);
     const p1 = dxfPt(t, v1.x, v1.y);
     if (Math.abs(bulge) < 1e-9) {
-      out.push({ type: 'line', x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y, color });
+      out.push({ type: 'line', x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y, color, closed });
       continue;
     }
     const dx = v1.x - v0.x, dy = v1.y - v0.y;

@@ -51,13 +51,16 @@ func logf(format string, args ...interface{}) {
 }
 
 // aiHTTPClient tanpa total timeout: jawaban model reasoning bisa beberapa menit.
-// Idle 60 detik ditangani per-request di sseLines, bukan batas total.
+// Idle timeout penanganan body per-request di sseLines (120s), bukan batas total.
+// ResponseHeaderTimeout dibiarkan SANGAT longgar (600s) — Node bridge tidak
+// punya batas tunggu header sama sekali, sehingga provider berpikir panjang
+// (Gemini dkk.) yang belum mengirim byte pertama >60s tidak boleh dibunuh.
 var aiHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: 600 * time.Second,
 		DisableKeepAlives:     true, // tutup socket tiap respons: provider hitung koneksi terbuka sebagai "sesi"
 		MaxIdleConns:          1,
 		IdleConnTimeout:       1 * time.Second,

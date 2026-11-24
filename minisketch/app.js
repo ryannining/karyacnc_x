@@ -1025,7 +1025,7 @@
       return id;
     };
     const colorOfSrc = (hex) => colorMap[hex] || importColorNormalized(hex);
-    const made = { entities: [], groups: new Set(), lines: 0, splines: 0, circles: 0, framed: 0, notes: 0 };
+    const made = { entities: [], groups: new Set(), lines: 0, splines: 0, circles: 0, framed: 0, notes: 0, openLines: [] };
     const groupBag = new Map();
 
     const tagEntity = (ent, item) => {
@@ -1067,6 +1067,9 @@
         }
         const pids = sub.nodes.map(n => mkPoint(n.x + off.x, n.y + off.y));
         const chain = isClosed ? pids.concat([pids[0]]) : pids;
+        // Closed subpaths are already complete loops: their edges are locked
+        // out of endpoint joining, so a shared vertex/edge between two shapes
+        // never welds them into one mixed contour. Only open chains join.
         for (let i = 1; i < chain.length; i++) {
           if (chain[i - 1] === chain[i]) continue;
           const id = newId();
@@ -1077,6 +1080,7 @@
           if (!firstId) firstId = id;
           made.entities.push(id);
           made.lines++;
+          if (!isClosed) made.openLines.push(id);
         }
       }
       if (firstId && item.filled && fillMode !== 'ignore') state.entities[firstId].fill = fillMode;
@@ -1177,8 +1181,8 @@
 
     // connect same-colour segments that meet within the join tolerance (SVG
     // often arrives as many tiny open paths; Settings > Geometry > Join
-    // imported points)
-    if (settings.joinImportAuto !== 'off' && made.lines >= 2) joinImportedSegments(made.entities, settings.joinImportTol);
+    // imported points). Closed subpaths are already loops and stay locked out.
+    if (settings.joinImportAuto !== 'off' && made.openLines.length >= 2) joinImportedSegments(made.openLines, settings.joinImportTol);
 
     return made;
   }
@@ -1408,7 +1412,7 @@
       help: 'Maximum gap between segment ends that loop detection still bridges into a closed loop. Customer CAD exports round coordinates, leaving 0.1-0.2 mm cracks at junctions that the CNC join tolerance (often 0.1) refuses to close — the shape then never fills or lists as a loop. Independent of the join tolerance: it only affects loop topology, never moves a point.' },
     { group: 'Geometry', key: 'joinImportAuto', label: 'Join imported points', unit: '',
       def: 'on', choices: [['on', 'On — weld same-colour ends when importing'], ['off', 'Off — import segments exactly as-is']],
-      help: 'When On, PDF / SVG / DXF / CDR imports weld same-colour segment ends that meet within the join tolerance so contours arrive connected and loops close: an open end snaps onto the vertex it touches (T-junctions), otherwise the surviving point keeps its exact file position. Then simplify drops staircase noise points whose turn is below the Ctrl+K sharp-corner angle and whose chord stays within the curve fit tolerance — corners and curve nodes keep their valid positions. Off keeps every imported segment exactly as the file describes it.' },
+      help: 'When On, PDF / SVG / DXF / CDR imports weld same-colour segment ends that meet within the join tolerance so contours arrive connected and loops close: an open end snaps onto the vertex it touches (T-junctions), otherwise the surviving point keeps its exact file position. Closed contours (rectangles, ellipses, closed paths) are already complete loops and are never welded — a shared vertex or edge between two shapes stays two independent loops instead of mixing into one contour. Then simplify drops staircase noise points whose turn is below the Ctrl+K sharp-corner angle and whose chord stays within the curve fit tolerance — corners and curve nodes keep their valid positions. Off keeps every imported segment exactly as the file describes it.' },
     { group: 'Geometry', key: 'joinImportTol', label: 'Join imported distance', unit: 'mm',
       def: 0.1, min: 0.001, max: 5, step: 0.01,
       help: 'How close two same-colour segment ends must be before an import welds them, AND the maximum chord deviation when import simplify hops staircase noise points. Ends within 20% of this distance merge as file noise without moving (loops close); across a real gap only a short segment’s open end may snap onto the other’s exact position. Ends of segments longer than 20x this distance are VALID anchors: never moved by welding, never dropped by simplify. Raise it to collapse coarser staircases; lower it to keep more of the file’s nodes.' },
@@ -5775,9 +5779,194 @@
     }
   }
 
+  // [Insert into green box] — the Arrange tab's "Insert" tool. It is like
+  // nesting, but placement only: the selected green (construction) box is the
+  // target, and every OTHER selected object is centered inside it. If an
+  // object's bounding box does not fit as-is but fits after a quarter turn,
+  // it is rotated 90° first. No packing — all objects land centered in the
+  // same box.
+  //
+  // Green detection follows the nest engine's rule: green (construction) loops
+  // are the target; everything else selected is an item to place. The split
+  // must see through a green box that ALREADY surrounds its contents (that is
+  // the "recenter" use): the sheet is still the target and the loops inside it
+  // are still items — arrangeableUnits would merge them into one unit, so the
+  // nest decomposition (nestCollectLoops) is used instead.
+  function collectInsertInput() {
+    const { sheetLoops, partLoops } = nestCollectLoops();
+    const target = [];
+    const items = [];
+    const consumed = new Set();
+    if (sheetLoops.length) {
+      let tb = null;
+      for (const rec of sheetLoops) {
+        for (const id of rec.entityIds) tb = mergeBounds(tb, entityTightBounds(state.entities[id]));
+      }
+      if (tb) {
+        const ids = [];
+        for (const rec of sheetLoops) for (const id of rec.entityIds) ids.push(+id);
+        target.push({ ids, b: tb });
+      }
+    }
+    for (const obj of nestGroupParts(partLoops)) {
+      const ids = obj.outer.entityIds.concat(...obj.holeRecs.map(h => h.entityIds)).filter(id => state.entities[id]);
+      let b = null;
+      for (const id of ids) { consumed.add(+id); b = mergeBounds(b, entityTightBounds(state.entities[id])); }
+      if (b) items.push({ ids, b });
+    }
+    // container objects (art / image / array / part) selected but not consumed
+    // by a part above are items too
+    for (const s of ui.selection) {
+      if (s.kind !== 'entity') continue;
+      const id = +s.id;
+      if (consumed.has(id)) continue;
+      const e = state.entities[id];
+      if (!e) continue;
+      if (e.type !== 'art' && e.type !== 'image' && e.type !== 'array' && e.type !== 'part') continue;
+      const bb = entityTightBounds(e);
+      if (bb) items.push({ ids: [id], b: bb });
+    }
+    return { target, items };
+  }
+
+  // Rotate one arrange unit by `deg` (visual degrees, CCW positive) about its
+  // own bounding-box centre. Mirrors quickRotate's mechanics but scoped to the
+  // unit: its points (incl. owned guide lines), spline handles, clone instance
+  // matrices; H/V/perp/parallel/aspect constraints on it are dropped, fix
+  // constraints follow their point.
+  function rotateUnit(unit, deg) {
+    const pts = new Set();
+    for (const id of unit.ids) {
+      const e = state.entities[id];
+      if (!e) continue;
+      for (const pid of entityPointIds(e)) pts.add(+pid);
+      if ((e.type === 'art' || e.type === 'text' || e.type === 'image') && Array.isArray(e.guide)) {
+        for (const gid of e.guide) {
+          const g = state.entities[gid];
+          if (g) for (const pid of entityPointIds(g)) pts.add(+pid);
+        }
+      }
+    }
+    let b = null;
+    for (const id of unit.ids) b = mergeBounds(b, entityTightBounds(state.entities[id]));
+    if (!b) return;
+    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    const eids = new Set(unit.ids.map(Number));
+    const phi = -deg * Math.PI / 180;
+    const c = Math.cos(phi), s = Math.sin(phi);
+    let removed = 0;
+    for (const cid in state.constraints) {
+      const con = state.constraints[cid];
+      const drop =
+        ((con.type === 'horizontal' || con.type === 'vertical') && eids.has(+con.entity)) ||
+        ((con.type === 'horizontalPoints' || con.type === 'verticalPoints') &&
+          pts.has(+con.p1) && pts.has(+con.p2)) ||
+        ((con.type === 'perpendicular' || con.type === 'parallel') &&
+          (eids.has(+con.line1) || eids.has(+con.line2))) ||
+        (con.type === 'aspect' && eids.has(+con.entity));
+      if (drop) { delete state.constraints[cid]; removed++; }
+    }
+    const rot = (x, y) => {
+      const dx = x - cx, dy = y - cy;
+      return { x: cx + c * dx - s * dy, y: cy + s * dx + c * dy };
+    };
+    for (const pid of pts) {
+      const p = state.points[pid];
+      if (!p) continue;
+      const q = rot(p.x, p.y);
+      p.x = q.x; p.y = q.y;
+    }
+    for (const id of unit.ids) {
+      const e = state.entities[id];
+      if (!e) continue;
+      if (e.type === 'array' && e.kind === 'clone') {
+        const M = [c, s, -s, c, cx - (c * cx - s * cy), cy - (s * cx + c * cy)];
+        e.instances = (e.instances || []).map(inst => (
+          inst && inst.m ? { ...inst, m: matMul(M, inst.m) } : inst));
+        delete e.shapes;
+        continue;
+      }
+      if (e.type !== 'spline' || !e.hs) continue;
+      for (const arr of [e.hs.o, e.hs.i]) {
+        for (const h of (arr || [])) {
+          if (!h) continue;
+          const q = rot(h.x, h.y);
+          h.x = q.x; h.y = q.y;
+        }
+      }
+    }
+    for (const cid in state.constraints) {
+      const con = state.constraints[cid];
+      if (con.type === 'fix' && pts.has(+con.p)) {
+        const pt = P(con.p);
+        if (pt) { con.x = pt.x; con.y = pt.y; }
+      }
+    }
+    requestSolve(pts);
+    return removed;
+  }
+
+  function arrangeInsert() {
+    const { target, items } = collectInsertInput();
+    if (!target.length) {
+      toast('Select the green (guide) box plus the objects to place inside it');
+      return;
+    }
+    if (!items.length) {
+      toast('Select at least one non-green object to insert into the green box');
+      return;
+    }
+    for (const u of items) {
+      if (u.ids.some(id => { const e = state.entities[id]; return e && e.type === 'part'; })) {
+        toast('Parts are pose-driven — rotate them with the transform tool');
+        return;
+      }
+    }
+    let tg = null;
+    for (const t of target) tg = mergeBounds(tg, t.b);
+    if (!tg) return;
+    const tcX = (tg.minX + tg.maxX) / 2;
+    const tcY = (tg.minY + tg.maxY) / 2;
+    const W = tg.maxX - tg.minX;
+    const H = tg.maxY - tg.minY;
+    // ALL non-green objects travel as ONE unit: one shared delta keeps their
+    // relative layout, so several loops never pile up at the box centre. The
+    // whole group rotates together (90°) only when that makes the GROUP fit.
+    const ids = [];
+    let b = null;
+    for (const u of items) {
+      for (const id of u.ids) ids.push(id);
+      b = mergeBounds(b, u.b);
+    }
+    if (!b) return;
+    const eps = 1e-6;
+    const w = b.maxX - b.minX;
+    const h = b.maxY - b.minY;
+    const fits = w <= W + eps && h <= H + eps;
+    const fitsRot = h <= W + eps && w <= H + eps;
+    pushHistory();
+    let rotated = 0;
+    if (!fits && fitsRot) {
+      rotateUnit({ ids }, 90);
+      rotated++;
+      b = null;
+      for (const id of ids) b = mergeBounds(b, entityTightBounds(state.entities[id]));
+      if (!b) return;
+    }
+    const dx = tcX - (b.minX + b.maxX) / 2;
+    const dy = tcY - (b.minY + b.maxY) / 2;
+    translateUnit({ ids }, dx, dy);
+    invalidateLoops();
+    commit();
+    toast('Inserted ' + ids.length + ' objects as one group' +
+      (rotated ? ' — rotated 90° to fit' : '') +
+      ' centered in the green box');
+  }
+
   // Align / distribute the arrangeable selection. kind in:
-  //   left | center-h | right | top | center-v | bottom | dist-h | dist-v
+  //   left | center-h | right | top | center-v | bottom | dist-h | dist-v | insert
   function arrangeSelection(kind) {
+    if (kind === 'insert') { arrangeInsert(); return; }
     const ents = arrangeableUnits();
     const need = kind === 'dist-h' || kind === 'dist-v' ? 3 : 2;
     if (ents.length < need) {
@@ -16263,6 +16452,7 @@
       return id;
     };
     const made = [];
+    const openLines = [];
     for (const pr of prims) {
       const id = newId();
       const fileColor = importColorNormalized(pr.color);
@@ -16271,6 +16461,10 @@
           id, type: 'line', color: fileColor || ui.color,
           a: addPoint(pr.x1, pr.y1), b: addPoint(pr.x2, pr.y2)
         };
+        // a closed polyline's ring is already one complete loop: lock it out
+        // of endpoint joining so a shared vertex/edge between two closed
+        // shapes never welds them into one mixed contour
+        if (!pr.closed) openLines.push(id);
       } else if (pr.type === 'circle') {
         state.entities[id] = { id, type: 'circle', color: fileColor || ui.color, c: addPoint(pr.cx, pr.cy), r: pr.r };
       } else if (pr.type === 'arc') {
@@ -16296,10 +16490,11 @@
       return null;
     }
     // connect same-colour open segments (DXF arrives as loose LINE entities);
-    // the import dialog's join switch / distance override the Settings default
+    // the import dialog's join switch / distance override the Settings default.
+    // Closed polyline rings are already loops and stay locked out.
     const joinOn = o.join != null ? o.join : settings.joinImportAuto !== 'off';
     const joinTol = isFinite(+o.joinTol) && +o.joinTol > 0 ? +o.joinTol : settings.joinImportTol;
-    if (joinOn && made.length >= 2) joinImportedSegments(made, joinTol);
+    if (joinOn && openLines.length >= 2) joinImportedSegments(openLines, joinTol);
     if (wasEmpty) fitView();
     // commit (not just render): without scheduleSave the import vanishes on a
     // refresh before the next edit triggers an autosave
@@ -16608,13 +16803,27 @@
       const straight = pr.nodes.every(nd => !nd.o && !nd.i);
       const ids = pr.nodes.map(nd => addPoint(nd.p));
       if (straight) {
-        const last = pr.closed ? ids.length : ids.length - 1;
+        // A closed prim (rect, ellipse outline, closed path) is ALREADY one
+        // complete loop: it must never take part in endpoint joining, or a
+        // vertex/edge shared between two shapes welds them into one mixed
+        // contour — two adjacent boxes collapse into a single loop plus
+        // leftover centre lines. Only OPEN chains join. Also drop the
+        // duplicated closing node some files emit (first === last), so no
+        // zero-length closing segment is created.
+        let chain = ids;
+        if (pr.closed && chain.length > 2) {
+          const p0 = state.points[chain[0]], pn = state.points[chain[chain.length - 1]];
+          if (p0 && pn && Math.hypot(p0.x - pn.x, p0.y - pn.y) < 1e-9) {
+            chain = chain.slice(0, -1);
+          }
+        }
+        const last = pr.closed ? chain.length : chain.length - 1;
         for (let i = 0; i < last; i++) {
-          const a = ids[i], b = ids[(i + 1) % ids.length];
+          const a = chain[i], b = chain[(i + 1) % chain.length];
           if (a === b) continue;
           const id = newId();
           state.entities[id] = { id, type: 'line', a, b, color };
-          lineIds.push(id);
+          if (!pr.closed) lineIds.push(id);
           made++;
         }
       } else {
@@ -22585,10 +22794,18 @@
     const qbHas = !!selectionBounds();
     document.querySelectorAll('[data-quick]').forEach(b => { b.disabled = !qbHas; });
     document.querySelectorAll('.qb-act').forEach(b => { b.disabled = !qbHas; });
-    // arrange tab: align needs >=2 units, distribute needs >=3
-    const nArr = arrangeableUnits().length;
+    // arrange tab: align needs >=2 units, distribute needs >=3, insert needs
+    // at least one green (construction) box + one other object
+    const unitsArr = arrangeableUnits();
+    const nArr = unitsArr.length;
+    const insertInput = collectInsertInput();
     document.querySelectorAll('[data-arrange]').forEach(b => {
-      const dist = b.dataset.arrange === 'dist-h' || b.dataset.arrange === 'dist-v';
+      const k = b.dataset.arrange;
+      const dist = k === 'dist-h' || k === 'dist-v';
+      if (k === 'insert') {
+        b.disabled = !(insertInput.target.length && insertInput.items.length);
+        return;
+      }
       b.disabled = dist ? nArr < 3 : nArr < 2;
     });
     document.querySelectorAll('.tool-btn').forEach(b => {
