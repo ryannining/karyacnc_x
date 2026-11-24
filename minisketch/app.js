@@ -2274,7 +2274,7 @@
       window.__aiModelDdScroll = (ev) => {
         const d = document.getElementById('ai-model-dd');
         if (!d) return;
-        if (ev && ev.target && d.contains(ev.target)) return;
+        if (ev && ev.target instanceof Node && d.contains(ev.target)) return;
         d.classList.add('hidden');
       };
       document.addEventListener('scroll', window.__aiModelDdScroll, true);

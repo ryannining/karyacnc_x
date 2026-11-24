@@ -259,6 +259,11 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	// Tanpa route ini Save MiniSketch jatuh ke unduhan diam-diam tanpa dialog.
 	mux.HandleFunc("/save-sketch", app.handleSaveSketch)
 	mux.HandleFunc("/save_sketch", app.handleSaveSketch)
+	// AI chat & daftar model: UI di :8321 same-origin -> /api/chat &
+	// /api/models harus dilayani di sini juga (sama seperti webAssetHandler
+	// di webview Wails; tanpa ini browser mode 404).
+	mux.HandleFunc("/api/chat", app.HandleAIChat)
+	mux.HandleFunc("/api/models", app.HandleAIModels)
 	// web update: serve from cache if fresh copy exists, else embedded
 	if dir := webAssetDir(); dir != "" {
 		mux.Handle("/", serveWebAsset(dir, embedded))
