@@ -33436,9 +33436,14 @@ function cmdSplitCurve() {
     // the remembered name; only an explicit Save As still asks for a name.
     const date = new Date();
     const stamp = date.toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    const written = downloadBlob('sketch-' + stamp + '.sketch', new Blob([text], { type: 'application/json' }), forcePicker);
+    // Ask for a name whenever there is not yet a document name (first save), so
+    // the user is never left guessing where/under what the file landed — the
+    // toast below then says where to look for it.
+    const ask = forcePicker || !save.name;
+    const written = downloadBlob('sketch-' + stamp + '.sketch', new Blob([text], { type: 'application/json' }), ask);
     if (written) setFileName(written);
-    toast('Downloaded .sketch file');
+    toast('Downloaded ' + written + ' — check your browser\u2019s Downloads folder' +
+      (ask ? ' (you picked the name)' : ''));
   }
 
   // Downloads ask for the file name and remember the last one (browser only):
@@ -33516,7 +33521,10 @@ function cmdSplitCurve() {
   }
 
   function saveApiAvailable() {
-    return !isWailsRuntime() && !isEmbedded() &&
+    // No longer blocks the picker on `embedded`: inside a same-origin frame
+    // Chrome/Edge can still open the native Save dialog. If the browser or
+    // the context refuses, saveTextAs falls back to the download path anyway.
+    return !isWailsRuntime() &&
       typeof window.showSaveFilePicker === 'function' &&
       typeof window.isSecureContext !== 'undefined' && window.isSecureContext;
   }

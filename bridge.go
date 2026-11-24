@@ -254,6 +254,11 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	mux.HandleFunc("/__bridge", func(w http.ResponseWriter, r *http.Request) {
 		handleBridgeWS(w, r, app)
 	})
+	// Sketcher iframe di :8321 same-origin -> /save-sketch harus dilayani di
+	// sini juga (di dev iframe-nya :3000, jadi route ini ada di app.go).
+	// Tanpa route ini Save MiniSketch jatuh ke unduhan diam-diam tanpa dialog.
+	mux.HandleFunc("/save-sketch", app.handleSaveSketch)
+	mux.HandleFunc("/save_sketch", app.handleSaveSketch)
 	// web update: serve from cache if fresh copy exists, else embedded
 	if dir := webAssetDir(); dir != "" {
 		mux.Handle("/", serveWebAsset(dir, embedded))

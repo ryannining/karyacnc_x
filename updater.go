@@ -385,6 +385,12 @@ func webAssetHandler(app *App) http.Handler {
 			app.HandleAIModels(w, r)
 			return
 		}
+		// Sama seperti /api/chat: seretcher iframe same-origin di webview juga,
+		// jadi /save-sketch dilayani di sini (dialog Save asli, bukan unduhan).
+		if r.URL.Path == "/save-sketch" || r.URL.Path == "/save_sketch" {
+			app.handleSaveSketch(w, r)
+			return
+		}
 		dir := webAssetDir()
 		if dir == "" {
 			embedded.ServeHTTP(w, r)
