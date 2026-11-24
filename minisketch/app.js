@@ -22436,6 +22436,33 @@
     ctx.restore();
   }
 
+  // Gate flash: a short expanding ring at the press point, shown the moment
+  // the drag gate (DRAG_GATE_MS) passes — the drag is armed now. It fades out
+  // in ~400 ms and clears itself. Screen coordinates (ui.gateFlash.x/y are the
+  // press position in canvas px).
+  const GATE_FLASH_MS = 400;
+  function drawGateFlash() {
+    const f = ui.gateFlash;
+    if (!f) return;
+    const age = performance.now() - f.t;
+    if (age > GATE_FLASH_MS) { ui.gateFlash = null; return; }
+    const k = age / GATE_FLASH_MS;
+    const r = 6 + 22 * k;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 0.9 * (1 - k));
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 2.5 * (1 - k) + 0.75;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, r, 0, TAU);
+    ctx.stroke();
+    ctx.globalAlpha = Math.max(0, 0.55 * (1 - k));
+    ctx.fillStyle = '#2563eb';
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, 2.5, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
   function drawEmptyState() {
     if (Object.keys(state.entities).length) return;
     ctx.save();
@@ -22574,6 +22601,7 @@
     prof('segmentHighlight', () => drawSegmentHighlight());
     prof('preview', () => drawPreview());
     prof('rubber', () => drawRubber());
+    prof('gateFlash', () => drawGateFlash());
     prof('scaleBar', () => drawScaleBar());
     if (ui.drag && ui.drag.snap) drawSnapMarker(ui.drag.snap, ui.drag.snap.coincident);
     // the part drag shows its own snap ring when it hovers another part's
@@ -26765,10 +26793,22 @@ function cmdSplitCurve() {
         // fast flick that stops moving sends no later move events, and without
         // the replay such a drag would never start at all.
         d.gateEv = ev;
+        d.gatePos = { x: pos.x, y: pos.y };
         if (!d.gateTimer) {
           d.gateTimer = setTimeout(() => {
             d.gateTimer = 0;
-            if (ui.drag === d && !d.moved && d.gateEv) onPointerMove(d.gateEv);
+            if (ui.drag === d && !d.moved) {
+              // The gate has passed: the drag is armed. Flash the press point
+              // so a drag started too early is visibly acknowledged (the early
+              // movement is replayed below, so the gesture is never lost). A
+              // plain press+release is a click — the flash still marks where
+              // it was registered.
+              if (d.kind === 'rubber') {
+                ui.gateFlash = { x: d.start.x, y: d.start.y, t: performance.now() };
+                scheduleRender();
+              }
+              if (d.gateEv) onPointerMove(d.gateEv);
+            }
           }, DRAG_GATE_MS - (performance.now() - ui._downAt));
         }
         return;
