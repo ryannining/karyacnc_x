@@ -402,6 +402,7 @@
           if (k.fill != null) { style.fill = k.fill; style.fillSet = true; }
           if (k['stroke-width'] != null) style.strokeWidth = k['stroke-width'];
           if (k['fill-rule'] != null) style.fillRule = k['fill-rule'];
+          if (k['text-anchor'] != null) style.textAnchor = k['text-anchor'];
           if (k.display != null) style.display = k.display;
           if (k.visibility != null) style.visibility = k.visibility;
           if (k.opacity != null) style.opacity = k.opacity;
@@ -414,13 +415,14 @@
     const st = {
       stroke: parent.stroke, fill: parent.fill, fillSet: !!parent.fillSet,
       strokeWidth: parent.strokeWidth, fillRule: parent.fillRule,
-      fontSize: parent.fontSize,
+      fontSize: parent.fontSize, textAnchor: parent.textAnchor,
       display: parent.display, visibility: parent.visibility, opacity: parent.opacity
     };
     const attr = (k) => (el.getAttribute && el.hasAttribute && el.hasAttribute(k) ? el.getAttribute(k) : null);
     const keys = {
       stroke: 'stroke', fill: 'fill', 'stroke-width': 'strokeWidth',
       'fill-rule': 'fillRule', 'font-size': 'fontSize',
+      'text-anchor': 'textAnchor',
       display: 'display', visibility: 'visibility', opacity: 'opacity'
     };
     for (const k in keys) {
@@ -440,6 +442,7 @@
       if (d['stroke-width'] != null) st.strokeWidth = d['stroke-width'];
       if (d['fill-rule'] != null) st.fillRule = d['fill-rule'];
       if (d['font-size'] != null) st.fontSize = d['font-size'];
+      if (d['text-anchor'] != null) st.textAnchor = d['text-anchor'];
       if (d.display != null) st.display = d.display;
       if (d.visibility != null) st.visibility = d.visibility;
       if (d.opacity != null) st.opacity = d.opacity;
@@ -16537,6 +16540,40 @@
   // to the real font metrics so the glyphs keep the PDF's size instead of being
   // stretched to a guessed box. Callers load the face first (importPrimsIntoDocument
   // awaits it) so the glyphs are on the first render.
+  // Re-place an imported text frame against the anchor it was created from
+  // (SVG text-anchor -> align). The frame's p0 is not the anchor: for middle/
+  // end anchors p0 is offset by half/full width, so it must be recomputed with
+  // the REAL measured width — the initial estimate (len * h * 0.55) is only a
+  // placeholder and would leave centered/right text off its SVG anchor.
+  function refitImportedText(ent) {
+    if (!ent || ent.type !== 'text') return false;
+    const m = textMetricsOf(ent);
+    if (!m) return false;
+    const p0 = P(ent.p0), qw = P(ent.pw), qh = P(ent.ph);
+    if (!p0 || !qw || !qh) return false;
+    const ax = (qw.x - p0.x), ay = (qw.y - p0.y);
+    const al = Math.hypot(ax, ay) || 1;
+    const ux = ax / al, uy = ay / al;
+    const hx = qh.x - p0.x, hy = qh.y - p0.y;
+    const hl = Math.hypot(hx, hy) || 1;
+    const hh = hl;                                 // keep the user-set height
+    const ww = hh * (m.width / m.height);
+    const align = ent.align === 'center' || ent.align === 'right' ? ent.align : 'left';
+    const off = align === 'center' ? ww / 2 : align === 'right' ? ww : 0;
+    // anchor point (stored at creation); fall back to the current p0+off
+    const ax0 = isFinite(+ent.ax) ? +ent.ax : p0.x + ux * off;
+    const ay0 = isFinite(+ent.ay) ? +ent.ay : p0.y + uy * off;
+    p0.x = ax0 - ux * off;
+    p0.y = ay0 - uy * off;
+    qw.x = p0.x + ux * ww;
+    qw.y = p0.y + uy * ww;
+    qh.x = p0.x + hx / hl * hh;
+    qh.y = p0.y + hy / hl * hh;
+    ensureTextAspect(ent);
+    requestSolve();
+    return true;
+  }
+
   function addImportedTextObject(x, y, text, sizeMm, dir, align) {
     const d = dir || {};
     const ux = isFinite(d.ux) ? d.ux : 1, uy = isFinite(d.uy) ? d.uy : 0;
@@ -16578,27 +16615,11 @@
     const ent = {
       id, type: 'text', p0, pw: pwId, ph: phId, guide: [idW, idH],
       text: String(text), font: TEXT_DEFAULT_FONT, weight: 400, italic: false, tracking: 0,
-      color: ui.color, align: al
+      color: ui.color, align: al,
+      ax: x, ay: y
     };
     state.entities[id] = ent;
-    const fit = () => {
-      const m = textMetricsOf(ent);
-      const q0 = P(ent.p0), qw = P(ent.pw), qh = P(ent.ph);
-      if (!m || !q0 || !qw || !qh) return;
-      const ww = sizeMm * (m.width / TEXT_REF);
-      const hh = sizeMm * (m.height / TEXT_REF);
-      const dx = qw.x - q0.x, dy = qw.y - q0.y;
-      const dl = Math.hypot(dx, dy) || 1;
-      qw.x = q0.x + dx / dl * ww;
-      qw.y = q0.y + dy / dl * ww;
-      const ex = qh.x - q0.x, ey = qh.y - q0.y;
-      const el = Math.hypot(ex, ey) || 1;
-      qh.x = q0.x + ex / el * hh;
-      qh.y = q0.y + ey / el * hh;
-      ensureTextAspect(ent);
-      requestSolve();
-    };
-    fit();
+    refitImportedText(ent);
     return id;
   }
 
@@ -34411,7 +34432,12 @@ function cmdSplitCurve() {
           if (ok) {
             for (const e of Object.values(state.entities)) {
               if (e.type === 'text' && e.font === fam && (e.weight || 400) === +w &&
-                (e.italic ? 'italic' : 'normal') === st) ensureTextAspect(e);
+                (e.italic ? 'italic' : 'normal') === st) {
+                // real metrics are available now: re-place imported text frames
+                // against their anchor (the estimate is replaced by true width)
+                if (e.ax != null || e.ay != null) refitImportedText(e);
+                else ensureTextAspect(e);
+              }
             }
             requestSolve();
           }
