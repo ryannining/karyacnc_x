@@ -950,6 +950,44 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// lastSketchDir remembers the folder of the last MiniSketch save so the next
+// Save dialog reopens there (zenity/kdialog do not reliably recall their own
+// last folder).
+var (
+	lastSketchDirMu sync.Mutex
+	lastSketchDir   string
+)
+
+const lastSketchDirKey = "last-sketch-dir"
+
+func getLastSketchDir() string {
+	lastSketchDirMu.Lock()
+	defer lastSketchDirMu.Unlock()
+	if lastSketchDir != "" {
+		return lastSketchDir
+	}
+	p := filepath.Join(configDir(), "karyacnc", lastSketchDirKey)
+	if b, err := os.ReadFile(p); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			lastSketchDir = s
+		}
+	}
+	return lastSketchDir
+}
+
+func rememberSketchDir(dir string) {
+	if dir == "" {
+		return
+	}
+	lastSketchDirMu.Lock()
+	defer lastSketchDirMu.Unlock()
+	if dir == lastSketchDir {
+		return
+	}
+	lastSketchDir = dir
+	_ = os.WriteFile(filepath.Join(configDir(), "karyacnc", lastSketchDirKey), []byte(dir), 0o644)
+}
+
 // saveFileDialog asks the user where to write a file.
 //
 // Two worlds, one call:
@@ -958,36 +996,46 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 //     a.ctx is nil and runtime.SaveFileDialog panics/errors. There the dialog
 //     must come from the desktop itself — zenity, kdialog or yad.
 //
+// The dialog reopens in the last-used folder (remembered across sessions).
+//
 // Returns ("", nil) when the user cancels.
 func (a *App) saveFileDialog(opts runtime.SaveDialogOptions, fallbackName string) (string, error) {
+	lastDir := getLastSketchDir()
 	if a.ctx != nil {
+		if lastDir != "" {
+			opts.DefaultDirectory = lastDir
+		}
 		return runtime.SaveFileDialog(a.ctx, opts)
 	}
-	return nativeSaveDialog(opts.Title, fallbackName)
+	return nativeSaveDialog(opts.Title, fallbackName, lastDir)
 }
 
 // nativeSaveDialog shows a GTK/Qt save dialog through whatever helper the
 // desktop already ships. Empty string + nil error means "cancelled".
-func nativeSaveDialog(title, name string) (string, error) {
+func nativeSaveDialog(title, name, dir string) (string, error) {
 	if goruntime.GOOS != "linux" {
 		return "", fmt.Errorf("no dialog backend outside Linux without a Wails context")
 	}
 	if name == "" {
 		name = "sketch.sketch"
 	}
-	// The directory is not pre-filled: letting the dialog remember its own last
-	// folder is better than forcing one, and the user picks anyway.
+	// Start inside the last used folder (if any) so the dialog does not forget
+	// where the user saves; the dialog still lets them navigate anywhere.
+	start := name
+	if dir != "" {
+		start = filepath.Join(dir, name)
+	}
 	type attempt struct {
 		bin  string
 		args []string
 	}
 	tries := []attempt{
 		{"zenity", []string{"--file-selection", "--save", "--confirm-overwrite",
-			"--title=" + title, "--filename=" + name,
+			"--title=" + title, "--filename=" + start,
 			"--file-filter=MiniSketch (*.sketch) | *.sketch"}},
-		{"kdialog", []string{"--getsavefilename", name, "*.sketch", "--title", title}},
+		{"kdialog", []string{"--getsavefilename", start, "*.sketch", "--title", title}},
 		{"yad", []string{"--file", "--save", "--confirm-overwrite",
-			"--title=" + title, "--filename=" + name,
+			"--title=" + title, "--filename=" + start,
 			"--file-filter=*.sketch"}},
 	}
 	for _, t := range tries {
@@ -1077,6 +1125,7 @@ func (a *App) handleSaveSketch(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"status":"error","message":%q}`, err.Error())
 		return
 	}
+	rememberSketchDir(filepath.Dir(path))
 	if SHOWDEBUG {
 		log.Printf("Saved sketch: %s (%d bytes)", path, len(req.Text))
 	}
