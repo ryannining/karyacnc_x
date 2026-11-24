@@ -16397,7 +16397,9 @@
     try {
       made = svgImportInsert(ir, {
         center: ui.lastWorld ? { x: ui.lastWorld.x, y: ui.lastWorld.y } : s2w(W / 2, H / 2),
-        fillMode: 'gray',
+        // pasted shapes come in WITHOUT fill (fill = none) — the lines are the
+        // geometry; a fill would tint whole shapes and hide nested cuts
+        fillMode: 'ignore',
         colorMap,
         // pasted <text> becomes a real editable text object, not a yellow note
         textMode: 'text'
