@@ -1793,6 +1793,10 @@
         const v = modelSel.value;
         if (v && window.setAiModelFromChat) window.setAiModelFromChat(v);
       });
+      // Tampilkan model aktif dari settings sejak awal (sebelum/apa pun hasil
+      // muat daftar provider) supaya pemilih panel chat tidak pernah kosong
+      // atau berbeda dari Settings.
+      if (window.syncAiModelSelect) window.syncAiModelSelect();
       loadM(true);   // isi otomatis saat panel dibuka (jika daftar tersedia)
     }
     const input = document.getElementById('chat-input');

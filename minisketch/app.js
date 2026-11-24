@@ -1729,6 +1729,26 @@
     } catch (err) { /* ignore */ }
   };
 
+  // Sinkronkan pemilih model di panel chat AI dengan settings.aiModel. Model
+  // bisa dipilih dari dua tempat (panel chat & Settings) dan keduanya harus
+  // selalu menunjuk nilai yang sama — termasuk sebelum daftar model provider
+  // sempat termuat (fetch gagal / key belum diisi), sehingga panel chat tidak
+  // pernah tampak "kosong" padahal settings sudah berisi model.
+  function syncAiModelSelect() {
+    const sel = document.getElementById('chat-model-sel');
+    if (!sel) return;
+    const v = String(settings.aiModel == null ? '' : settings.aiModel).trim();
+    if (String(sel.value) === v) return;
+    if (v && !Array.from(sel.options).some(o => o.value === v)) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = v;
+      sel.add(o);
+    }
+    sel.value = v;
+  }
+  window.syncAiModelSelect = syncAiModelSelect;
+
   // Push the numbers into the working constants.
   function applySettings() {
     TEXT_TOL_MM = settings.textTol;
@@ -1785,6 +1805,9 @@
     invalidateLoops();
     if (W > 1) resize();   // pick up the new canvas quality and repaint
     if (typeof updateCncTolField === 'function') updateCncTolField();
+    // AI model changes (Settings > AI chat) must reach the chat panel's model
+    // selector immediately; the selector is the single visible picker there.
+    syncAiModelSelect();
   }
 
   function buildSettingsForm() {
@@ -1808,6 +1831,9 @@
     const bodies = {};
     let idx = 0;
     for (const sp of SETTINGS_SPEC) {
+      // Model AI dipilih HANYA di panel chat — Settings hanya untuk URL &
+      // key/profile provider, jadi tidak ada baris "AI model" di sini.
+      if (sp.key === 'aiModel') continue;
       // KaryaCNC serves the AI chat through its own built-in Go proxy
       // (/api/chat), so it has no separate Node bridge to point at. It hides
       // the "AI bridge URL" row by setting window.MiniSketchUI.showBridgeUrl
@@ -2055,10 +2081,12 @@
       const unit = urlRow.querySelector('.settings-unit');
       if (unit) unit.textContent = google ? 'otomatis: generativelanguage.googleapis.com' : '';
     }
-    // ---- AI provider presets + model list (semua provider) --------------
-    const modelInput = document.getElementById('set-aiModel');
-    const modelRow = modelInput ? modelInput.closest('.settings-row') : null;
-    const groupHost = modelRow ? (modelRow.parentElement || modelRow) : null;
+    // ---- AI provider presets (profil URL + key) ------------------------
+    // Pemilihan model tidak ada di Settings — hanya di panel chat AI.
+    const groupHost = (() => {
+      const ref = document.getElementById('set-aiProviderGoogle');
+      return ref ? ref.closest('.settings-group') : null;
+    })();
 
     const effGoogle = () => {
       const cbEl = document.getElementById('set-aiProviderGoogle');
@@ -2127,7 +2155,7 @@
         const gcbEl = document.getElementById('set-aiProviderGoogle');
         if (p.baseUrl) urlEl.value = p.baseUrl;
         if (p.apiKey != null) keyEl.value = p.apiKey;
-        if (p.model) modelInput.value = p.model;
+        if (p.model) window.setAiModelFromChat(p.model);   // model hanya di panel chat
         if (gcbEl) gcbEl.checked = isGeminiBaseUrl(p.baseUrl);
         syncProviderRows();   // cukup state URL-row/dll. (id sudah ada → tidak duplikat)
       });
@@ -2145,7 +2173,7 @@
           name,
           baseUrl: base,
           apiKey: effKey(),
-          model: String(modelInput ? modelInput.value : '').trim()
+          model: String(settings.aiModel != null ? settings.aiModel : '').trim()
         };
         const idx = aiProviders.findIndex(x => x.baseUrl === base);
         if (idx >= 0) aiProviders[idx] = rec; else aiProviders.push(rec);
@@ -2166,120 +2194,8 @@
       });
     }
 
-    // Muat daftar model dari provider AKTIF (base URL + key dari kolom).
-    // Bisa Gemini (ListModels) maupun OpenAI-compatible (/models).
-    let dd = document.getElementById('ai-model-dd');
-    let btn = document.getElementById('ai-models-refresh');
-    if (!dd) {
-      // rendered on document.body with fixed coordinates so the settings
-      // panel's overflow can never clip it
-      dd = document.createElement('div');
-      dd.id = 'ai-model-dd';
-      dd.className = 'settings-dd hidden';
-      dd.style.position = 'fixed';
-      document.body.appendChild(dd);
-    }
-    if (modelRow && !btn) {
-      btn = document.createElement('button');
-      btn.type = 'button';
-      btn.id = 'ai-models-refresh';
-      btn.className = 'btn small ai-model-load';
-      btn.textContent = '🔄';
-      btn.title = 'Muat daftar model dari provider aktif (base URL + API key yang terisi)';
-      // kecil, di sebelah kiri kolom AI model (segaris dengan input)
-      modelRow.appendChild(btn);
-      modelRow.insertBefore(btn, modelInput);
-      if (modelInput) modelRow.style.gridTemplateColumns = 'max-content auto 1fr 24px';
-      const fillList = (names) => {
-        dd.innerHTML = '';
-        for (const name of names) {
-          const opt = document.createElement('button');
-          opt.type = 'button';
-          opt.value = name;
-          opt.textContent = name;
-          opt.addEventListener('click', () => {
-            if (modelInput) modelInput.value = name;
-            dd.classList.add('hidden');
-          });
-          dd.appendChild(opt);
-        }
-      };
-      btn.addEventListener('click', async (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        btn.disabled = true;
-        btn.textContent = '…';
-        const baseNow = effBase();
-        const hostLabel = (() => { try { return new URL(baseNow).host; } catch (e) { return 'provider'; } })();
-        try {
-          const r = await fetch('/api/models', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ settings: { baseUrl: baseNow, apiKey: effKey() } })
-          });
-          const j = await r.json().catch(() => ({}));
-          if (Array.isArray(j.models) && j.models.length) {
-            fillList(j.models);
-            placeDd();
-            dd.classList.remove('hidden');
-            toast(j.models.length + ' model dimuat dari ' + hostLabel + ' — pilih dari daftar');
-          } else {
-            toast('Gagal memuat model (' + hostLabel + '): ' + ((j && j.error) || 'respons tidak dikenal'));
-          }
-        } catch (err) {
-          toast('Gagal memuat model (' + hostLabel + '): ' + String(err && err.message || err));
-        } finally {
-          btn.disabled = false;
-          btn.textContent = 'Muat daftar model';
-        }
-      });
-    }
-    if (btn) btn.style.display = '';
-
-    // document-level click closes the dropdown; helper bound once
-    if (!window.__aiModelDdClose) {
-      window.__aiModelDdClose = (ev) => {
-        const d = document.getElementById('ai-model-dd');
-        if (d && !d.contains(ev.target) &&
-            !(ev.target.id === 'ai-models-refresh') &&
-            !(ev.target.id === 'set-aiModel')) {
-          d.classList.add('hidden');
-        }
-      };
-      document.addEventListener('click', window.__aiModelDdClose, true);
-    }
-    const placeDd = () => {
-      if (!dd || !modelInput) return;
-      const r = modelInput.getBoundingClientRect();
-      dd.style.top = Math.round(r.bottom + 4) + 'px';
-      dd.style.left = Math.round(r.left) + 'px';
-      dd.style.width = Math.max(140, Math.round(r.width)) + 'px';
-      dd.style.right = 'auto';
-    };
-    const openDd = (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (dd && dd.children.length && dd.classList.contains('hidden')) {
-        placeDd();
-        dd.classList.remove('hidden');
-      }
-    };
-    modelInput.removeEventListener('focus', openDd);
-    modelInput.addEventListener('focus', openDd);
-    modelInput.addEventListener('click', openDd);
-    // any scroll/resize OUTSIDE the dropdown closes it; scrolling INSIDE the
-    // dropdown's own list must keep it open (the wheel/scrollbar is how the
-    // user reads long model lists).
-    if (!window.__aiModelDdScroll) {
-      window.__aiModelDdScroll = (ev) => {
-        const d = document.getElementById('ai-model-dd');
-        if (!d) return;
-        if (ev && ev.target instanceof Node && d.contains(ev.target)) return;
-        d.classList.add('hidden');
-      };
-      document.addEventListener('scroll', window.__aiModelDdScroll, true);
-      window.addEventListener('resize', window.__aiModelDdScroll);
-    }
+    // Pemilihan model + pemuat daftar model TIDAK ada di Settings — panel
+    // chat AI yang punya pemilihnya sendiri (chat-model-sel + 🔄).
   }
 
   function openSettingsModal() {
@@ -5652,12 +5568,29 @@
     // ONLY explicitly selected children travel with the parent. Whatever else
     // happens to sit inside the loop (unselected objects, geometry on other
     // layers) must stay where it is — arrange never kidnaps bystanders.
-    const kids = entitiesInsideLoop(loop)
-      .filter(id => selEnts.has(+id))
+    const insideSel = entitiesInsideLoop(loop).filter(id => selEnts.has(+id));
+    // Framed objects (text / image) inside the loop are INDEPENDENT arrange
+    // units, not part of the parent's compound: selecting a caption inside
+    // its box and pressing Center H must center the caption in the box, which
+    // is impossible while the loop swallows it into one unit (the arrange
+    // buttons then stay disabled — only the loop counts). Their guide frame
+    // (the green handles) belongs to them too, so it must not travel with the
+    // loop either — otherwise the pair splits and the release solve snaps the
+    // frame straight back.
+    const skipFramed = new Set();
+    for (const id of insideSel) {
+      const e = state.entities[id];
+      if (e && (e.type === 'text' || e.type === 'image')) {
+        skipFramed.add(+id);
+        if (Array.isArray(e.guide)) for (const gid of e.guide) skipFramed.add(+gid);
+      }
+    }
+    const kids = insideSel
       .filter(id => {
         const e = state.entities[id];
         return e && entityEditable(e);
-      });
+      })
+      .filter(id => !skipFramed.has(+id));
     // One group index per call: the old full entity scan PER queued kid was
     // O(kids × entities) — a whole-document selection made it ~90M iterations.
     const byGroup = new Map();
@@ -24956,9 +24889,16 @@
       // it is fully selected, in otherwise
       if (loopShapeSelected(loop)) {
         ui.selection = ui.selection.filter(notOwn);
+        // the anchor died with the toggle: the loop was the reference and it
+        // just left the selection
+        if (lastPickEntityId != null && ownSet.has(lastPickEntityId)) lastPickEntityId = null;
       } else {
         ui.selection = ui.selection.filter(notOwn).concat(
           own.filter(eid => !selected('entity', eid)).map(eid => ({ kind: 'entity', id: eid })));
+        // Shift+click ADDS the loop: it becomes the reference object, exactly
+        // like a plain click would. Without this the anchor stays on whatever
+        // was picked earlier, so arrange would align to the wrong object.
+        markLastPicked('entity', own[0]);
       }
     } else {
       // Ctrl+click takes the loop and everything it encloses (its holes /
@@ -24973,6 +24913,13 @@
         if (addMod && !forceSelect) {
           const allIn = pool.every(eid => selected('entity', eid));
           ui.selection = allIn ? outside : outside.concat(pool.map(eid => ({ kind: 'entity', id: eid })));
+          // Ctrl+click adds the loop (and its contents): it is the reference
+          // too. Toggling it back out clears the anchor if it pointed here.
+          if (allIn) {
+            if (lastPickEntityId != null && poolSet.has(lastPickEntityId)) lastPickEntityId = null;
+          } else {
+            markLastPicked('entity', pool[0]);
+          }
         } else if (forceSelect) {
           // double click: keep whatever else was selected, take the loop and
           // its contents in, never toggle back out
@@ -29462,6 +29409,10 @@ function cmdSplitCurve() {
       return;
     }
     if (key === ' ') {
+      // A modal dialog is open: let Space reach the dialog's own handling /
+      // native button activation (see initModalBehavior). It must not be
+      // hijacked as the arc-full-circle shortcut while one is up.
+      if (activeModal()) return;
       ev.preventDefault();
       // Space at the arc's third point toggles between an arc and a full
       // circle through the three points.
@@ -34306,6 +34257,30 @@ function cmdSplitCurve() {
           return;
         }
         // Enter confirms: the primary button, else the last action button
+        const actions = modal.querySelectorAll('.modal-actions button');
+        const primary = modal.querySelector('.modal-actions .btn.primary') ||
+          modal.querySelector('.btn.primary') || actions[actions.length - 1];
+        if (primary) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          primary.click();
+        }
+        return;
+      }
+      if (ev.key === ' ') {
+        // Native dialogs accept Space to activate the focused button (and the
+        // default button when nothing else is focused). Only Enter worked in
+        // the app dialogs because the sketch shortcut handler swallowed Space.
+        // A focused button is clicked explicitly (same rule as Enter), a text
+        // field keeps typing spaces, anything else presses the primary action.
+        const t = ev.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable === true)) return;
+        if (modal.id === 'app-dialog-modal' && t && t.tagName === 'BUTTON' && t.closest('.modal-actions')) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          t.click();
+          return;
+        }
         const actions = modal.querySelectorAll('.modal-actions button');
         const primary = modal.querySelector('.modal-actions .btn.primary') ||
           modal.querySelector('.btn.primary') || actions[actions.length - 1];
