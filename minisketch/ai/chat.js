@@ -728,7 +728,7 @@
       case 'boolean': {
         const mode = a.mode === 'cut' ? 'cut' : a.mode === 'intersect' ? 'intersect' : 'union';
         if (mode !== 'union' && api.ui.selection.filter(s => s.kind === 'entity').length < 2) {
-          return { ok: false, error: mode + ' needs exactly 2+ loops: select tool loop first, then target' };
+          return { ok: false, error: mode + ' needs exactly 2+ loops: select the target loop first, then the tool loop last' };
         }
         api.cmdBoolean(mode);
         return { ok: true, mode };

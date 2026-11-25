@@ -17220,13 +17220,48 @@
     return picked;
   }
 
+  // Two loops fill the same region when their bounding box and area agree
+  // within tolerance. A box drawn as lines AND as a spline fitted over the
+  // same corners (boolfail.sketch) is the same shape twice — a boolean must
+  // compute it once, or cutting the duplicate legitimately leaves nothing.
+  function loopsSameRegion(A, B) {
+    const pa = A.poly, pb = B.poly;
+    if (!pa || !pb || pa.length < 3 || pb.length < 3) return false;
+    const stat = (poly) => {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, s = 0;
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i], b = poly[(i + 1) % poly.length];
+        s += a.x * b.y - b.x * a.y;
+        if (a.x < minX) minX = a.x;
+        if (a.y < minY) minY = a.y;
+        if (a.x > maxX) maxX = a.x;
+        if (a.y > maxY) maxY = a.y;
+      }
+      return { minX, minY, maxX, maxY, area: Math.abs(s) / 2 };
+    };
+    const sa = stat(pa), sb = stat(pb);
+    const tol = 1e-3;
+    if (Math.abs(sa.minX - sb.minX) > tol || Math.abs(sa.minY - sb.minY) > tol ||
+        Math.abs(sa.maxX - sb.maxX) > tol || Math.abs(sa.maxY - sb.maxY) > tol) return false;
+    return Math.abs(sa.area - sb.area) <= 1e-6 * Math.max(1, sa.area, sb.area);
+  }
+
+  // Collapse duplicate regions to the first loop that fills each region.
+  function dedupeLoops(loops) {
+    const out = [];
+    for (const L of loops) {
+      if (!out.some(K => loopsSameRegion(K, L))) out.push(L);
+    }
+    return out;
+  }
+
   // pickedLoops() yields ascending loop-index order, which ignores the order
-  // the user clicked. For a boolean the FIRST picked loop is the tool and the
+  // the user clicked. For a boolean the LAST picked loop is the tool and the
   // rest are targets, so that role must follow selection order — otherwise
-  // "select the tool first" is a lie and cut/intersect feel random. Reorder by
-  // the earliest selection position of each loop's boundary entities. With no
-  // entity selection (a point marquee) there is no click order: keep loop order.
-  function orderLoopsBySelection(loops) {
+  // "select the tool last" is a lie and cut/intersect feel random. Reorder by
+  // the selection position of each loop's boundary entities; with no entity
+  // selection (a point marquee) there is no click order: keep loop order.
+  function orderLoopsBySelection(loops, toolLast) {
     const pos = new Map();
     ui.selection.forEach((s, idx) => {
       if (s && s.kind === 'entity' && !pos.has(+s.id)) pos.set(+s.id, idx);
@@ -17240,7 +17275,19 @@
       }
       return best;
     };
-    return loops.slice().sort((a, b) => key(a) - key(b));
+    const ordered = loops.slice().sort((a, b) => key(a) - key(b));
+    if (!toolLast) return ordered;
+    // toolLast: the most recently selected loop is the tool, so promote it to
+    // the front. Loops with no click order (never picked explicitly) stay at
+    // the back in their original loop order; if nobody was explicitly picked,
+    // there is no "last clicked" to promote — keep the current order.
+    let last = -1;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (isFinite(key(ordered[i]))) { last = i; break; }
+    }
+    if (last <= 0) return ordered;
+    const tool = ordered.splice(last, 1)[0];
+    return [tool].concat(ordered);
   }
 
   // --- Exact bezier boolean (PathBool) ---------------------------------------
@@ -17490,13 +17537,24 @@
   // so the loop graph stays connected. A corner that coincides with an old
   // loop point lands on that SAME point id (pointAtWorld), which is what
   // keeps point-anchored constraints alive across the operation.
-  function boolPathsToEntities(PB, resultPaths, color) {
+  //
+  // `avoid` lists point ids the result must NOT weld onto — the kept tool's
+  // points in cut-keep mode (Ctrl+Shift+- / Shift+click Cut). Welding a result
+  // corner onto a kept tool corner tied the two together, so dragging the tool
+  // dragged the result with it (and the other way). Fresh points are created
+  // there instead.
+  function boolPathsToEntities(PB, resultPaths, color, avoid) {
     const shared = new Map();
     const madeIds = [];
+    const avoidSet = avoid && avoid.size ? avoid : null;
     const pidAt = (x, y) => {
       const key = Math.round(x / BOOL_EPS) + ',' + Math.round(y / BOOL_EPS);
       if (shared.has(key)) return shared.get(key);
-      const id = pointAtWorld(x, y, color);
+      let id = pointAtWorld(x, y, color);
+      if (avoidSet && avoidSet.has(id)) {
+        id = privatePoint(x, y);   // a fresh point: never weld onto the kept tool
+        state.points[id].x = x; state.points[id].y = y;
+      }
       shared.set(key, id);
       return id;
     };
@@ -17766,7 +17824,7 @@
   // result; everything that would be meaningless on the new geometry (radius
   // on a spline, parallel between two eaten lines) is dropped and counted in
   // the toast instead of vanishing silently.
-  function cmdBooleanExact(PB, mode, picked) {
+  function cmdBooleanExact(PB, mode, picked, removedLoops, keepTool, keptLoops) {
     const isUnion = mode === 'union';
     // PolyBool's operations are N-ary LEFT-FOLDS: Difference(A,B,C) means
     // A−B−C. So cut with several targets must union the targets first
@@ -17828,22 +17886,41 @@
     }
     const color = colorOf(state.entities[loopEntities(picked[isUnion ? 0 : 1])[0]]) || ui.color;
     // triage BEFORE any removal: which constraints touch the eaten loops?
-    const oldIds = new Set();
-    for (const loop of picked) for (const eid of loopEntities(loop)) oldIds.add(+eid);
+    // `removedLoops` already skips the tool when it is kept (Ctrl+Shift+-).
+    const eatIds = new Set();
+    for (const loop of removedLoops) {
+      for (const eid of loopEntities(loop)) eatIds.add(+eid);
+    }
+    // Points that belong to a KEPT loop: the result must not weld onto them,
+    // or dragging a kept original would drag the result (and vice versa). A
+    // point shared with an eaten loop disappears with the eat, so it is fine
+    // to land on — collect only the kept loops' own points.
+    const keepPointIds = new Set();
+    if (keepTool) {
+      for (const loop of (keptLoops || [])) {
+        for (const eid of loopEntities(loop)) {
+          const e = state.entities[eid];
+          if (!e) continue;
+          for (const pid of entityPointIds(e)) {
+            if (!eatIds.has(+pid)) keepPointIds.add(+pid);
+          }
+        }
+      }
+    }
     const oldCons = [];
     for (const cid in state.constraints) {
       const c = state.constraints[cid];
-      if (oldIds.has(+c.entity) || oldIds.has(+c.line) ||
-          oldIds.has(+c.line1) || oldIds.has(+c.line2)) oldCons.push(c);
+      if (eatIds.has(+c.entity) || eatIds.has(+c.line) ||
+          eatIds.has(+c.line1) || eatIds.has(+c.line2)) oldCons.push(c);
     }
     pushHistory();
-    const madeIds = boolPathsToEntities(PB, resultPaths, color);
+    const madeIds = boolPathsToEntities(PB, resultPaths, color, keepPointIds);
     if (!madeIds.length) {
       commit();
       toast('That operation leaves nothing');
       return true;
     }
-    removeEntities([...oldIds]);
+    removeEntities([...eatIds]);
     // re-attach what survives meaningfully
     let kept = 0, dropped = 0;
     const single = madeIds.length === 1 ? madeIds[0] : null;
@@ -17875,6 +17952,7 @@
     const what = isUnion ? 'Union' : mode === 'cut' ? 'Cut' : 'Intersection';
     let msg = what + ': ' + picked.length + ' loops \u2192 ' + madeIds.length +
       ' result' + (madeIds.length === 1 ? '' : 's') + ' \u00b7 exact curves';
+    if (keepTool) msg += ' \u00b7 originals kept';
     if (kept) msg += ' \u00b7 ' + kept + ' constraint' + (kept === 1 ? '' : 's') + ' kept';
     if (dropped) msg += ' \u00b7 ' + dropped + ' dropped';
     toast(msg);
@@ -17988,13 +18066,44 @@
   }
 
   function cmdBoolean(mode) {
-    const picked = orderLoopsBySelection(pickedLoops());
-    const isUnion = mode === 'union';
+    // "keep" modes (Shift+click, or Ctrl+Shift+- for cut) run the operation
+    // but leave every ORIGINAL loop in the drawing; the result is added on
+    // top of them. cut-keep keeps only the tool, since the targets are what
+    // the cut removes.
+    const keep = mode === 'cut-keep' || mode === 'union-keep' || mode === 'intersect-keep';
+    const effMode = mode === 'cut-keep' ? 'cut'
+      : mode === 'union-keep' ? 'union'
+      : mode === 'intersect-keep' ? 'intersect' : mode;
+    const keepTool = keep;
+    const isUnion = effMode === 'union';
+    // Cut / intersect take their tool from the LAST selected loop; reorder so
+    // that loop becomes the first (tool) unit. Union has no tool.
+    const allPicked = orderLoopsBySelection(pickedLoops(), !isUnion);
+    // Duplicate loops over the same region (a box as lines + as a fitted
+    // spline) must count once for the OPERATION — but every selected loop is
+    // still eaten, so the twin never litters the result plane.
+    const picked = dedupeLoops(allPicked);
     if (picked.length < 2) {
       toast(isUnion ? 'Select two or more loops, then press Ctrl++'
-        : 'Select the tool loop first, then the target loop');
+        : 'Select the target loop first, then the tool loop last');
       return;
     }
+    const targets = isUnion ? picked : picked.slice(1);
+    const toolLoop = isUnion ? null : picked[0];
+    // Which of the selected loops survive the operation? In keep mode the
+    // kept set differs per operation:
+    //   cut-keep       -> only the TOOL stays (the user asked "toolnya tidak
+    //                     dihapus"); the targets are what a cut eats
+    //   union-keep     -> every original stays (union adds one merged outline)
+    //   intersect-keep -> every original stays (intersect adds the overlap)
+    // Without keep everything selected is consumed and replaced by the result.
+    const keptLoops = keep
+      ? (effMode === 'cut'
+          ? allPicked.filter(L => loopsSameRegion(L, toolLoop))   // keep the tool
+          : allPicked)                                            // keep every original
+      : [];
+    // loops to remove: every selected loop except the ones kept above.
+    const removedLoops = allPicked.filter(L => !keptLoops.includes(L));
     // exact engine first: no flatten, no re-fit, corners stay constraint-safe
     const PB = pathBoolLib();
     if (!PB) {
@@ -18007,7 +18116,7 @@
         console.warn('booleanFit=exact but window.PathBool is missing — index.html or tools/path-bool.js is stale');
         return;
       }
-    } else if (cmdBooleanExact(PB, mode, picked)) {
+    } else if (cmdBooleanExact(PB, effMode, picked, removedLoops, keepTool, keptLoops)) {
       return;
     }
     const Lib = clipperLib();
@@ -18033,12 +18142,14 @@
     if (isUnion) {
       cl.AddPaths(picked.map(l => toPath(fix(l))), Lib.PolyType.ptSubject, true);
     } else {
-      cl.AddPaths([toPath(fix(picked[1]))], Lib.PolyType.ptSubject, true);
-      cl.AddPaths([toPath(fix(picked[0]))], Lib.PolyType.ptClip, true);
+      // subject = all targets fused (multi-target cut/intersect already worked
+      // in the exact engine; this keeps the Clipper fallback equivalent)
+      cl.AddPaths(targets.map(l => toPath(fix(l))), Lib.PolyType.ptSubject, true);
+      cl.AddPaths([toPath(fix(toolLoop))], Lib.PolyType.ptClip, true);
     }
     const raw = new Lib.Paths();
-    const clipOp = mode === 'cut' ? Lib.ClipType.ctDifference
-      : mode === 'intersect' ? Lib.ClipType.ctIntersection : Lib.ClipType.ctUnion;
+    const clipOp = effMode === 'cut' ? Lib.ClipType.ctDifference
+      : effMode === 'intersect' ? Lib.ClipType.ctIntersection : Lib.ClipType.ctUnion;
     cl.Execute(clipOp, raw, Lib.PolyFillType.pftNonZero, Lib.PolyFillType.pftNonZero);
     const result = [];
     for (const path of raw) {
@@ -18056,12 +18167,17 @@
       toast('That operation leaves nothing');
       return;
     }
-    // colour of the target (second) loop, or the first loop for a union
-    const firstEnt = state.entities[loopEntities(picked[isUnion ? 0 : 1])[0]];
+    // colour of the target loop(s), or the first loop for a union
+    const refLoop = isUnion ? picked[0] : targets[0];
+    const firstEnt = state.entities[loopEntities(refLoop)[0]];
     const color = (firstEnt && colorOf(firstEnt)) || ui.color;
     pushHistory();
     const removed = new Set();
-    for (const loop of picked) for (const eid of loopEntities(loop)) removed.add(+eid);
+    // keepTool (Ctrl+Shift+-): the tool stays in the drawing — only the
+    // targets are consumed and replaced by the result.
+    for (const loop of removedLoops) {
+      for (const eid of loopEntities(loop)) removed.add(+eid);
+    }
     removeEntities([...removed]);
     // The result is rebuilt as real curves unless the user asked for the exact
     // outline: Clipper returns a dense polyline (one vertex per tessellated arc
@@ -18086,13 +18202,14 @@
     }
     ui.selection = madeIds.map(id => ({ kind: 'entity', id }));
     commit();
-    const what = isUnion ? 'Union' : mode === 'cut' ? 'Cut' : 'Intersection';
+    const what = isUnion ? 'Union' : effMode === 'cut' ? 'Cut' : 'Intersection';
     const nodes = madeIds.reduce((n, id) => {
       const ent = state.entities[id];
       return n + (ent && ent.pts ? ent.pts.length : 0);
     }, 0);
     toast(what + ': ' + picked.length + ' loops \u2192 ' + madeIds.length +
       ' result' + (madeIds.length === 1 ? '' : 's') +
+      (keepTool ? ' \u00b7 originals kept' : '') +
       (fittedN
         ? ' \u00b7 ' + nodes + ' node' + (nodes === 1 ? '' : 's') + ' \u00b7 ' + fmt(fitTol) + ' mm'
         : ' \u00b7 polyline kept'));
@@ -22783,12 +22900,12 @@
     const nLoops = pickedLoops().length;
     if (ui.offsetJob) return offsetHintText();
     const selN = selectedEntities().length;
-    // Boolean: order matters (tool first, then target), so say which is next.
+    // Boolean: order matters (target first, tool LAST), so say which is next.
     if (nLoops >= 2) {
-      return 'Boolean ready: ' + nLoops + ' loops — Ctrl++ union · Ctrl+- cut (FIRST loop = tool, SECOND = target) · Ctrl+0 intersect.';
+      return 'Boolean ready: ' + nLoops + ' loops — Ctrl++ union · Ctrl+- cut (LAST selected = tool) · Ctrl+0 intersect. Hold Shift on any of them to KEEP the original loops (result added on top).';
     }
     if (nLoops === 1) {
-      return 'Boolean: 1 loop picked — pick a SECOND loop, then Ctrl++ union · Ctrl+- cut (first = tool) · Ctrl+0 intersect. Offset: Ctrl+J offsets this selection.';
+      return 'Boolean: 1 loop picked — pick a SECOND loop (target), then the TOOL last, then Ctrl++ union · Ctrl+- cut (last selected = tool) · Ctrl+0 intersect. Hold Shift to keep the originals. Offset: Ctrl+J offsets this selection.';
     }
     if (selN > 0) {
       return base + ' Offset: Ctrl+J offsets the selection (wheel = distance, Enter confirms). Boolean: pick closed loops first (' + selN + ' selected, 0 loops).';
@@ -31900,15 +32017,18 @@ function cmdSplitCurve() {
     });
 
     document.querySelectorAll('[data-quick]').forEach(btn => {
-      const act = () => {
+      const act = (ev) => {
         const a = btn.dataset.quick;
+        const keep = !!(ev && ev.shiftKey);   // Shift = keep the original loops
         if (a === 'flip-x') quickFlip('x');
         else if (a === 'flip-y') quickFlip('y');
         else if (a === 'rot-ccw') quickRotate(90);
         else if (a === 'rot-cw') quickRotate(-90);
-        else if (a === 'union') cmdBoolean('union');
-        else if (a === 'cut') cmdBoolean('cut');
-        else if (a === 'intersect') cmdBoolean('intersect');
+        else if (a === 'union') cmdBoolean(keep ? 'union-keep' : 'union');
+        // Shift+click on Cut = cut & keep the tool (the browser eats
+        // Ctrl+Shift+- as zoom out, so the same gesture lives here).
+        else if (a === 'cut') cmdBoolean(keep ? 'cut-keep' : 'cut');
+        else if (a === 'intersect') cmdBoolean(keep ? 'intersect-keep' : 'intersect');
       };
       btn.addEventListener('click', act);
       // tablets: a held touch must not double-fire with the click
@@ -34207,23 +34327,25 @@ function cmdSplitCurve() {
         return;
       }
       // Boolean loops: union Ctrl++, cut Ctrl+-, intersection Ctrl+0.
-      // (Ctrl+B and its shift/alt variants are retired — one key per operation.)
+      // Shift+the chord runs the SAME operation but KEEPS every original loop
+      // (the result is added on top). Without Shift the inputs are consumed
+      // and replaced by the result.
       if ((ev.ctrlKey || ev.metaKey) && (ev.key === '+' || ev.key === '=')) {
         ev.preventDefault();
         ev.stopPropagation();
-        cmdBoolean('union');
+        cmdBoolean(ev.shiftKey ? 'union-keep' : 'union');
         return;
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.key === '-') {
         ev.preventDefault();
         ev.stopPropagation();
-        cmdBoolean('cut');
+        cmdBoolean(ev.shiftKey ? 'cut-keep' : 'cut');
         return;
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.key === '0') {
         ev.preventDefault();
         ev.stopPropagation();
-        cmdBoolean('intersect');
+        cmdBoolean(ev.shiftKey ? 'intersect-keep' : 'intersect');
         return;
       }
       // "\": sharp corner — the selected spline points drop their handles
