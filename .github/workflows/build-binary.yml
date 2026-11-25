@@ -156,9 +156,34 @@ jobs:
 
       - name: Create release
         run: |
-          gh release create ${{ github.event.inputs.version }} \
-            --title "KaryaCNC ${{ github.event.inputs.version }}" \
-            --notes "Binary release ${{ github.event.inputs.version }}" \
-            artifacts/karyacnc-windows/* artifacts/karyacnc-linux/*
+          set -e
+          VERSION="${{ github.event.inputs.version }}"
+          retry() {
+            local n=$1; shift
+            local i
+            for i in $(seq 1 "$n"); do
+              if "$@"; then return 0; fi
+              echo "retry $i/$n gagal — tunggu..." >&2
+              sleep $((i * 8))
+            done
+            return 1
+          }
+          # Bersihkan sisa dari percobaan sebelumnya (draft/tag) — error create
+          # bisa meninggalkan draft yang gagal dibersihkan otomatis.
+          gh release delete "$VERSION" --yes --cleanup-tag 2>/dev/null || true
+          # Buat release dulu (tanpa asset), lalu upload terpisah: upload yang
+          # kena 502 bisa di-retry tanpa harus recreate release.
+          retry 5 gh release create "$VERSION" \
+            --title "KaryaCNC $VERSION" \
+            --notes "Binary release $VERSION"
+          # Upload asset per-folder dengan retry (+ --clobber agar idempoten);
+          # lewati folder yang tidak punya file.
+          for dir in artifacts/karyacnc-windows artifacts/karyacnc-linux; do
+            if compgen -G "$dir/*" > /dev/null; then
+              retry 6 gh release upload "$VERSION" "$dir"/* --clobber
+            else
+              echo "tidak ada asset di $dir — lewati"
+            fi
+          done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
