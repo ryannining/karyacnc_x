@@ -377,6 +377,14 @@ func webAssetHandler(app *App) http.Handler {
 		// AI chat proxy di webview: location.origin bukan http://localhost:3000,
 		// jadi /api/chat & /api/models dilayani langsung di sini (policy-free,
 		// lihat ai_bridge.go).
+		if r.URL.Path == "/health" {
+			handleHealth(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/marketplace/") {
+			app.handleMarketplaceAPI(w, r)
+			return
+		}
 		if r.URL.Path == "/api/chat" {
 			app.HandleAIChat(w, r)
 			return

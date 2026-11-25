@@ -87,6 +87,22 @@ while IFS= read -r f; do
     FILES+=("$rel")
 done < <(find "$SRC/ai" -maxdepth 2 -type f \( -name '*.js' -o -name '*.txt' -o -name '*.json' \) | sort)
 
+# Aset RUNTIME ekstensi: extensions/manager.js dimuat lewat <script> di
+# index.html (ikut auto-discovery di atas), tapi seluruh file marketplace/
+# TIDAK dirujuk index.html — catalog.json dan extensions/*.js di-fetch saat
+# runtime oleh extensions/manager.js. Tanpa ikut tersalin, Marketplace kosong
+# (dan install gagal) di salinan KaryaCNC.
+for f in "$SRC"/extensions/*.js; do
+    [ -f "$f" ] || continue
+    FILES+=("extensions/$(basename "$f")")
+done
+if [ -d "$SRC/marketplace" ]; then
+    while IFS= read -r f; do
+        rel="${f#"$SRC"/}"
+        FILES+=("$rel")
+    done < <(find "$SRC/marketplace" -type f | sort)
+fi
+
 # Buang duplikat, jaga urutan
 FILES=($(printf '%s\n' "${FILES[@]}" | awk '!seen[$0]++'))
 

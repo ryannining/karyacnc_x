@@ -19,9 +19,9 @@
   NS.mode = 'chat';
   let api = null;
 
-  // Mode SVG adalah SATU-SATUNYA mode yang didukung (paling akurat untuk
-  // geometri vector). Mode agen (tool calls) dihapus.
-  NS.svgMode = () => true;
+  // Mode default = 'svg' (vector output) or 'ext' (AI Extension Builder).
+  NS.builderMode = 'svg';
+  NS.svgMode = () => NS.builderMode !== 'ext';
 
   function isLocalApiUrl(base) {
     try {
@@ -286,11 +286,11 @@
   // archive grows past it quickly. Structure:
   //   • `sessions` store — one record per session (running OR archived):
   //       { id, title, at, updatedAt, messages: [{role,text,ops,at,done,thinking,retryText,images?}] }
-  //   • `meta` store — ONLY archived sessions (the LOG list), lightweight:
+  //   • `meta` store — ONLY archived sessions (the History list), lightweight:
   //       { id, title, at, updatedAt, count, img }
   //   • localStorage key CURRENT_ID_KEY — which session is RUNNING right now.
   // The running session always survives a reload; "New" moves it into `meta`
-  // (LOG), and clicking a LOG entry moves it back to running.
+  // (History), and clicking a History entry moves it back to running.
   const DB_NAME = 'minisketch-chat';
   const DB_VER = 1;
   const SESSIONS = 'sessions';
@@ -438,8 +438,8 @@
     }
     return fresh();
   }
-  // Move the running session into the LOG archive (called by New, and before
-  // resuming a LOG session so nothing currently running is lost).
+  // Move the running session into the History archive (called by New, and before
+  // resuming a History session so nothing currently running is lost).
   function archiveCurrentSession() {
     if (NS.sessionId && finishedMessages().length) {
       return saveCurrentSession().then(() => {
@@ -456,7 +456,7 @@
     }
     return Promise.resolve();
   }
-  // Clicking a LOG row moves that session back to running.
+  // Clicking a History row moves that session back to running.
   function resumeSession(id) {
     return idbGet(SESSIONS, id).then(sess => {
       if (!sess) return false;
@@ -464,7 +464,7 @@
       NS.sessionAt = sess.at;
       NS.log = sanitizeMessages(sess.messages);
       lsSet(CURRENT_ID_KEY, id);
-      // it is the running session again: drop it from the LOG list
+      // it is the running session again: drop it from the History list
       return idbDel(META, id).then(() => true);
     }).catch(() => false);
   }
@@ -1233,6 +1233,11 @@
     renderLog();
     const url = bridgeUrl();
     if (!url) {
+      if (NS.builderMode === 'ext') {
+        pushLog('ai', 'Mode Extension Builder memerlukan koneksi bridge/AI. Jalankan "node server/serve.js" lalu buka http://127.0.0.1:8090 (atau isi AI bridge URL di Settings).');
+        renderLog();
+        return;
+      }
       const parsed = parseLocal(input);
       if (parsed && parsed.ops.length) {
         const r = await applyOps(parsed.ops);
@@ -1311,15 +1316,17 @@
     const stopWaitClock = () => { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } };
     try {
       await ensurePolicy();
-      const svgMode = NS.svgMode();
-      // SVG mode: no tool manifest at all — the model only returns <svg>.
-      const toolManifest = (!svgMode && P && P.toolManifest) ? P.toolManifest() : [];
+      const extMode = NS.builderMode === 'ext';
+      if (extMode && P && P.ensureExtPrompt) await P.ensureExtPrompt();
+      const svgMode = !extMode && NS.svgMode();
+      // SVG & Extension Builder modes send no CAD tool manifest — the model returns <svg> or tool JS directly.
+      const toolManifest = (!svgMode && !extMode && P && P.toolManifest) ? P.toolManifest() : [];
       for (let round = 1; round <= MAX_ROUNDS; round++) {
         // Rebuild systemMessage EVERY round so `use_skill` and fresh document
         // state take effect immediately on round 2+.
         const curState = stateSummary();
         const sysMsg = P && P.systemMessage
-          ? P.systemMessage(history, curState, NS.requestedSkills || [], { svgMode })
+          ? P.systemMessage(history, curState, NS.requestedSkills || [], { svgMode, extMode })
           : null;
         const messages = [...history];
         if (sysMsg) messages.unshift(sysMsg);
@@ -1350,8 +1357,8 @@
           });
         }
         startWaitClock(lastExec
-          ? 'memeriksa hasil putaran ' + (round - 1) + '…'
-          : 'berpikir…');
+          ? 'checking round ' + (round - 1) + ' results…'
+          : 'thinking…');
         const tRound = performance.now();
         const payload = {
           messages,
@@ -1408,7 +1415,7 @@
               liveThink[round] = (liveThink[round] || '') + ev.delta.thinking;
               think[round] = liveThink[round];
               liveMsg.thinking = (liveMsg.thinking || '') + ev.delta.thinking;
-              if (!liveContent && (!liveMsg.text || liveMsg.text === '…')) liveMsg.text = 'berpikir…';
+              if (!liveContent && (!liveMsg.text || liveMsg.text === '…')) liveMsg.text = 'thinking…';
               scheduleThinkFlush();
             } else if (ev.delta && ev.delta.content) {
               stopWaitClock();
@@ -1443,7 +1450,7 @@
           markDone(liveMsg);
           break;
         }
-        setPhase('mengeksekusi ' + calls.length + ' op (putaran ' + round + '/' + MAX_ROUNDS + ')…', calls);
+        setPhase('executing ' + calls.length + ' op' + (calls.length > 1 ? 's' : '') + ' (round ' + round + '/' + MAX_ROUNDS + ')…', calls);
         const r = await applyOps(calls, { noHistory: historyPushed });
         if (r.pushedHistory) historyPushed = true;
         lastExec = {
@@ -1461,14 +1468,14 @@
           ids: (r.ids || []).slice(0, 20),
           errors: (r.errors || []).slice(0, 3)
         });
-        setPhase('putaran ' + round + '/' + MAX_ROUNDS + ': ' + r.made + ' op' +
-          (r.errors.length ? ', error: ' + r.errors[0] : ', ok') + ' — memverifikasi…', calls);
+        setPhase('round ' + round + '/' + MAX_ROUNDS + ': ' + r.made + ' op' +
+          (r.errors.length ? ', error: ' + r.errors[0] : ', ok') + ' — verifying…', calls);
         if (round === MAX_ROUNDS) {
           liveMsg.rounds = round;
           if (usageTotal.total_tokens > 0) liveMsg.usage = { ...usageTotal };
-          setPhase('Berhenti di batas ' + MAX_ROUNDS + ' putaran. Terakhir: ' + r.made + ' op' +
+          setPhase('Stopped at the ' + MAX_ROUNDS + '-round limit. Last: ' + r.made + ' op' +
             (r.errors.length ? ', error: ' + r.errors[0] : '') +
-            '. Ketik "lanjutkan" untuk meneruskan, atau tombol Retry untuk mengulang.', calls);
+            '. Type "continue" to proceed, or the Retry button to start over.', calls);
           liveMsg.retryText = input;   // Retry re-runs the whole request
           markDone(liveMsg);
         }
@@ -1499,26 +1506,33 @@
   }
 
   // ---- panel ---------------------------------------------------------------
-  // The LOG tab shows only archived SESSIONS (no message content); the input
-  // row and image tray belong to the Chat tab, so they hide in LOG mode.
+  // The History tab shows only archived SESSIONS (no message content); the input
+  // row and image tray belong to the Chat tab, so they hide in History mode.
   function setChatInputVisible(on) {
     const row = document.getElementById('chat-input-row');
     const tray = document.getElementById('chat-pending');
     if (row) row.hidden = !on;
     if (tray) tray.hidden = !on || !(NS.pendingImages && NS.pendingImages.length);
+    // Chat-only chrome: model row and the mode combo + New Session bar. The
+    // History tab is purely the archived-session list, so these are hidden
+    // there (the input row above already hides textarea + attach + Send).
+    ['chat-model-row', 'chat-builder-bar'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.hidden = !on;
+    });
   }
   function renderSessions(host) {
     host.innerHTML = '';
     if (!NS.meta.length) {
       const li = document.createElement('li');
-      li.innerHTML = '<span class="muted">Belum ada sesi tersimpan — tekan New untuk memindahkan percakapan saat ini ke LOG.</span>';
+      li.innerHTML = '<span class="muted">No archived sessions yet — press New Session to move the current conversation to History.</span>';
       host.appendChild(li);
       return;
     }
     for (const s of NS.meta) {
       const li = document.createElement('li');
       li.className = 'chat-session clickable';
-      li.title = 'Klik untuk melanjutkan sesi ini';
+      li.title = 'Click to resume this session';
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = s.title;
@@ -1532,7 +1546,7 @@
       const del = document.createElement('button');
       del.className = 'mini-del';
       del.textContent = '×';
-      del.title = 'Hapus dari LOG';
+      del.title = 'Delete from History';
       del.addEventListener('click', (ev) => {
         ev.stopPropagation();
         deleteArchivedSession(s.id).then(refreshMeta);
@@ -1557,7 +1571,7 @@
   // chunk (stickToBottom -> scrollHeight) was ~80% of the recorded freeze.
   const THINK_PARAS = 2;
   const THINK_MAX_CHARS = 8000;
-  const THINK_CUT_NOTE = '[… pemikiran sebelumnya dipotong — hanya 2 paragraf terakhir ditampilkan]\n';
+  const THINK_CUT_NOTE = '[… earlier thinking was trimmed — only the last 2 paragraphs are shown]\n';
   function thinkDisplay(s) {
     s = String(s || '');
     if (!s) return { text: '', cut: false };
@@ -1603,7 +1617,7 @@
     // on every delta, which fought the user's scrolling and snapped to the top.
     if (NS.liveMsg && NS.liveRefs && NS.liveRefs.li.isConnected) {
       const m = NS.liveMsg;
-      const who = m.role === 'user' ? '<b>kamu</b>' : m.role === 'ai' ? '<b>ai</b>' : '<b class="muted">sys</b>';
+      const who = m.role === 'user' ? '<b>you</b>' : m.role === 'ai' ? '<b>ai</b>' : '<b class="muted">sys</b>';
       let html = who + ' ' + escapeHtml(m.text).replace(/\n/g, '<br>');
       if (m.ops && m.ops.length) html += '<br><span class="muted">' + m.ops.map(o => escapeHtml(o.name)).join(', ') + '</span>';
       NS.liveRefs.text.innerHTML = html;
@@ -1623,14 +1637,17 @@
     const items = NS.log.filter(m => m.role !== 'sys');
     if (!items.length) {
       const li = document.createElement('li');
-      li.innerHTML = '<span class="muted">Tanya atau perintahkan sesuatu… cth: "kotak 100x60 di 0,0", "4 lubang d5 di sudut", "buatkan box 120x80x60".</span>';
+      li.innerHTML = '<span class="muted">Ask or describe something… e.g. "100x60 box at 0,0", "4x d5 holes in the corners", "build a 120x80x60 box tool".</span>';
       host.appendChild(li);
       return;
     }
     const fmtTok = (n) => n >= 1000 ? (Math.round(n / 100) / 10) + 'k' : String(n);
+    // The Fork button (copy the first prompt to a new session) sits right under
+    // the FIRST user turn, per the requested layout — it is about that turn.
+    let forkPlaced = false;
     for (const m of items.slice(-60)) {
       const li = document.createElement('li');
-      const who = m.role === 'user' ? '<b>kamu</b>' : m.role === 'ai' ? '<b>ai</b>' : '<b class="muted">sys</b>';
+      const who = m.role === 'user' ? '<b>you</b>' : m.role === 'ai' ? '<b>ai</b>' : '<b class="muted">sys</b>';
       let html = who + ' ' + escapeHtml(m.text).replace(/\n/g, '<br>');
       if (m.ops && m.ops.length) {
         html += '<br><span class="muted">' + m.ops.map(o => escapeHtml(o.name)).join(', ') + '</span>';
@@ -1638,9 +1655,14 @@
       const textSpan = document.createElement('span');
       textSpan.innerHTML = html;
       li.appendChild(textSpan);
+      // Fork under the opening user prompt (only once, and only in Chat tab).
+      if (m.role === 'user' && !forkPlaced) {
+        li.appendChild(makeForkButton());
+        forkPlaced = true;
+      }
       if (m.role === 'ai' && m.done) {
         const parts = [];
-        if (m.rounds && m.rounds > 1) parts.push(m.rounds + ' putaran');
+        if (m.rounds && m.rounds > 1) parts.push(m.rounds + ' rounds');
         if (m.usage && m.usage.total_tokens > 0) parts.push(fmtTok(m.usage.total_tokens) + ' token');
         if (parts.length) {
           const meta = document.createElement('span');
@@ -1651,14 +1673,16 @@
       }
       appendImageThumbs(li, m);
       // Render SVG preview + Insert/Copy whenever an AI reply contains <svg>
-      if (m.role === 'ai' && (NS.svgMode() || /<svg[\s\S]*?<\/svg>/i.test(m.text))) appendSvgBlock(li, m);
+      if (m.role === 'ai' && !extractExtensionCode(m.text) && (NS.svgMode() || /<svg[\s\S]*?<\/svg>/i.test(m.text))) appendSvgBlock(li, m);
+      // Render AI Extension Builder actions when reply contains MiniSketchTools.register(...)
+      if (m.role === 'ai' && extractExtensionCode(m.text)) appendExtensionBlock(li, m);
       if (m.thinking) {
         NS.thinkClosed = NS.thinkClosed || new WeakSet();
         const det = document.createElement('details');
         det.className = 'chat-think';
         det.open = !NS.thinkClosed.has(m);
         const sum = document.createElement('summary');
-        sum.textContent = 'pikiran model (' + m.thinking.split(/\n-{3,}\n/).length + ' putaran)';
+        sum.textContent = 'model thinking (' + m.thinking.split(/\n-{3,}\n/).length + ' rounds)';
         sum.addEventListener('click', () => {
           if (det.open) NS.thinkClosed.add(m); else NS.thinkClosed.delete(m);
         });
@@ -1703,6 +1727,39 @@
       host.appendChild(li);
     }
     host.scrollTop = host.scrollHeight;
+  }
+
+  // Build the "Fork" button that appears under the FIRST user message: it copies
+  // that first prompt (text + attached image) into a brand-new session. Kept as
+  // a helper so renderLog can place it inline below the opening user turn.
+  function makeForkButton() {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn small chat-fork';
+    btn.textContent = 'Fork';
+    btn.title = 'Fork: copy the first prompt (text + attached image) to a new session — handy after switching models. The current session moves to History.';
+    btn.addEventListener('click', () => {
+      if (NS.activeAbort) return;
+      const firstUser = NS.log.find(m => m && m.role === 'user');
+      if (!firstUser) return;
+      const seedText = String(firstUser.text || '');
+      const seedImages = (Array.isArray(firstUser.images) && firstUser.images.length)
+        ? firstUser.images.slice()
+        : null;
+      archiveCurrentSession().then(() => {
+        NS.log = [];
+        NS.sessionId = newSessionId();
+        NS.sessionAt = Date.now();
+        lsSet(CURRENT_ID_KEY, NS.sessionId);
+        NS.pendingImages = seedImages || [];
+        renderPending();
+        setTab('chat');
+        renderLog();
+        scheduleSave();
+        send(seedText);
+      });
+    });
+    return btn;
   }
 
   // In-app lightbox overlay for attached images & SVG previews (never calls window.open).
@@ -1783,7 +1840,7 @@
       img.className = 'chat-thumb';
       img.src = src;
       img.alt = 'gambar terlampir';
-      img.title = 'Klik untuk memperbesar gambar';
+      img.title = 'Click to enlarge';
       img.addEventListener('click', () => openLightbox(src, 'Gambar terlampir'));
       row.appendChild(img);
     }
@@ -1893,6 +1950,234 @@
     li.appendChild(row);
   }
 
+  // ---- AI Extension Builder mode -----------------------------------------
+  function extractExtensionCode(text) {
+    const raw = String(text == null ? '' : text);
+    const hasReg = (s) =>
+      /(?:MiniSketchTools|NS)\s*\.\s*register\s*\(/.test(s) ||
+      (/\bMiniSketchTools\b/.test(s) && /\.register\s*\(/.test(s));
+    if (!hasReg(raw)) return null;
+    const blocks = [];
+    const fenceRe = /```(?:js|javascript|ts)?\s*\n([\s\S]*?)```/gi;
+    let m;
+    while ((m = fenceRe.exec(raw)) !== null) {
+      if (hasReg(m[1])) blocks.push(m[1].trim());
+    }
+    if (blocks.length) return blocks[blocks.length - 1];
+    // Fallback: raw un-fenced code if the model omitted markdown fences
+    if (/^\s*(?:\(\(\)\s*=>|\(function\s*\(|\/\/|\/\*|(?:window\.)?MiniSketchTools\.register\s*\()/m.test(raw)) {
+      return raw.trim();
+    }
+    return null;
+  }
+
+  function downloadExtensionFile(filename, content) {
+    try {
+      const blob = new Blob([String(content || '')], { type: 'application/javascript;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function appendExtensionBlock(li, m) {
+    const code = extractExtensionCode(m && m.text);
+    if (!code) return;
+    const reg = window.MiniSketchTools;
+    const val = (reg && reg.validateExtensionCode)
+      ? reg.validateExtensionCode(code)
+      : { ok: true, errors: [], warnings: [], extracted: { id: 'custom-tool', label: 'Custom Tool' } };
+    const meta = {
+      id: (val.extracted && val.extracted.id) || 'custom-tool',
+      name: (val.extracted && (val.extracted.label || val.extracted.id)) || 'Custom Tool',
+      label: (val.extracted && (val.extracted.label || val.extracted.id)) || 'Custom Tool',
+      title: (val.extracted && val.extracted.title) || '',
+      version: (val.extracted && val.extracted.version) || '1.0.0',
+      author: (val.extracted && val.extracted.author) || 'AI Builder',
+      category: (val.extracted && val.extracted.category) || 'AI Generated',
+      description: (val.extracted && val.extracted.description) || '',
+      icon: (val.extracted && val.extracted.icon) || ''
+    };
+
+    const card = document.createElement('div');
+    card.className = 'chat-ext';
+
+    const head = document.createElement('div');
+    head.className = 'chat-ext-head';
+    const title = document.createElement('span');
+    title.className = 'chat-ext-title';
+    if (reg && reg.sanitizeIconSvg) {
+      const ic = document.createElement('span');
+      ic.className = 'chat-ext-ic';
+      ic.innerHTML = reg.sanitizeIconSvg(meta.icon);
+      title.appendChild(ic);
+    }
+    const b = document.createElement('b');
+    b.textContent = meta.label || 'Extension';
+    const sub = document.createElement('span');
+    sub.className = 'muted';
+    sub.textContent = meta.id ? (' · ' + meta.id + ' · v' + meta.version) : '';
+    title.appendChild(b);
+    title.appendChild(sub);
+    head.appendChild(title);
+    card.appendChild(head);
+
+    const status = document.createElement('div');
+    status.className = 'chat-ext-status ' + (val.ok ? 'is-ok' : 'is-err');
+    if (!val.ok) {
+      status.textContent = 'Invalid: ' + val.errors[0];
+    } else if (val.warnings && val.warnings.length) {
+      status.textContent = 'Ready (' + val.warnings.length + ' warning: ' + val.warnings[0] + ')';
+    } else {
+      status.textContent = 'Ready — syntax & contract valid';
+    }
+    card.appendChild(status);
+
+    const actions = document.createElement('div');
+    actions.className = 'chat-ext-actions';
+
+    if (!val.ok) {
+      const fixBtn = document.createElement('button');
+      fixBtn.type = 'button';
+      fixBtn.className = 'btn small primary';
+      fixBtn.textContent = 'Minta AI Perbaiki';
+      fixBtn.disabled = !!NS.activeAbort;
+      fixBtn.title = 'Send the validation errors to AI Extension Builder so the code gets fixed';
+      fixBtn.addEventListener('click', () => {
+        if (NS.activeAbort) return;
+        const bExt = document.getElementById('chat-builder-ext');
+        if (bExt && NS.builderMode !== 'ext') bExt.click();
+        else NS.builderMode = 'ext';
+        const prompt =
+          'Kode ekstensi sebelumnya gagal validasi:\n- ' +
+          val.errors.join('\n- ') +
+          '\n\nTolong perbaiki error tersebut dan kirim ulang SATU blok kode ```js ... ``` yang lengkap dan valid untuk window.MiniSketchTools.register({...}).';
+        send(prompt);
+      });
+      actions.appendChild(fixBtn);
+    }
+
+    const testBtn = document.createElement('button');
+    testBtn.type = 'button';
+    testBtn.className = 'btn small';
+    testBtn.textContent = 'Test Run';
+    testBtn.disabled = !val.ok;
+    testBtn.title = val.ok
+      ? 'Load temporarily (not saved) and open the tool dialog to test'
+      : ('Tidak bisa dijalankan sebelum validasi lolos: ' + val.errors[0]);
+    testBtn.addEventListener('click', () => {
+      if (!reg || !reg.installExtension) return;
+      const res = reg.installExtension(meta, code, { preview: true });
+      if (!res.ok) {
+        status.className = 'chat-ext-status is-err';
+        status.textContent = res.error || 'Preview failed.';
+        return;
+      }
+      reg.open(res.tool.id);
+      status.className = 'chat-ext-status is-ok';
+      status.textContent = 'Preview active — test parameters, then click Install to keep.';
+    });
+
+    const installBtn = document.createElement('button');
+    installBtn.type = 'button';
+    installBtn.className = 'btn small' + (val.ok ? ' primary' : '');
+    installBtn.textContent = 'Install';
+    installBtn.disabled = !val.ok;
+    installBtn.title = val.ok
+      ? 'Save to LocalStorage and add permanently to the Extensions panel'
+      : ('Tidak bisa dipasang sebelum validasi lolos: ' + val.errors[0]);
+    installBtn.addEventListener('click', () => {
+      if (!reg || !reg.installExtension) return;
+      const res = reg.installExtension(meta, code, { source: 'ai' });
+      if (!res.ok) {
+        status.className = 'chat-ext-status is-err';
+        status.textContent = res.error || 'Install failed.';
+        return;
+      }
+      status.className = 'chat-ext-status is-ok';
+      status.textContent = 'Installed to Extensions panel (' + res.tool.id + ').';
+      if (api && api.toast) api.toast('Extension "' + (res.tool.label || res.tool.id) + '" installed');
+    });
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'btn small';
+    editBtn.textContent = 'Edit…';
+    editBtn.title = 'Buka kode ekstensi di editor tab Add / Import untuk diperiksa atau diubah manual';
+    editBtn.addEventListener('click', () => {
+      if (window.MiniSketchExtensions && window.MiniSketchExtensions.open) {
+        window.MiniSketchExtensions.open('import', { code });
+      } else if (api && api.toast) {
+        api.toast('Extension Manager is not loaded.');
+      }
+    });
+
+    const pubBtn = document.createElement('button');
+    pubBtn.type = 'button';
+    pubBtn.className = 'btn small';
+    pubBtn.textContent = 'Publish…';
+    pubBtn.disabled = !val.ok;
+    pubBtn.title = 'Publish permanently to MiniSketch Server or GitHub Marketplace';
+    pubBtn.addEventListener('click', () => {
+      if (window.MiniSketchExtensions && window.MiniSketchExtensions.openPublish) {
+        window.MiniSketchExtensions.openPublish(meta, code);
+      } else if (api && api.toast) {
+        api.toast('Extension Manager is not loaded.');
+      }
+    });
+
+    const dlBtn = document.createElement('button');
+    dlBtn.type = 'button';
+    dlBtn.className = 'btn small';
+    dlBtn.textContent = 'Download .js';
+    dlBtn.addEventListener('click', () => {
+      const fn = (meta.id || 'extension').replace(/[^a-z0-9-_]/gi, '-') + '.js';
+      const ok = downloadExtensionFile(fn, code);
+      status.className = 'chat-ext-status ' + (ok ? 'is-ok' : 'is-err');
+      status.textContent = ok ? ('Downloaded ' + fn) : 'Download failed.';
+    });
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'btn small';
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', async () => {
+      const ok = await copyTextToClipboard(code);
+      status.className = 'chat-ext-status ' + (ok ? 'is-ok' : 'is-err');
+      status.textContent = ok ? 'Code copied to clipboard.' : 'Copy failed.';
+    });
+
+    actions.appendChild(testBtn);
+    actions.appendChild(installBtn);
+    actions.appendChild(editBtn);
+    actions.appendChild(pubBtn);
+    actions.appendChild(dlBtn);
+    actions.appendChild(copyBtn);
+    card.appendChild(actions);
+
+    const det = document.createElement('details');
+    det.className = 'chat-ext-code';
+    const sum = document.createElement('summary');
+    sum.textContent = 'View source (' + code.split('\n').length + ' lines)';
+    const pre = document.createElement('pre');
+    const codeEl = document.createElement('code');
+    codeEl.textContent = code;
+    pre.appendChild(codeEl);
+    det.appendChild(sum);
+    det.appendChild(pre);
+    card.appendChild(det);
+
+    li.appendChild(card);
+  }
+
   // follow the tail of a scrolling element unless the user scrolled up to read
   function stickToBottom(el) {
     if (!el) return;
@@ -1908,6 +2193,7 @@
     NS.mode = mode === 'log' ? 'log' : 'chat';
     document.querySelectorAll('[data-chat-tab]').forEach(b => {
       b.classList.toggle('is-on', b.dataset.chatTab === NS.mode);
+      b.setAttribute('aria-selected', b.dataset.chatTab === NS.mode ? 'true' : 'false');
     });
     if (NS.mode === 'log') refreshMeta();
     renderLog();
@@ -1936,6 +2222,23 @@
     document.querySelectorAll('[data-chat-tab]').forEach(b => {
       b.addEventListener('click', () => setTab(b.dataset.chatTab));
     });
+
+    // Mode combo box (SVG / Extension): one dropdown instead of two buttons.
+    const modeSel = document.getElementById('chat-builder-mode');
+    const setBuilderMode = (mode) => {
+      NS.builderMode = mode === 'ext' ? 'ext' : 'svg';
+      if (modeSel) {
+        modeSel.value = NS.builderMode === 'ext' ? 'ext' : 'svg';
+      }
+      const inp = document.getElementById('chat-input');
+      if (inp) {
+        inp.placeholder = NS.builderMode === 'ext'
+          ? 'Describe a parametric CNC tool to build… (e.g. "coaster generator with inner pattern")'
+          : 'Describe a vector image… (Shift+Enter for a new line)';
+      }
+    };
+    if (modeSel) modeSel.addEventListener('change', () => setBuilderMode(modeSel.value));
+    setBuilderMode(NS.builderMode);
     // Pemilih model di panel chat: 🔄 memuat daftar dari provider aktif,
     // pilih -> tersimpan ke settings (judul panel ikut terupdate).
     const modelSel = document.getElementById('chat-model-sel');
@@ -1977,8 +2280,7 @@
       loadM(true);
     }
 
-    // Reasoning level quick-control (Off/Low/Normal). (Mode Agen/SVG and the
-    // Settings gear were removed — SVG is the only mode now.)
+    // Reasoning level quick-control (Off/Low/Normal).
     const thinkSel = document.getElementById('chat-think-sel');
     if (thinkSel) thinkSel.addEventListener('change', () => {
       if (window.setAiThinkLevelFromChat) window.setAiThinkLevelFromChat(thinkSel.value);
@@ -2006,30 +2308,10 @@
       if (!btn) return;
       btn.classList.toggle('is-stop', !!on);
       btn.textContent = on ? '■ Stop' : 'Send';
-      btn.title = on ? 'Hentikan permintaan yang sedang berjalan' : '';
+      btn.title = on ? 'Stop the running request' : '';
     };
-    const forkBtn = document.getElementById('chat-fork');
-    if (forkBtn) forkBtn.addEventListener('click', () => {
-      if (NS.activeAbort) return;
-      const firstUser = NS.log.find(m => m && m.role === 'user');
-      if (!firstUser) return;
-      const seedText = String(firstUser.text || '');
-      const seedImages = (Array.isArray(firstUser.images) && firstUser.images.length)
-        ? firstUser.images.slice()
-        : null;
-      archiveCurrentSession().then(() => {
-        NS.log = [];
-        NS.sessionId = newSessionId();
-        NS.sessionAt = Date.now();
-        lsSet(CURRENT_ID_KEY, NS.sessionId);
-        NS.pendingImages = seedImages || [];
-        renderPending();
-        setTab('chat');
-        renderLog();
-        scheduleSave();
-        send(seedText);
-      });
-    });
+    // NOTE: the Fork button is rendered inline under the first user message by
+    // renderLog/makeForkButton — there is no toolbar fork button any more.
 
     const newBtn = document.getElementById('chat-new');
     if (newBtn) newBtn.addEventListener('click', () => {
@@ -2066,4 +2348,5 @@
   NS.stateSummary = stateSummary;
   NS.renderLog = renderLog;
   NS.bridgeUrl = bridgeUrl;
+  NS.extractExtensionCode = extractExtensionCode;
 })();

@@ -88,6 +88,40 @@ func isGeminiBase(base string) bool {
 		strings.Contains(base, "generativelanguage.google.com")
 }
 
+// isLocalHost mendeteksi provider lokal/LAN (Ollama, LM Studio, llama.cpp,
+// vLLM) yang biasanya tidak memakai API key — parity dengan Node bridge
+// (ai-bridge.js isLocalHost).
+func isLocalHost(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	if strings.HasPrefix(h, "10.") || strings.HasPrefix(h, "192.168.") {
+		return true
+	}
+	for i := 16; i <= 31; i++ {
+		if strings.HasPrefix(h, fmt.Sprintf("172.%d.", i)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isGlmHost mendeteksi host GLM/z.ai (parity dengan Node isGlmHost) —
+// provider ini memakai flag `thinking` untuk mengendalikan reasoning.
+func isGlmHost(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return strings.Contains(h, "bigmodel.cn") || h == "z.ai" || strings.HasSuffix(h, ".z.ai")
+}
+
 // aiToolCall satu panggilan tool yang sudah dirakit: nama + argumen (objek).
 // Bentuk inilah yang dibaca chat.js: {name, arguments:{...}}.
 type aiToolCall struct {
@@ -95,11 +129,20 @@ type aiToolCall struct {
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
+// aiUsage menampung pemakaian token dari provider (parity dengan Node bridge:
+// event final SSE menyertakan `usage` bila tersedia).
+type aiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 // aiUpstreamResult adalah pesan assistant final yang sudah dirakit dari stream.
 type aiUpstreamResult struct {
 	Content   string
 	Reasoning string
 	ToolCalls []aiToolCall
+	Usage     *aiUsage
 }
 
 // normalizeAIBase menerima base URL dalam bentuk apa pun yang dipakai user
@@ -219,7 +262,7 @@ func aiGeminiParts(content json.RawMessage) []geminiPart {
 }
 
 // aiGeminiRequest menyusun body generateContent Gemini dari input gaya OpenAI.
-func aiGeminiRequest(req aiBridgeRequest, withThinking bool) (map[string]interface{}, error) {
+func aiGeminiRequest(req aiBridgeRequest, model, level string) (map[string]interface{}, error) {
 	var contents []map[string]interface{}
 	var sysText strings.Builder
 	push := func(role string, parts []geminiPart) {
@@ -296,19 +339,57 @@ func aiGeminiRequest(req aiBridgeRequest, withThinking bool) (map[string]interfa
 			body["tools"] = []map[string]interface{}{{"functionDeclarations": decls}}
 		}
 	}
-	if withThinking {
-		body["thinkingConfig"] = map[string]interface{}{"includeThinking": true}
+	if level != "" {
+		if tc := geminiThinkingConfig(model, level); tc != nil {
+			body["thinkingConfig"] = tc
+		}
 	}
 	return body, nil
+}
+
+// geminiThinkingConfig menyusun generationConfig.thinkingConfig sesuai level
+// reasoning ('off'|'low'|'normal') dan generasi model — parity dengan Node
+// ai-bridge.js geminiThinkingConfig.
+func geminiThinkingConfig(model, level string) map[string]interface{} {
+	off := level == "off"
+	low := level == "low"
+	m := strings.ToLower(model)
+	isGen34 := strings.HasPrefix(m, "gemini-3") || strings.HasPrefix(m, "gemini-4")
+	isGen25 := strings.HasPrefix(m, "gemini-2.5")
+	if off {
+		if isGen25 {
+			if strings.Contains(m, "pro") {
+				return map[string]interface{}{"includeThoughts": false, "thinkingBudget": 128}
+			}
+			return map[string]interface{}{"includeThoughts": false, "thinkingBudget": 0}
+		}
+		if isGen34 {
+			if strings.Contains(m, "flash-lite") {
+				return map[string]interface{}{"includeThoughts": false, "thinkingLevel": "MINIMAL"}
+			}
+			return map[string]interface{}{"includeThoughts": false, "thinkingLevel": "LOW"}
+		}
+		return nil
+	}
+	if low {
+		if isGen34 {
+			return map[string]interface{}{"includeThoughts": true, "thinkingLevel": "LOW"}
+		}
+		if isGen25 {
+			return map[string]interface{}{"includeThoughts": true, "thinkingBudget": 1024}
+		}
+		return map[string]interface{}{"includeThoughts": true}
+	}
+	return map[string]interface{}{"includeThoughts": true}
 }
 
 // aiCallGeminiUpstream: SATU permintaan streaming ke Gemini
 // (…/v1beta/models/{model}:streamGenerateContent?alt=sse). Mengurai part
 // thought -> thinking, text -> content, functionCall -> tool_calls.
-func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBridgeRequest, withThinking bool, onDelta aiDeltaFn) (aiUpstreamResult, error) {
+func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBridgeRequest, level string, onDelta aiDeltaFn) (aiUpstreamResult, error) {
 	var out aiUpstreamResult
 
-	payload, err := aiGeminiRequest(req, withThinking)
+	payload, err := aiGeminiRequest(req, model, level)
 	if err != nil {
 		return out, fmt.Errorf("gemini request: %w", err)
 	}
@@ -348,6 +429,12 @@ func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBr
 					Parts []geminiPart `json:"parts"`
 				} `json:"content"`
 			} `json:"candidates"`
+			UsageMetadata *struct {
+				PromptTokenCount     int `json:"promptTokenCount"`
+				CandidatesTokenCount int `json:"candidatesTokenCount"`
+				ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+				TotalTokenCount      int `json:"totalTokenCount"`
+			} `json:"usageMetadata"`
 			Error *struct {
 				Message string `json:"message"`
 			} `json:"error"`
@@ -382,6 +469,15 @@ func aiCallGeminiUpstream(ctx context.Context, base, key, model string, req aiBr
 				out.ToolCalls = append(out.ToolCalls, aiToolCall{Name: part.FunctionCall.Name, Arguments: sanitizeAIArgs(args)})
 			}
 		}
+		if um := ev.UsageMetadata; um != nil {
+			pt := um.PromptTokenCount
+			ct := um.CandidatesTokenCount + um.ThoughtsTokenCount
+			total := um.TotalTokenCount
+			if total == 0 {
+				total = pt + ct
+			}
+			out.Usage = &aiUsage{PromptTokens: pt, CompletionTokens: ct, TotalTokens: total}
+		}
 	})
 	if err != nil {
 		return out, err
@@ -414,7 +510,10 @@ func (a *App) HandleAIChat(w http.ResponseWriter, r *http.Request) {
 	base := normalizeAIBase(req.Settings.BaseURL)
 	key := strings.TrimSpace(req.Settings.APIKey)
 	model := strings.TrimSpace(req.Settings.Model)
-	if base == "" || key == "" {
+	gemini := isGeminiBase(base)
+	local := !gemini && isLocalHost(base)
+	// Parity dengan Node bridge: provider lokal/OLLama tidak wajib API key.
+	if base == "" || (key == "" && !local) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, `{"error":"No API key or base URL. Isi \"AI API base URL\" dan \"AI API key\" di Settings › AI chat."}`)
@@ -458,24 +557,23 @@ func (a *App) HandleAIChat(w http.ResponseWriter, r *http.Request) {
 	//   normal -> reasoning penuh
 	// Bila provider menolak flag (400), coba sekali lagi tanpa flag.
 	ctx := r.Context()
-	gemini := isGeminiBase(base)
 	thinkRaw := strings.ToLower(strings.TrimSpace(req.Settings.Thinking))
 	wantThink := thinkRaw != "off"
 	lowThink := thinkRaw == "low"
 
-	call := func(withThinking bool) (aiUpstreamResult, error) {
+	call := func(withThinking, bare bool) (aiUpstreamResult, error) {
 		if gemini {
-			return aiCallGeminiUpstream(ctx, base, key, model, req, withThinking, send)
+			return aiCallGeminiUpstream(ctx, base, key, model, req, thinkRaw, send)
 		}
-		return aiCallUpstream(ctx, base, key, model, req, withThinking, lowThink && withThinking, send)
+		return aiCallUpstream(ctx, base, key, model, req, withThinking, lowThink && withThinking, bare, send)
 	}
 
-	upstream, err := call(wantThink)
+	upstream, err := call(wantThink, false)
 	if err != nil && isAIStatus(err, 400) {
 		if SHOWDEBUG {
-			logf("[ai] provider menolak flag thinking (400) — mencoba ulang tanpa flag")
+			logf("[ai] provider menolak flag thinking/usage (400) — mencoba ulang tanpa flag")
 		}
-		upstream, err = call(false)
+		upstream, err = call(false, true)
 	}
 	if err != nil && isAIStatus(err, 429) {
 		// 429 = batas sesi/rate. Tunggu sekali lalu ulang: provider biasanya
@@ -484,7 +582,7 @@ func (a *App) HandleAIChat(w http.ResponseWriter, r *http.Request) {
 			logf("[ai] upstream 429 — menunggu 6 detik, mencoba sekali lagi")
 		}
 		time.Sleep(6 * time.Second)
-		upstream, err = call(wantThink)
+		upstream, err = call(wantThink, false)
 	}
 	if err != nil {
 		text := err.Error()
@@ -496,15 +594,19 @@ func (a *App) HandleAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	thinking := upstream.Reasoning
-	if len(thinking) > 4000 {
-		thinking = thinking[:4000]
+	if len(thinking) > 8000 {
+		thinking = thinking[:8000]
 	}
-	send(map[string]interface{}{
+	event := map[string]interface{}{
 		"done":       true,
 		"reply":      upstream.Content,
 		"thinking":   thinking,
 		"tool_calls": upstream.ToolCalls,
-	})
+	}
+	if upstream.Usage != nil {
+		event["usage"] = upstream.Usage
+	}
+	send(event)
 }
 
 // HandleAIModels adalah endpoint POST /api/models: daftar model Gemini yang bisa
@@ -533,7 +635,7 @@ func (a *App) HandleAIModels(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"error":"Base URL kosong — pilih provider atau isi AI API base URL."}`)
 		return
 	}
-	if key == "" {
+	if key == "" && !isLocalHost(base) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, `{"error":"Isi dulu AI API key."}`)
@@ -626,8 +728,8 @@ func (a *App) HandleAIModels(w http.ResponseWriter, r *http.Request) {
 			prev = n
 		}
 	}
-	if len(uniq) > 200 {
-		uniq = uniq[:200]
+	if len(uniq) > 300 {
+		uniq = uniq[:300]
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"models": uniq})
@@ -647,24 +749,34 @@ type aiDeltaFn func(obj interface{})
 // dan merakit hasilnya. onDelta dipakai untuk mengirim delta live ke frontend.
 // lowThink menambahkan reasoning_effort=low (didukung GLM/z.ai; tidak ada
 // dampak jika provider mengabaikannya).
-func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRequest, withThinking, lowThink bool, onDelta aiDeltaFn) (aiUpstreamResult, error) {
+func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRequest, withThinking, lowThink, bare bool, onDelta aiDeltaFn) (aiUpstreamResult, error) {
 	var out aiUpstreamResult
 
 	payload := map[string]interface{}{
-		"model":       model,
-		"messages":    req.Messages,
-		"stream":      true,
-		"tool_choice": "auto",
+		"model":    model,
+		"messages": req.Messages,
+		"stream":   true,
 	}
+	// tool_choice hanya dikirim bila ada tools — beberapa provider
+	// OpenAI-compatible menolak (400) `tool_choice:"auto"` tanpa `tools`
+	// (mode SVG mengirim tools kosong). Parity dengan Node openaiRequest.
 	if len(req.Tools) > 0 {
 		payload["tools"] = req.Tools
+		payload["tool_choice"] = "auto"
 	}
-	if withThinking {
-		// Minta model GLM-family mengalirkan penalarannya. Bila provider menolak,
-		// pemanggil mencoba ulang tanpa flag ini.
-		payload["thinking"] = map[string]string{"type": "enabled"}
+	if !bare {
+		payload["stream_options"] = map[string]interface{}{"include_usage": true}
 	}
-	if lowThink {
+	glm := isGlmHost(base)
+	if glm {
+		// Model GLM-family: reasoning dikendalikan via flag `thinking`.
+		if withThinking {
+			payload["thinking"] = map[string]string{"type": "enabled"}
+		} else {
+			payload["thinking"] = map[string]string{"type": "disabled"}
+		}
+	}
+	if lowThink && withThinking {
 		payload["reasoning_effort"] = "low"
 	}
 	body, err := json.Marshal(payload)
@@ -695,6 +807,7 @@ func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRe
 	content := &strings.Builder{}
 	reasoning := &strings.Builder{}
 	tcb := map[int]*aiTCSlot{}
+	var usage *aiUsage
 
 	// forward menerbitkan satu event delta SSE {delta:{thinking|content}} —
 	// bentuk persis yang dibaca chat.js. onDelta = send (func(interface{})).
@@ -725,6 +838,11 @@ func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRe
 					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
 		}
 		if json.Unmarshal([]byte(data), &chunk) != nil || len(chunk.Choices) == 0 {
 			return
@@ -759,6 +877,13 @@ func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRe
 				slot.args.WriteString(tc.Function.Arguments)
 			}
 		}
+		if chunk.Usage != nil {
+			u := chunk.Usage
+			if u.TotalTokens == 0 {
+				u.TotalTokens = u.PromptTokens + u.CompletionTokens
+			}
+			usage = &aiUsage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+		}
 	})
 	if err != nil {
 		return out, err
@@ -767,6 +892,7 @@ func aiCallUpstream(ctx context.Context, base, key, model string, req aiBridgeRe
 	out.Content = content.String()
 	out.Reasoning = reasoning.String()
 	out.ToolCalls = assembleAIToolCalls(tcb)
+	out.Usage = usage
 	return out, nil
 }
 

@@ -264,6 +264,10 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	// di webview Wails; tanpa ini browser mode 404).
 	mux.HandleFunc("/api/chat", app.HandleAIChat)
 	mux.HandleFunc("/api/models", app.HandleAIModels)
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/api/marketplace/catalog", app.handleMarketplaceAPI)
+	mux.HandleFunc("/api/marketplace/publish", app.handleMarketplaceAPI)
+	mux.HandleFunc("/api/marketplace/extensions/", app.handleMarketplaceAPI)
 	// web update: serve from cache if fresh copy exists, else embedded
 	if dir := webAssetDir(); dir != "" {
 		mux.Handle("/", serveWebAsset(dir, embedded))

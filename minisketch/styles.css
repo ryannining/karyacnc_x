@@ -337,8 +337,11 @@ button {
 .btn:hover { background: var(--surface-2-hover); }
 .btn:active { transform: translateY(1px); }
 /* `.btn` sets display, which beats the UA rule for [hidden]; this keeps the
-   hidden ATTRIBUTE meaningful so JS can show/hide a button with .hidden = true */
+   hidden ATTRIBUTE meaningful so JS can show/hide a button with .hidden = true.
+   Same guard for flex `.row` bars (chat model row, input row, …): ai/chat.js
+   toggles .hidden on them when switching Chat ↔ History. */
 .btn[hidden] { display: none; }
+.row[hidden] { display: none; }
 
 .btn.ghost {
   background: transparent;
@@ -3571,9 +3574,55 @@ body.wall-drag-active .stage::after {
 }
 
 /* AI chat tab: reuse .panel/.row/.list/.btn, only the log needs wrapping lines */
+/* ---- AI Chat: ribbon-style tab strip (Chat | History) ------------------- */
+.chat-tabs {
+  display: flex;
+  gap: 3px;
+  border-bottom: 1px solid var(--line);
+  /* span the full panel width (cancel .panel-body's side padding) so the
+     ribbon edge runs edge-to-edge like a real tab strip */
+  margin: 0 -12px 7px;
+  padding: 0 9px;
+}
+.chat-tab {
+  appearance: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 16px 6px;
+  cursor: pointer;
+  flex: 0 1 auto;
+}
+.chat-tab:hover {
+  color: var(--text-2);
+  background: var(--surface-2);
+}
+.chat-tab.is-on {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 600;
+  /* overlap the strip's bottom border so the active tab reads as connected
+     to the panel content below it (folder-tab look, not a button) */
+  margin-bottom: -1px;
+  padding-bottom: 7px;
+}
+.chat-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 .chat-model-row {
   margin-bottom: 5px;
   gap: 5px;
+  /* Divider between the model row and the mode/New Session bar below it. */
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 7px;
 }
 .chat-model-row .muted {
   font-size: 10.5px;
@@ -3644,7 +3693,6 @@ body.wall-drag-active .stage::after {
   font-size: 10px;
   color: var(--muted);
 }
-.tab-bar .btn { flex: 1 1 auto; }
 #chat-log li.chat-error { border-color: color-mix(in srgb, #ff0000 45%, transparent); }
 /* archived session rows (LOG tab): override the message-block li layout */
 #chat-log li.chat-session { display: flex; align-items: center; gap: 7px; }
@@ -3928,3 +3976,398 @@ details.chat-think summary:hover { color: #00c96a; }
   flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis;
 }
 .font-pick-empty { padding: 8px; font-size: 11px; color: var(--faint); }
+
+/* ---- AI Extension Builder & Tools Extensions Marketplace --------------- */
+.chat-builder-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+.chat-builder-bar select {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+}
+.chat-builder-bar .btn {
+  flex: 0 0 auto;
+  text-align: center;
+}
+
+.chat-ext {
+  margin-top: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2, var(--surface));
+}
+.chat-ext-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.chat-ext-title {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.chat-ext-ic {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  flex: 0 0 auto;
+}
+.chat-ext-ic svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+.chat-ext-title .muted {
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.chat-ext-status {
+  font-size: 10.5px;
+  line-height: 1.35;
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+.chat-ext-status.is-ok { color: #16a34a; }
+.chat-ext-status.is-err { color: #dc2626; }
+.chat-ext-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+details.chat-ext-code {
+  margin-top: 6px;
+  font-size: 10.5px;
+}
+details.chat-ext-code summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+details.chat-ext-code pre {
+  margin: 5px 0 0;
+  padding: 6px 8px;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.4;
+  white-space: pre;
+}
+
+.ext-panel-foot {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 4px;
+}
+.ext-panel-foot .btn {
+  flex: 1 1 0;
+  text-align: center;
+}
+
+.ext-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.ext-btn-ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--ink);
+}
+.ext-btn-ic svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+.ext-btn-lbl {
+  line-height: 1.2;
+}
+.ext-btn-ver {
+  font-size: 9.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.modal-box.ext-box {
+  width: min(740px, calc(100vw - 28px));
+  max-height: calc(100dvh - 28px);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  overflow: hidden;
+}
+.ext-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.ext-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.ext-head-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ext-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.ext-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+.ext-pane[hidden] { display: none; }
+
+.ext-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.ext-toolbar-wrap {
+  flex-wrap: wrap;
+}
+.ext-toolbar-stack {
+  flex-direction: column;
+  align-items: stretch;
+}
+.ext-toolbar-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ext-input,
+.ext-select {
+  flex: 1 1 160px;
+  min-width: 0;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--ink);
+  background: var(--input, var(--surface-2));
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  box-sizing: border-box;
+}
+.ext-input:focus,
+.ext-select:focus,
+.ext-code:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ext-select {
+  flex: 0 1 180px;
+}
+
+.ext-list {
+  flex: 1 1 auto;
+  min-height: 220px;
+  max-height: 52vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2, var(--bg));
+}
+.ext-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+}
+.ext-row:last-child { border-bottom: none; }
+.ext-row.is-disabled { opacity: 0.68; }
+.ext-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ext-row-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ext-row-ic {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  flex: 0 0 auto;
+}
+.ext-row-ic svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.ext-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.ext-meta {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ext-row-desc {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-2, var(--muted));
+  line-height: 1.35;
+}
+.ext-row-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.ext-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--ink);
+  cursor: pointer;
+  margin-right: 4px;
+  user-select: none;
+}
+.ext-toggle input { accent-color: var(--accent); }
+.ext-empty {
+  padding: 22px 14px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.ext-empty.is-err { color: #dc2626; }
+
+.ext-code {
+  width: 100%;
+  min-height: 210px;
+  resize: vertical;
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--input, var(--bg));
+  color: var(--ink);
+}
+.ext-code-sm {
+  min-height: 120px;
+}
+.ext-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+}
+.ext-status {
+  font-size: 11px;
+  line-height: 1.4;
+  min-height: 16px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.ext-status.is-ok { color: #16a34a; }
+.ext-status.is-err { color: #dc2626; }
+
+.ext-pane-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ext-publish-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 10px;
+}
+.ext-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.ext-field-full {
+  grid-column: 1 / -1;
+}
+.ext-target-box {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2, var(--bg));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ext-target-box[hidden] { display: none; }
+.ext-pub-row-actions {
+  justify-content: flex-end;
+}
+.ext-pub-row-actions .ext-toggle {
+  margin-right: auto;
+}
+@media (max-width: 620px) {
+  .ext-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ext-publish-grid {
+    grid-template-columns: 1fr;
+  }
+}
+

@@ -847,6 +847,15 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	// Marketplace & /health (parity dengan Node bridge).
+	if strings.HasPrefix(r.URL.Path, "/api/marketplace/") {
+		a.handleMarketplaceAPI(w, r)
+		return
+	}
+	if r.URL.Path == "/health" {
+		handleHealth(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/api/origin":
 		a.handleRajaOngkirOrigin(w, r)
