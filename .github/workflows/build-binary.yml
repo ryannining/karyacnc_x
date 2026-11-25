@@ -134,15 +134,23 @@ jobs:
 
       - name: Delete old binary releases
         run: |
-          # simpan hanya release binary terbaru — versi lama dihapus biar
-          # customer tidak salah download.
+          # Versi sama boleh dipakai ulang: hapus dulu release/tag saat ini
+          # kalau sudah ada (CI tidak bisa membuat release dengan tag yang ada).
+          # Sekalian bersihkan versi binary lama (v1.0.0 atau 1.0.0), sisakan
+          # hanya yang sedang dibangun.
           CURRENT="${{ github.event.inputs.version }}"
-          gh release list --limit 50 --json tagName,isDraft --jq '.[] | select(.tagName | test("^v[0-9]+\\.")) | .tagName' | while read -r tag; do
-            if [ "$tag" != "$CURRENT" ]; then
-              echo "hapus release lama: $tag"
-              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-            fi
-          done
+          if gh release view "$CURRENT" >/dev/null 2>&1; then
+            echo "hapus release saat ini (reuse): $CURRENT"
+            gh release delete "$CURRENT" --yes --cleanup-tag
+          fi
+          gh release list --limit 50 --json tagName --jq '.[].tagName' \
+            | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | while read -r tag; do
+              if [ "$tag" != "$CURRENT" ]; then
+                echo "hapus release lama: $tag"
+                gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+              fi
+            done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -39,8 +39,18 @@ done
 
 cd "$SHARE"
 
-# ===== 1) Commit + push =====
-if $DO_COMMIT; then
+# Deteksi apakah ada perubahan sama sekali (working tree kotor, staged, atau
+# commit lokal belum ter-push). Kalau tidak ada, lewati push + CI Build Web.
+CHANGES_DETECTED=false
+if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git status -s)" ]; then
+    CHANGES_DETECTED=true
+fi
+if [ "$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
+    CHANGES_DETECTED=true
+fi
+
+# ===== 1) Commit (hanya kalau ada perubahan) =====
+if $DO_COMMIT && $CHANGES_DETECTED; then
     if [ -z "$COMMIT_MSG" ]; then
         echo "=== File berubah: ==="
         git status -s | head -20
@@ -48,13 +58,14 @@ if $DO_COMMIT; then
         read -rp "Commit message: " COMMIT_MSG
         [ -z "$COMMIT_MSG" ] && { echo "Commit message kosong. Batal." >&2; exit 1; }
     fi
-    if git diff --quiet && git diff --cached --quiet && [ -z "$(git status -s)" ]; then
-        echo ">>> Tidak ada perubahan. Skip commit."
-    else
-        git add -A
-        git commit -m "$COMMIT_MSG"
-        echo ">>> Commit: $COMMIT_MSG"
-    fi
+    git add -A
+    git commit -m "$COMMIT_MSG"
+    echo ">>> Commit: $COMMIT_MSG"
+fi
+
+if ! $CHANGES_DETECTED; then
+    echo ">>> Tidak ada perubahan. Skip push dan CI Build Web."
+    exit 0
 fi
 
 echo ">>> Push ke GitHub..."
@@ -85,6 +96,18 @@ if $DO_BINARY; then
     fi
     if [ -n "$VERSION" ]; then
         BIN_VER="$VERSION"
+
+        # Versi yang sama boleh dipakai ulang: release/tag lama dihapus dulu,
+        # karena CI Build Binary tidak bisa membuat release dengan tag yang sudah
+        # ada. Hapus release + tag sekaligus (atau tag sisa kalau tidak ada release).
+        if gh release view "$VERSION" -R "$REPO" >/dev/null 2>&1; then
+            echo ">>> Release $VERSION sudah ada — hapus dulu (release + tag)."
+            gh release delete "$VERSION" -R "$REPO" --yes --cleanup-tag
+        elif git ls-remote --tags origin "refs/tags/$VERSION" | grep -q .; then
+            echo ">>> Tag $VERSION sudah ada tanpa release — hapus tag dulu."
+            git push origin ":refs/tags/$VERSION"
+        fi
+
         echo ">>> Trigger Build Binary $VERSION..."
         gh workflow run "Build Binary" -f version="$VERSION"
 
