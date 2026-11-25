@@ -77,19 +77,39 @@ jobs:
           # di-delete/recreate. Delete+create berulang menyebabkan race yang
           # meninggalkan release dalam status draft (tidak bisa diakses publik
           # via URL download). Asset di-update dengan --clobber.
+          retry() {
+            local n=$1; shift
+            local i
+            for i in $(seq 1 "$n"); do
+              if "$@"; then return 0; fi
+              echo "retry $i/$n gagal — tunggu..." >&2
+              sleep $((i * 5))
+            done
+            return 1
+          }
           if ! gh release view web-latest > /dev/null 2>&1; then
-            gh release create web-latest \
+            retry 5 gh release create web-latest \
               --title "Web (rolling)" \
               --notes "Auto-generated web build (frontend + minisketch + invoice)" \
               --latest
           fi
-          gh release edit web-latest --draft=false --latest
+          retry 5 gh release edit web-latest --draft=false --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update release notes
         run: |
-          gh release edit web-latest --title "Web $VERSION" --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" --latest
+          retry() {
+            local n=$1; shift
+            local i
+            for i in $(seq 1 "$n"); do
+              if "$@"; then return 0; fi
+              echo "retry $i/$n gagal — tunggu..." >&2
+              sleep $((i * 5))
+            done
+            return 1
+          }
+          retry 5 gh release edit web-latest --title "Web $VERSION" --notes "Auto-generated web build $VERSION (frontend + minisketch + invoice)" --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
