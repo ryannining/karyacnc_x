@@ -13,6 +13,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if web assets changed
+        run: |
+          # Build Web hanya perlu jalan kalau ada perubahan pada bundle web
+          # (frontend/ minisketch/ tools_invoice/). Push yang cuma menyentuh
+          # script/Go/dokumentasi (mis. release.sh) langsung di-skip.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger — build web tetap jalan."
+            exit 0
+          fi
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "Push awal — build web tetap jalan."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE"...HEAD | grep -E '^(frontend|minisketch|tools_invoice)/' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "Tidak ada perubahan frontend/minisketch/tools_invoice — skip Build Web."
+            exit 0
+          fi
+          echo "Perubahan web terdeteksi, lanjut build."
 
       - uses: actions/setup-node@v4
         with:
@@ -122,6 +145,16 @@ jobs:
             rel="${f#./}"
             cp "$f" "/tmp/upload/${rel//\//__}"
           done)
-          gh release upload web-latest /tmp/upload/* --clobber --repo ${{ github.repository }}
+          retry() {
+            local n=$1; shift
+            local i
+            for i in $(seq 1 "$n"); do
+              if "$@"; then return 0; fi
+              echo "retry $i/$n gagal — tunggu..." >&2
+              sleep $((i * 8))
+            done
+            return 1
+          }
+          retry 6 gh release upload web-latest /tmp/upload/* --clobber --repo ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
