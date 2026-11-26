@@ -842,6 +842,7 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -900,6 +901,20 @@ func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	case "/save-sketch", "/save_sketch":
 		a.handleSaveSketch(w, r)
+		return
+	case "/api/system-fonts":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", 405)
+			return
+		}
+		handleSystemFonts(w, r)
+		return
+	case "/api/system-font-bytes":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", 405)
+			return
+		}
+		handleSystemFontBytes(w, r)
 		return
 	default:
 		// Handle /sketcher prefix for minisketch
