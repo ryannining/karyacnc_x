@@ -127,6 +127,27 @@ export namespace http {
 
 }
 
+export namespace main {
+	
+	export class SystemFontInfo {
+	    family: string;
+	    style: string;
+	    file: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SystemFontInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.family = source["family"];
+	        this.style = source["style"];
+	        this.file = source["file"];
+	    }
+	}
+
+}
+
 export namespace multipart {
 	
 	export class FileHeader {

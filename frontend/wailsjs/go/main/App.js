@@ -86,6 +86,10 @@ export function StartWSServer(arg1) {
   return window['go']['main']['App']['StartWSServer'](arg1);
 }
 
+export function SystemFonts() {
+  return window['go']['main']['App']['SystemFonts']();
+}
+
 export function UploadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['UploadFile'](arg1, arg2, arg3);
 }
