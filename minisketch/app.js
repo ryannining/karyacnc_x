@@ -62,8 +62,8 @@
   const CNC_CODES = COLORS.map(c => c.value);
 
   // Above this many entities the renderer switches to its cheap path (colour
-  // batching, no point handles), which is what keeps an imported drawing usable.
-  const BULK_ENTITIES = 1200;
+  // batching), which keeps medium and large drawings fast on onboard GPUs.
+  const BULK_ENTITIES = 48;
 
   // The CNC tolerance, in millimetres: whatever is closer than this is one joint.
   // It decides when a selection walks on (N), when an imported path counts as
@@ -80,7 +80,11 @@
   const PART_COLOR = '#15803d';
 
   const canvas = document.getElementById('canvas');
-  const ctx = canvas.getContext('2d');
+  // alpha:false skips browser page compositing on the opaque CAD viewport
+  // (noticeable win on Intel onboard GPUs). `ctx` is rebound temporarily when
+  // baking the static scene backdrop so every draw pass shares one code path.
+  const mainCtx = canvas.getContext('2d', { alpha: false }) || canvas.getContext('2d');
+  let ctx = mainCtx;
   const stage = document.getElementById('stage');
   const fileInput = document.getElementById('file-input');
   // Base directory of THIS script, not of the document: served under a subpath
@@ -182,21 +186,26 @@
   // drawOneEntity asks this per entity per frame; the palette is tiny
   const themeColorMemo = new Map();
 
-  function themeCanvas() {
-    const proto = Object.getPrototypeOf(ctx);
+  function themeContext(targetCtx) {
+    if (!targetCtx) return;
+    const proto = Object.getPrototypeOf(targetCtx);
     for (const prop of ['strokeStyle', 'fillStyle']) {
       const desc = Object.getOwnPropertyDescriptor(proto, prop);
       if (!desc || !desc.set) continue;
       let current;
-      Object.defineProperty(ctx, prop, {
+      Object.defineProperty(targetCtx, prop, {
         configurable: true,
         get() { return current; },
         set(v) {
           current = typeof v === 'string' ? themedCanvasColor(v) : v;
-          desc.set.call(ctx, current);
+          desc.set.call(targetCtx, current);
         }
       });
     }
+  }
+
+  function themeCanvas() {
+    themeContext(mainCtx);
   }
 
   function applyTheme(name, opts) {
@@ -1770,7 +1779,10 @@
     }
     const inp = document.getElementById('chat-input');
     if (inp) {
-      inp.placeholder = 'Describe a vector image… (Shift+Enter for a new line)';
+      const isExt = !!(window.MiniSketchAI && window.MiniSketchAI.builderMode === 'ext');
+      inp.placeholder = isExt
+        ? 'Describe a parametric CNC tool to build… (e.g. "coaster generator with inner pattern")'
+        : 'Describe a vector image… (Shift+Enter for a new line)';
     }
   }
   window.syncAiQuickControls = syncAiQuickControls;
@@ -1846,7 +1858,6 @@
     if (cnc) cnc.tol = settings.cncFlatten;
     // the text tracer caches by raster size, so drop it whenever it changes
     if (textTraceCache && textTraceCache.clear) textTraceCache.clear();
-    syncWallInput();
     syncWallIndicator();
     invalidateLoops();
     if (W > 1) resize();   // pick up the new canvas quality and repaint
@@ -2579,7 +2590,7 @@
   // split sites); treat the return value as read-only.
   const epiCache = new Map();
   function entityPointIds(e) {
-    const eid = e.id;
+    const eid = e.id != null ? +e.id : null;
     const hit = eid != null ? epiCache.get(eid) : null;
     if (hit) return hit;
     const out = entityPointIdsBuild(e);
@@ -3129,8 +3140,202 @@
     return mult * pow;
   }
 
+  // Fast structured history snapshots: points pack into TypedArrays and spline
+  // handles pack into flat Float64Arrays instead of running JSON.stringify /
+  // JSON.parse over the entire document. On restore (undo/redo), applySnapshot
+  // diffs in-place against `state` so untouched splines and closed-spline loops
+  // keep their geometry caches warm.
+  function deepClonePlain(v) {
+    if (v === null || typeof v !== 'object') return v;
+    if (Array.isArray(v)) {
+      const out = new Array(v.length);
+      for (let i = 0; i < v.length; i++) out[i] = deepClonePlain(v[i]);
+      return out;
+    }
+    const out = {};
+    for (const k in v) {
+      if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = deepClonePlain(v[k]);
+    }
+    return out;
+  }
+
+  function cloneEntityForSnapshot(e) {
+    if (!e) return e;
+    const t = e.type;
+    if (t === 'line' || t === 'circle' || t === 'arc' || t === 'note') {
+      const out = {};
+      for (const k in e) {
+        if (!Object.prototype.hasOwnProperty.call(e, k)) continue;
+        const v = e[k];
+        out[k] = (v !== null && typeof v === 'object') ? deepClonePlain(v) : v;
+      }
+      return out;
+    }
+    if (t === 'spline') {
+      const out = {};
+      for (const k in e) {
+        if (!Object.prototype.hasOwnProperty.call(e, k)) continue;
+        if (k === 'pts' || k === 'sharp' || k === 'hs') continue;
+        const v = e[k];
+        out[k] = (v !== null && typeof v === 'object') ? deepClonePlain(v) : v;
+      }
+      if (Array.isArray(e.pts)) out.pts = e.pts.slice();
+      if (Array.isArray(e.sharp)) out.sharp = e.sharp.slice();
+      if (e.hs && Array.isArray(e.hs.o) && Array.isArray(e.hs.i) && e.hs.o.length === e.hs.i.length) {
+        const o = e.hs.o, ii = e.hs.i, n = o.length;
+        const flat = new Float64Array(n * 4);
+        let mask = null;
+        for (let k = 0; k < n; k++) {
+          const ho = o[k], hi = ii[k];
+          if (ho) { flat[k * 4] = ho.x; flat[k * 4 + 1] = ho.y; }
+          else { if (!mask) mask = new Uint8Array(n); mask[k] |= 1; }
+          if (hi) { flat[k * 4 + 2] = hi.x; flat[k * 4 + 3] = hi.y; }
+          else { if (!mask) mask = new Uint8Array(n); mask[k] |= 2; }
+        }
+        out.hs = null;
+        out._hsFlat = flat;
+        out._hsMask = mask;
+        out._hsLen = n;
+      } else if (e.hs != null) {
+        out.hs = deepClonePlain(e.hs);
+      } else {
+        out.hs = null;
+      }
+      return out;
+    }
+    return deepClonePlain(e);
+  }
+
+  function restoreEntityFromSnapshot(se) {
+    if (!se) return se;
+    const t = se.type;
+    if (t === 'line' || t === 'circle' || t === 'arc' || t === 'note') {
+      const out = {};
+      for (const k in se) {
+        if (!Object.prototype.hasOwnProperty.call(se, k)) continue;
+        const v = se[k];
+        out[k] = (v !== null && typeof v === 'object') ? deepClonePlain(v) : v;
+      }
+      return out;
+    }
+    if (t === 'spline') {
+      const out = {};
+      for (const k in se) {
+        if (!Object.prototype.hasOwnProperty.call(se, k)) continue;
+        if (k === 'pts' || k === 'sharp' || k === 'hs' || k === '_hsFlat' || k === '_hsMask' || k === '_hsLen') continue;
+        const v = se[k];
+        out[k] = (v !== null && typeof v === 'object') ? deepClonePlain(v) : v;
+      }
+      if (Array.isArray(se.pts)) out.pts = se.pts.slice();
+      if (Array.isArray(se.sharp)) out.sharp = se.sharp.slice();
+      if (se._hsFlat) {
+        const flat = se._hsFlat, mask = se._hsMask, n = se._hsLen || 0;
+        const o = new Array(n), ii = new Array(n);
+        for (let k = 0; k < n; k++) {
+          const m = mask ? mask[k] : 0;
+          o[k] = (m & 1) ? null : { x: flat[k * 4], y: flat[k * 4 + 1] };
+          ii[k] = (m & 2) ? null : { x: flat[k * 4 + 2], y: flat[k * 4 + 3] };
+        }
+        out.hs = { o, i: ii };
+      } else if (se.hs != null) {
+        out.hs = deepClonePlain(se.hs);
+      } else {
+        out.hs = null;
+      }
+      return out;
+    }
+    return deepClonePlain(se);
+  }
+
+  function entityMatchesSnapshot(cur, se) {
+    if (!cur || !se || cur.type !== se.type) return false;
+    const t = cur.type;
+    if (t !== 'line' && t !== 'circle' && t !== 'arc' && t !== 'note' && t !== 'spline') return false;
+    // Any extra nested property (e.g. gen, guide) triggers a safe restore.
+    let curKeys = 0, seKeys = 0;
+    for (const k in cur) {
+      if (!Object.prototype.hasOwnProperty.call(cur, k)) continue;
+      if (t === 'spline' && (k === 'pts' || k === 'sharp' || k === 'hs')) continue;
+      curKeys++;
+      const cv = cur[k], sv = se[k];
+      if ((cv !== null && typeof cv === 'object') || (sv !== null && typeof sv === 'object')) return false;
+      if (cv !== sv) return false;
+    }
+    for (const k in se) {
+      if (!Object.prototype.hasOwnProperty.call(se, k)) continue;
+      if (t === 'spline' && (k === 'pts' || k === 'sharp' || k === 'hs' || k === '_hsFlat' || k === '_hsMask' || k === '_hsLen')) continue;
+      seKeys++;
+    }
+    if (curKeys !== seKeys) return false;
+    if (t !== 'spline') return true;
+    const cp = cur.pts, sp = se.pts;
+    if (!Array.isArray(cp) || !Array.isArray(sp) || cp.length !== sp.length) return false;
+    for (let k = 0; k < cp.length; k++) if (cp[k] !== sp[k]) return false;
+    const cs = cur.sharp, ss = se.sharp;
+    if (!!cs !== !!ss) return false;
+    if (cs && ss) {
+      if (cs.length !== ss.length) return false;
+      for (let k = 0; k < cs.length; k++) if (!!cs[k] !== !!ss[k]) return false;
+    }
+    if (!se._hsFlat) return se.hs == null && !cur.hs;
+    if (!cur.hs || !Array.isArray(cur.hs.o) || !Array.isArray(cur.hs.i)) return false;
+    const n = se._hsLen || 0;
+    if (cur.hs.o.length !== n || cur.hs.i.length !== n) return false;
+    const flat = se._hsFlat, mask = se._hsMask;
+    const co = cur.hs.o, ci = cur.hs.i;
+    for (let k = 0; k < n; k++) {
+      const m = mask ? mask[k] : 0;
+      const ho = co[k], hi = ci[k];
+      if (m & 1) { if (ho) return false; }
+      else if (!ho || ho.x !== flat[k * 4] || ho.y !== flat[k * 4 + 1]) return false;
+      if (m & 2) { if (hi) return false; }
+      else if (!hi || hi.x !== flat[k * 4 + 2] || hi.y !== flat[k * 4 + 3]) return false;
+    }
+    return true;
+  }
+
   function snapshot() {
-    return JSON.stringify({ state, view });
+    const pts = state.points;
+    const pKeys = Object.keys(pts);
+    const n = pKeys.length;
+    const ptIds = new Int32Array(n);
+    const ptXY = new Float64Array(n * 2);
+    const ptFixed = new Uint8Array(n);
+    let ptExtra = null;
+    for (let i = 0; i < n; i++) {
+      const k = pKeys[i];
+      const p = pts[k];
+      const id = +k;
+      ptIds[i] = id;
+      ptXY[i * 2] = p.x;
+      ptXY[i * 2 + 1] = p.y;
+      ptFixed[i] = (p.fixed ? 1 : 0) | (p.pr ? 2 : 0);
+      for (const pk in p) {
+        if (pk !== 'id' && pk !== 'x' && pk !== 'y' && pk !== 'fixed' && pk !== 'pr') {
+          if (!ptExtra) ptExtra = new Map();
+          let ex = ptExtra.get(id);
+          if (!ex) { ex = {}; ptExtra.set(id, ex); }
+          ex[pk] = deepClonePlain(p[pk]);
+        }
+      }
+    }
+    const entities = {};
+    for (const k in state.entities) entities[k] = cloneEntityForSnapshot(state.entities[k]);
+    const constraints = {};
+    for (const k in state.constraints) constraints[k] = deepClonePlain(state.constraints[k]);
+    const mates = {};
+    for (const k in state.mates) mates[k] = deepClonePlain(state.mates[k]);
+    const layers = (state.layers || []).map(l => ({
+      id: l.id, name: l.name, visible: l.visible, locked: l.locked
+    }));
+    return {
+      _v: 2,
+      ptIds, ptXY, ptFixed, ptExtra,
+      entities, constraints, mates, layers,
+      nextLayerId: state.nextLayerId,
+      nextId: state.nextId,
+      view: view ? { ox: view.ox, oy: view.oy, zoom: view.zoom } : null
+    };
   }
 
   function pushHistory() {
@@ -3147,21 +3352,145 @@
     if (redoBtn) redoBtn.disabled = future.length === 0;
   }
 
-  function applySnapshot(str) {
+  function applySnapshot(snap) {
     try {
-      const data = JSON.parse(str);
-      state = data.state;
+      if (typeof snap === 'string') {
+        const data = JSON.parse(snap);
+        state = data.state;
+        if (data.view && settings.undoRestoresView === 'on') view = data.view;
+        ui.selection = ui.selection.filter(s => {
+          if (s.kind === 'point') return !!state.points[s.id];
+          if (s.kind === 'entity') return !!state.entities[s.id];
+          return !!state.constraints[s.id];
+        });
+        ui.focusLoop = null;
+        invalidateLoops();
+        ui.solveDirty = anyDimensionViolated();
+        scheduleSave();
+        updateUI();
+        render();
+        return;
+      }
+      if (!snap || snap._v !== 2) throw new Error('bad snapshot');
+      const dirtyPoints = new Set();
+      const dirtyEntities = new Set();
+      let structural = false;
+
+      // 1. Diff & restore points in-place
+      const seenPts = new Set();
+      const ptIds = snap.ptIds, ptXY = snap.ptXY, ptFixed = snap.ptFixed, ptExtra = snap.ptExtra;
+      for (let i = 0; i < ptIds.length; i++) {
+        const id = ptIds[i];
+        seenPts.add(id);
+        const nx = ptXY[i * 2], ny = ptXY[i * 2 + 1];
+        const pf = ptFixed[i], nf = !!(pf & 1), npr = !!(pf & 2);
+        const ex = ptExtra ? ptExtra.get(id) : null;
+        const cur = state.points[id];
+        if (!cur) {
+          const np = { x: nx, y: ny };
+          if (nf) np.fixed = true;
+          if (npr) np.pr = true;
+          if (ex) Object.assign(np, deepClonePlain(ex));
+          state.points[id] = np;
+          dirtyPoints.add(id);
+          structural = true;
+        } else {
+          let changed = cur.x !== nx || cur.y !== ny || !!cur.fixed !== nf || !!cur.pr !== npr;
+          if (!changed && ex) changed = true;
+          if (!changed) {
+            for (const pk in cur) {
+              if (pk !== 'id' && pk !== 'x' && pk !== 'y' && pk !== 'fixed' && pk !== 'pr') { changed = true; break; }
+            }
+          }
+          if (changed) {
+            cur.x = nx;
+            cur.y = ny;
+            if (nf) cur.fixed = true;
+            else delete cur.fixed;
+            if (npr) cur.pr = true;
+            else delete cur.pr;
+            for (const pk in cur) {
+              if (pk !== 'id' && pk !== 'x' && pk !== 'y' && pk !== 'fixed' && pk !== 'pr') delete cur[pk];
+            }
+            if (ex) Object.assign(cur, deepClonePlain(ex));
+            dirtyPoints.add(id);
+          }
+        }
+      }
+      for (const k in state.points) {
+        const id = +k;
+        if (!seenPts.has(id)) {
+          delete state.points[k];
+          dirtyPoints.add(id);
+          structural = true;
+        }
+      }
+
+      // 2. Diff & restore entities in-place (preserving untouched splines)
+      const sEnts = snap.entities;
+      for (const k in state.entities) {
+        if (!Object.prototype.hasOwnProperty.call(sEnts, k)) {
+          delete state.entities[k];
+          dirtyEntities.add(+k);
+          structural = true;
+        }
+      }
+      for (const k in sEnts) {
+        const se = sEnts[k];
+        const cur = state.entities[k];
+        if (!cur) {
+          state.entities[k] = restoreEntityFromSnapshot(se);
+          dirtyEntities.add(+k);
+          structural = true;
+        } else if (!entityMatchesSnapshot(cur, se)) {
+          // Replacing state.entities[k] creates a new object reference, so
+          // caches holding entity refs (pointUseCache, byLayerCache) MUST drop.
+          structural = true;
+          state.entities[k] = restoreEntityFromSnapshot(se);
+          dirtyEntities.add(+k);
+        }
+      }
+
+      // 3. Restore constraints, mates, layers, counters
+      const cons = {};
+      for (const k in snap.constraints) cons[k] = deepClonePlain(snap.constraints[k]);
+      state.constraints = cons;
+      const mates = {};
+      for (const k in snap.mates) mates[k] = deepClonePlain(snap.mates[k]);
+      state.mates = mates;
+      const prevLayers = state.layers || [];
+      const nextLayers = (snap.layers || []).map(l => ({
+        id: l.id, name: l.name, visible: l.visible, locked: l.locked
+      }));
+      if (prevLayers.length !== nextLayers.length) structural = true;
+      else {
+        for (let i = 0; i < prevLayers.length; i++) {
+          if (prevLayers[i].id !== nextLayers[i].id ||
+            prevLayers[i].visible !== nextLayers[i].visible ||
+            prevLayers[i].locked !== nextLayers[i].locked) {
+            structural = true;
+            break;
+          }
+        }
+      }
+      state.layers = nextLayers;
+      state.nextLayerId = snap.nextLayerId;
+      state.nextId = snap.nextId;
+      conflictBadgeCache = null;
+
       // the camera belongs to the user, not to the history: undo / redo change
       // the GEOMETRY so the before/after can be compared in place. Only the
       // "Undo moves the view" setting puts the viewport back the way it was.
-      if (data.view && settings.undoRestoresView === 'on') view = data.view;
+      if (snap.view && settings.undoRestoresView === 'on') {
+        view = { ox: snap.view.ox, oy: snap.view.oy, zoom: snap.view.zoom };
+      }
       ui.selection = ui.selection.filter(s => {
         if (s.kind === 'point') return !!state.points[s.id];
         if (s.kind === 'entity') return !!state.entities[s.id];
         return !!state.constraints[s.id];
       });
       ui.focusLoop = null;
-      invalidateLoops();
+      invalidateLoops({ dirtyPoints, dirtyEntities, structural });
       ui.solveDirty = anyDimensionViolated();
       scheduleSave();
       updateUI();
@@ -3405,15 +3734,66 @@
   // went stale (see arrayEnsureShapes). Declared here, bumped by the one signal
   // every geometry change already goes through.
   let geometryEpoch = 0;
+  let staticSceneEpoch = 0;
 
-  function invalidateLoops() {
+  function invalidateLoops(opts) {
     geometryEpoch++;
     // A new document object means the layer map points at stale layer objects.
     invalidateLayerIndex();
-    // A drag only changes point COORDINATES, never which points an entity owns
-    // — rebuilding the entity→points index on every pointermove is wasted work
-    // on a big drawing. It is dropped here for every structural change; the
-    // drag path (ui.drag) rebuilds it only when an entity appears or vanishes.
+    const targeted = !!(opts && !opts.full && (opts.dirtyPoints || opts.dirtyEntities));
+    if (targeted) {
+      // Drop entity-reference caches FIRST on structural changes so pointUses()
+      // below resolves live post-edit / post-undo entity objects, never stale ones.
+      if (opts.structural) {
+        pointUseCache = null;
+        entityCountCache = -1;
+        byLayerCache = null;
+      }
+      const dirtyEnts = new Set();
+      if (opts.dirtyEntities) {
+        for (const eid of opts.dirtyEntities) dirtyEnts.add(+eid);
+      }
+      if (opts.dirtyPoints) {
+        for (const pid of opts.dirtyPoints) {
+          const uses = pointUses(+pid);
+          if (uses) for (const e of uses) dirtyEnts.add(+e.id);
+        }
+      }
+      for (const eid of dirtyEnts) {
+        splineSampleCache.delete(eid);
+        splineRenderXYCache.delete(eid);
+        closedSplineLoopCache.delete(eid);
+        artContourCache.delete(eid);
+        eqbCache.delete(eid);
+        if (opts.structural) epiCache.delete(eid);
+      }
+      // If all dirty entities are currently excluded from the static backdrop
+      // (subset drag in progress), keep the static backdrop valid!
+      let hitsStatic = true;
+      if (ui.drag && ui.drag._backdropSkip && dirtyEnts.size) {
+        hitsStatic = false;
+        for (const eid of dirtyEnts) {
+          if (!ui.drag._backdropSkip.has(eid)) { hitsStatic = true; break; }
+        }
+      }
+      if (hitsStatic || opts.structural) staticSceneEpoch++;
+      if (!ui.drag) conflictBadgeCache = null;
+      pointEditableCache = null;
+      pointShownCache = null;
+      hitGridCache = null;
+      pointGridCache = null;
+      noteCache = null;
+      if (ui.drag) {
+        loopsDeferred = true;
+        return;
+      }
+      loopCache = null;
+      loopsDeferred = false;
+      return;
+    }
+
+    // Full invalidation path (default when called with no arguments).
+    staticSceneEpoch++;
     if (!ui.drag) {
       pointUseCache = null;
       conflictBadgeCache = null;
@@ -3426,14 +3806,10 @@
     noteCache = null;
     epiCache.clear();
     eqbCache.clear();
-    // sample/contour caches always drop (cheap to rebuild, must track moving
-    // points during a drag); only the loop topology is deferred below
     splineSampleCache = new Map();
+    splineRenderXYCache = new Map();
+    closedSplineLoopCache = new Map();
     artContourCache = new Map();
-    // A drag only moves points; rebuilding the loop topology on every
-    // pointermove made dragging crawl on big drawings. The rebuild is deferred
-    // to the first read after the drag (mouse-up / release) and the pre-drag
-    // loops stay on screen meanwhile.
     if (ui.drag) {
       loopsDeferred = true;
       return;
@@ -3448,19 +3824,26 @@
     render();
   }
 
-  function commit() {
+  function commit(opts) {
     // commit() runs after every structural edit (add / remove / regroup), and
     // never during a plain coordinate drag — exactly the boundary the
     // entity→points index cares about.
     pointUseCache = null;
-    // The entity→points index must be dropped BEFORE cleanupPoints(): a
-    // structural edit that rewired an existing entity's points (double-click
-    // insert on a spline) leaves the cached list stale, and a stale list hides
-    // the brand-new point from the used-set — the sweep deleted the point that
-    // was just inserted, pts/hs lengths mismatched, and the renderer silently
-    // fell back to autoHandles (the "sharp triangle became rounded" bug).
-    // invalidateLoops() below clears it too, but only AFTER the sweep ran.
-    epiCache.clear();
+    const targeted = !!(opts && (opts.dirtyEntities || opts.dirtyPoints));
+    if (targeted) {
+      if (opts.dirtyEntities) {
+        for (const eid of opts.dirtyEntities) epiCache.delete(+eid);
+      }
+    } else {
+      // The entity→points index must be dropped BEFORE cleanupPoints(): a
+      // structural edit that rewired an existing entity's points (double-click
+      // insert on a spline) leaves the cached list stale, and a stale list hides
+      // the brand-new point from the used-set — the sweep deleted the point that
+      // was just inserted, pts/hs lengths mismatched, and the renderer silently
+      // fell back to autoHandles (the "sharp triangle became rounded" bug).
+      // invalidateLoops() below clears it too, but only AFTER the sweep ran.
+      epiCache.clear();
+    }
     for (const eid in state.entities) {
       const e = state.entities[eid];
       if (e.layer == null || !getLayer(e.layer)) e.layer = ui.activeLayer;
@@ -3476,7 +3859,15 @@
     // same definition Z uses for leftovers) — sweeping here means one leaky
     // code path can never leave ghost points behind again
     cleanupPoints();
-    invalidateLoops();
+    if (targeted) {
+      invalidateLoops({
+        dirtyEntities: opts.dirtyEntities,
+        dirtyPoints: opts.dirtyPoints,
+        structural: true
+      });
+    } else {
+      invalidateLoops();
+    }
     scheduleSave();
     updateUI();
     render();
@@ -4120,17 +4511,183 @@
     const refRads = new Set();
     const refEnts = new Set();
 
-    const arcIds = [];
-    for (const key in state.entities) {
-      if (state.entities[key].type === 'arc') arcIds.push(+key);
-    }
-
     // Text aspect lock: off as soon as both handle lines carry a driven
     // dimension, so a text with two dimensions resizes freely (no ratio).
     const aspectOff = new Set();
     for (const cid in state.constraints) {
       const c = state.constraints[cid];
       if (c.type === 'aspect' && textDimCount(c.entity) >= 2) aspectOff.add(cid);
+    }
+
+    const dragPtSet = new Set();
+    if (opts.dragPoints) {
+      for (const id of opts.dragPoints) dragPtSet.add(+id);
+    }
+    const dragEntSet = new Set();
+    if (opts.dragEntity != null) dragEntSet.add(+opts.dragEntity);
+    if (opts.dragRadiusTarget && opts.dragRadiusTarget.e != null) dragEntSet.add(+opts.dragRadiusTarget.e);
+    const hasDragScope = !!(opts.dragPoints || opts.dragEntity != null || opts.dragRadiusTarget);
+
+    const entPtsOf = (eid) => {
+      const e = state.entities[eid];
+      if (!e) return [];
+      if (e.type === 'line') return [+e.a, +e.b];
+      if (e.type === 'arc') return [+e.c, +e.s, +e.e];
+      if (e.type === 'circle') return [+e.c];
+      if (e.type === 'spline') return (e.pts || []).map(Number);
+      if (e.type === 'rect' || e.type === 'text') return [e.p0, e.pw, e.ph, e.p2].filter(v => v != null).map(Number);
+      return [];
+    };
+
+    const conItems = [];
+    const conTouchedPts = new Set();
+    const conTouchedEnts = new Set();
+    for (const cid in state.constraints) {
+      const c = state.constraints[cid];
+      if (!c || c.reference) continue;
+      if (c.type === 'aspect' && aspectOff.has(cid)) continue;
+      const pts = [];
+      const ents = [];
+      if (c.type === 'coincident' || c.type === 'distance' || c.type === 'horizontalPoints' || c.type === 'verticalPoints') {
+        if (c.p1 != null) pts.push(+c.p1);
+        if (c.p2 != null) pts.push(+c.p2);
+      } else if (c.type === 'fix') {
+        if (c.p != null) pts.push(+c.p);
+      } else if (c.type === 'aspect') {
+        if (c.p0 != null) pts.push(+c.p0);
+        if (c.pw != null) pts.push(+c.pw);
+        if (c.ph != null) pts.push(+c.ph);
+      } else if (c.type === 'horizontal' || c.type === 'vertical') {
+        if (c.entity != null) {
+          ents.push(+c.entity);
+          for (const pid of entPtsOf(c.entity)) pts.push(pid);
+        }
+      } else if (c.type === 'radius') {
+        if (c.entity != null) {
+          ents.push(+c.entity);
+          const e = state.entities[c.entity];
+          if (e && e.type === 'arc') { pts.push(+e.c, +e.s); }
+        }
+      } else if (c.type === 'pointDim' || c.type === 'pointOn' || c.type === 'midpoint') {
+        if (c.p != null) pts.push(+c.p);
+        if (c.entity != null) {
+          ents.push(+c.entity);
+          for (const pid of entPtsOf(c.entity)) pts.push(pid);
+        }
+      } else if (c.type === 'tangent' || c.type === 'tangentAt') {
+        if (c.p != null) pts.push(+c.p);
+        if (c.line != null) {
+          ents.push(+c.line);
+          for (const pid of entPtsOf(c.line)) pts.push(pid);
+        }
+        if (c.entity != null) {
+          ents.push(+c.entity);
+          for (const pid of entPtsOf(c.entity)) pts.push(pid);
+        }
+      } else if (c.type === 'equal' || c.type === 'parallel' || c.type === 'perpendicular' || c.type === 'angle') {
+        for (const eid of [c.line1, c.line2]) {
+          if (eid == null) continue;
+          ents.push(+eid);
+          const e = state.entities[eid];
+          if (e && (e.type === 'line' || e.type === 'arc')) {
+            for (const pid of entPtsOf(eid)) pts.push(pid);
+          }
+        }
+      }
+      for (const pid of pts) conTouchedPts.add(pid);
+      for (const eid of ents) conTouchedEnts.add(eid);
+      conItems.push({ cid, c, pts, ents });
+    }
+
+    // Collect only arcs that matter: coupled to an active constraint, drifted off
+    // equal-radius, or partially dragged (stretching/bending rather than moving rigidly).
+    const arcItems = [];
+    for (const key in state.entities) {
+      const e = state.entities[key];
+      if (!e || e.type !== 'arc') continue;
+      const eid = +key;
+      const cPt = state.points[e.c], sPt = state.points[e.s], ePt = state.points[e.e];
+      if (!cPt || !sPt || !ePt) continue;
+      const touchedByCon = conTouchedEnts.has(eid) || conTouchedPts.has(+e.c) || conTouchedPts.has(+e.s) || conTouchedPts.has(+e.e);
+      const drifted = Math.abs(dist(cPt, sPt) - dist(cPt, ePt)) > 1e-6;
+      let partialDrag = false;
+      if (hasDragScope) {
+        const inDrag = (dragPtSet.has(+e.c) ? 1 : 0) + (dragPtSet.has(+e.s) ? 1 : 0) + (dragPtSet.has(+e.e) ? 1 : 0);
+        partialDrag = (inDrag > 0 && inDrag < 3) || dragEntSet.has(eid);
+      }
+      if (!touchedByCon && !drifted && !partialDrag) continue;
+      arcItems.push({ eid, e, pts: [+e.c, +e.s, +e.e] });
+    }
+
+    // Empty system fast exit: nothing to probe or solve.
+    if (!conItems.length && !arcItems.length) {
+      if (opts.dragPoints || opts.dragEntity != null) {
+        return { cost: 0, iterations: 0, ok: false, skipped: true, moved: false };
+      }
+      return { cost: 0, iterations: 0, ok: true, moved: false };
+    }
+
+    // Connected-component scoping for drag solves: isolate the coupled cluster
+    // touching the dragged geometry so unrelated constraints/parts never bloat
+    // the Jacobian or fail an unrelated release solve.
+    let activeConItems = conItems;
+    let activeArcItems = arcItems;
+    if (hasDragScope) {
+      const compPts = new Set(dragPtSet);
+      const compEnts = new Set(dragEntSet);
+      if (opts.dragTargets) {
+        for (const t of opts.dragTargets) {
+          if (t && t.p != null) compPts.add(+t.p);
+        }
+      }
+      const pickCon = new Array(conItems.length).fill(false);
+      const pickArc = new Array(arcItems.length).fill(false);
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (let i = 0; i < conItems.length; i++) {
+          if (pickCon[i]) continue;
+          const it = conItems[i];
+          let hit = false;
+          for (let j = 0; j < it.pts.length; j++) {
+            if (compPts.has(it.pts[j])) { hit = true; break; }
+          }
+          if (!hit) {
+            for (let j = 0; j < it.ents.length; j++) {
+              if (compEnts.has(it.ents[j])) { hit = true; break; }
+            }
+          }
+          if (hit) {
+            pickCon[i] = true;
+            expanded = true;
+            for (const pid of it.pts) compPts.add(pid);
+            for (const eid of it.ents) compEnts.add(eid);
+          }
+        }
+        for (let i = 0; i < arcItems.length; i++) {
+          if (pickArc[i]) continue;
+          const it = arcItems[i];
+          let hit = compEnts.has(it.eid);
+          if (!hit) {
+            for (let j = 0; j < it.pts.length; j++) {
+              if (compPts.has(it.pts[j])) { hit = true; break; }
+            }
+          }
+          if (hit) {
+            pickArc[i] = true;
+            expanded = true;
+            compEnts.add(it.eid);
+            for (const pid of it.pts) compPts.add(pid);
+          }
+        }
+      }
+      activeConItems = [];
+      for (let i = 0; i < conItems.length; i++) if (pickCon[i]) activeConItems.push(conItems[i]);
+      activeArcItems = [];
+      for (let i = 0; i < arcItems.length; i++) if (pickArc[i]) activeArcItems.push(arcItems[i]);
+      if (!activeConItems.length && !activeArcItems.length) {
+        return { cost: 0, iterations: 0, ok: false, skipped: true, moved: false };
+      }
     }
 
     const residual = (x) => {
@@ -4182,8 +4739,8 @@
       };
       const out = [];
 
-      for (const cid in state.constraints) {
-        const c = state.constraints[cid];
+      for (let ci = 0; ci < activeConItems.length; ci++) {
+        const c = activeConItems[ci].c;
         if (c.reference) continue;
         if (c.type === 'coincident') {
           if (!state.points[c.p1] || !state.points[c.p2]) continue;
@@ -4271,7 +4828,6 @@
           const p = GP(c.p);
           out.push((p.x - (a.x + b.x) / 2) * 2, (p.y - (a.y + b.y) / 2) * 2);
         } else if (c.type === 'aspect') {
-          if (aspectOff.has(cid)) continue;
           if (!state.points[c.p0] || !state.points[c.pw] || !state.points[c.ph]) continue;
           const t0 = GP(c.p0), t1 = GP(c.pw), t2 = GP(c.ph);
           const wa = Math.hypot(t1.x - t0.x, t1.y - t0.y);
@@ -4355,8 +4911,8 @@
         if (e) out.push((GR(t.e) - t.r) * ((t.w || DRAG_TARGET_W) / (opts.residualScale || 1)));
       }
 
-      for (const eid of arcIds) {
-        const e = state.entities[eid];
+      for (let ai = 0; ai < activeArcItems.length; ai++) {
+        const e = activeArcItems[ai].e;
         const c = GP(e.c);
         const s = GP(e.s);
         const en = GP(e.e);
@@ -4367,19 +4923,6 @@
     };
 
     // ---- Gate: can this drag change the answer at all? --------------------
-    // solveSketch only gives the solver points that some residual READS, so a
-    // dragged point no constraint touches is never a variable: LM returns the
-    // identical state with or without it, and it cannot pull the drag back
-    // either. Auto solve used to pay for that pointless solve — plus a full
-    // updateUI() and a synchronous repaint — on every interval slot, which is
-    // the hitch felt while dragging a free object around a drawing that has
-    // constraints somewhere else. Only a drag-carrying call pays for the
-    // extra probe: everything else still probes once, as before.
-    // Drag targets for points no constraint reads are dead weight: such a
-    // point is not a solver variable, so its target residual can never pull
-    // anything — it only enlarges the Jacobian (a select-all drag carried
-    // 16k targets for 4 constraints). Hold them out before the probe so the
-    // variable set stays the constraint-read points.
     if (opts.dragTargets && opts.dragTargets.length) {
       gateProbe = true;
       residual([]);
@@ -4389,46 +4932,31 @@
     }
     if (opts.dragPoints) {
       gateProbe = true;
-      residual([]);        // constraints only — the drag targets are held out
+      const rGate = residual([]);        // constraints only — the drag targets are held out
       gateProbe = false;
       let touched = false;
       for (const id of opts.dragPoints) {
         if (refPts.has(+id)) { touched = true; break; }
       }
-      // A radius handle is read by radius / equal / point-on residuals only;
-      // nothing else on the entity can change because of it.
       if (!touched && opts.dragEntity != null) touched = refEnts.has(+opts.dragEntity);
-      // A drag TARGET is not a constraint, but it IS work: the solve exists to
-      // pull the point onto the pointer. Skipping it because no constraint reads
-      // the dragged point is what left the point wherever the mouse put it while
-      // the rest of the system was never asked to follow.
       if (!touched && opts.dragRadiusTarget && refEnts.has(+opts.dragRadiusTarget.e)) touched = true;
       if (!touched) {
         let cost = 0;
-        const r = residual([]);
-        for (let i = 0; i < r.length; i++) cost += r[i] * r[i];
-        // Not solved, so the cost the status chip shows must not move either.
+        for (let i = 0; i < rGate.length; i++) cost += rGate[i] * rGate[i];
         return { cost, iterations: 0, ok: false, skipped: true, moved: false };
       }
     }
 
-    residual([]);           // probe: record which variables the residuals touch
+    const rProbe = residual([]);           // probe: record variables AND initial cost at x0
     recording = false;
+    let cost0 = 0;
+    for (let i = 0; i < rProbe.length; i++) cost0 += rProbe[i] * rProbe[i];
+    // Already satisfied to sub-0.00001mm precision: skip Jacobian build & LM solve
+    if (isFinite(cost0) && cost0 < 1e-10) {
+      return { cost: cost0, iterations: 0, ok: true, moved: false };
+    }
 
     // ---- Arc end-point rule -----------------------------------------------
-    // An arc's radius is the distance from its centre to its START point, so a
-    // solve that may move both ends AND the centre drifts the whole arc instead
-    // of bending it: the start "does not move" only because the centre moved
-    // with it.
-    //
-    // The rule: the end that carries no constraint is the one that moves; the
-    // other end is anchored. When neither end is constrained the centre is
-    // anchored as well, so dragging the free end changes the SWEEP, never the
-    // radius or the position of the arc.
-    //
-    //   end free            -> start (and centre) anchored, end follows
-    //   only the start free -> the END is anchored
-    //   both constrained    -> no rule (the user is steering both)
     const arcEndFree = (pid) => {
       for (const cid in state.constraints) {
         const c = state.constraints[cid];
@@ -4439,22 +4967,15 @@
       }
       return true;
     };
-    for (const key in state.entities) {
-      const e = state.entities[key];
-      if (!e || e.type !== 'arc') continue;
+    for (let ai = 0; ai < activeArcItems.length; ai++) {
+      const e = activeArcItems[ai].e;
       if (!state.points[e.s] || !state.points[e.e]) continue;
       const startFree = arcEndFree(e.s);
       const endFree = arcEndFree(e.e);
       if (endFree) {
-        // the END is the free one: the start stays, and so does the centre —
-        // pinning the centre is what keeps |c-s| (the arc's radius) constant
-        // while the free end swings. Without it the solver slid the whole arc
-        // around and the radius drifted with it.
         fixed.add(+e.s);
         if (arcEndFree(e.c) && state.points[e.c]) fixed.add(+e.c);
       } else if (startFree) {
-        // only the start is free: it is the one the user is dragging, and moving
-        // it legitimately changes the radius, so the centre stays free
         fixed.add(+e.e);
       }
     }
@@ -4481,20 +5002,12 @@
     });
 
     if (!vars.length) {
-      const r = residual([]);
-      const cost = r.reduce((s, v) => s + v * v, 0);
-      return { cost, iterations: 0, ok: cost < 1e-7, moved: false };
+      return { cost: cost0, iterations: 0, ok: cost0 < 1e-7, moved: false };
     }
 
-    // A step cap keeps one iteration from teleporting the shape across the
-    // plane; a solve with a drag target needs a slightly smaller cap than a
-    // deliberate re-solve, because the hand is the authority while dragging.
     const stepCap = opts.stepCap > 0 ? opts.stepCap
       : (opts.dragTargets && opts.dragTargets.length ? 8 : 25);
     const result = lmSolve(x0, residual, maxIter, stepCap);
-    // Ran out of budget mid-descent and the sketch is still far from a
-    // solution: write nothing. Committing that iterate is what made the shape
-    // jump somewhere the user never saw, one gesture after another.
     const stalled = !result.converged && !(result.cost < 1e-2);
     if (stalled) {
       markUnsolved();
@@ -4510,10 +5023,6 @@
         if (Math.abs(result.x[i] - state.points[v.id].y) > 1e-9) moved = true;
         state.points[v.id].y = result.x[i];
       } else {
-        // A radius may not run away: a nearly singular system can push it to
-        // absurd values, and a circle that jumps from r=3 to r=300 is never what
-        // the user meant. The solve may change it by at most 2x in either
-        // direction from where it started.
         const before = Math.max(0.01, state.entities[v.id].r);
         const lo = Math.max(0.01, before / RADIUS_SOLVE_LIMIT);
         const hi = before * RADIUS_SOLVE_LIMIT;
@@ -4577,11 +5086,17 @@
 
   // Every automatic solve goes through here.
   function requestSolve(a, b) {
-    if (ui.solveMode === 'manual') {
-      markUnsolved();
-      return null;
-    }
-    if (ui.solveMode === 'release' && dragSolveSuppressed) {
+    const isDeferredDrag = ui.solveMode === 'manual' || (ui.solveMode === 'release' && dragSolveSuppressed);
+    if (isDeferredDrag) {
+      // During a drag, only flag unsolved if the dragged object actually touches
+      // a currently violated constraint or stretched arc — free/normal objects and
+      // rigid translations of satisfied shapes stay silent.
+      if (typeof state !== 'undefined' && state && a &&
+          (a.dragPoints || a.dragEntity != null || a.dragRadiusTarget) &&
+          typeof dragHasConstraintViolation === 'function' &&
+          !dragHasConstraintViolation(a)) {
+        return { cost: 0, iterations: 0, ok: true, skipped: true, moved: false };
+      }
       markUnsolved();
       return null;
     }
@@ -4739,11 +5254,10 @@
   // somewhere else than the mouse is the exact complaint this fixes.
   function solveRelease(d) {
     const out = solveReleaseInner(d);
-    // requestSolve() used to own this flag cleanup, and pointerup stopped calling
-    // it: without this the status chip stayed "unsolved · F9" for ever, even
-    // though the release solve had just run. A stalled solve keeps the flag on,
-    // because the geometry really is still away from its constraints.
-    if (out && !out.skipped && !out.stalled) ui.solveDirty = false;
+    if (out && !out.stalled) {
+      if (!out.skipped) ui.solveDirty = false;
+      else if (typeof anyConstraintViolated === 'function' && !anyConstraintViolated()) ui.solveDirty = false;
+    }
     return out;
   }
 
@@ -4765,7 +5279,7 @@
     // has no single primary, so all of them are targets; use the first as the
     // one that has to be exact).
     const watch = primary != null ? primary : (held.length ? held[0] : null);
-    if (!watch) return requestSolve();
+    if (!watch) return { cost: ui.solverCost || 0, iterations: 0, ok: true, skipped: true, moved: false };
     const want = (() => {
       const t = targets.find(x => +x.p === +watch);
       return t ? { x: t.x, y: t.y } : null;
@@ -8613,9 +9127,38 @@
 
   // Geometry caches: spline sampling runs per curve per frame without one, and
   // contour simplification per group. Both change only with the geometry, so
-  // they are rebuilt lazily and dropped together in invalidateLoops().
+  // they are rebuilt lazily and dropped selectively (or fully) in invalidateLoops().
   let splineSampleCache = new Map();
+  let splineRenderXYCache = new Map();
+  let closedSplineLoopCache = new Map();
   let artContourCache = new Map();
+
+  // Precomputed cubic Bézier Bernstein weights for SPLINE_SEG steps (t = 1/N .. 1).
+  const _BZ_N = (typeof SPLINE_SEG === 'number' && SPLINE_SEG > 0) ? SPLINE_SEG : 12;
+  const _BZ_B0 = new Float64Array(_BZ_N);
+  const _BZ_B1 = new Float64Array(_BZ_N);
+  const _BZ_B2 = new Float64Array(_BZ_N);
+  const _BZ_B3 = new Float64Array(_BZ_N);
+  for (let s = 1; s <= _BZ_N; s++) {
+    const t = s / _BZ_N, mt = 1 - t;
+    _BZ_B0[s - 1] = mt * mt * mt;
+    _BZ_B1[s - 1] = 3 * mt * mt * t;
+    _BZ_B2[s - 1] = 3 * mt * t * t;
+    _BZ_B3[s - 1] = t * t * t;
+  }
+
+  // Adaptive motion simplification: while an interactive drag/transform is in
+  // motion, relax curve LOD and use bevel joins so onboard GPUs stay fluid;
+  // full crisp rendering resumes immediately on pointerup.
+  function isMotionSimplified() {
+    if (fastMode) return true;
+    const d = ui.drag;
+    if (!d || !d.moved) return false;
+    return d.kind === 'entity' || d.kind === 'point' || d.kind === 'radius' ||
+      d.kind === 'splineHandle' || d.kind === 'xfMove' || d.kind === 'xfRotate' ||
+      d.kind === 'xfScale' || d.kind === 'xfMoveInstance' ||
+      d.kind === 'partMarker' || d.kind === 'partBody' || d.kind === 'partsGroup';
+  }
 
   function splineSamplesOf(e) {
     const hit = splineSampleCache.get(+e.id);
@@ -8625,6 +9168,89 @@
     const samples = splineSamples(cps, e.hs, !!e.closed);
     splineSampleCache.set(+e.id, { pts: e.pts, hs: e.hs, closed: !!e.closed, samples });
     return samples;
+  }
+
+  // Flat [x0, y0, x1, y1, ...] Float64Array dedicated to Canvas 2D rendering
+  // and loop-fill path building: skips 12x subdivision on collinear/straight
+  // spans and avoids per-vertex {x, y} object allocations. (splineSamplesOf
+  // keeps its uniform SPLINE_SEG cadence for splineSegmentAt / CNC export.)
+  function splineRenderXYOf(e) {
+    const eid = +e.id;
+    const closed = !!e.closed;
+    const hit = splineRenderXYCache.get(eid);
+    if (hit && hit.pts === e.pts && hit.hs === e.hs && hit.closed === closed) return hit.xy;
+    ensureSplineHandles(e);
+    const ids = entityPointIds(e);
+    const cps = [];
+    for (let i = 0; i < ids.length; i++) {
+      const p = P(ids[i]);
+      if (p) cps.push(p);
+    }
+    const n = cps.length;
+    if (n < 2) {
+      const empty = new Float64Array(0);
+      splineRenderXYCache.set(eid, { pts: e.pts, hs: e.hs, closed, xy: empty });
+      return empty;
+    }
+    const hs = (e.hs && e.hs.o && e.hs.i && e.hs.o.length === n && e.hs.i.length === n)
+      ? e.hs : autoHandles(cps, closed);
+    const nsegs = closed ? n : n - 1;
+    const straight = new Uint8Array(nsegs);
+    let totalPts = 1;
+    for (let i = 0; i < nsegs; i++) {
+      const j = (i + 1) % n;
+      const p0 = cps[i], p3 = cps[j];
+      const c1 = hs.o[i] || p0, c2 = hs.i[j] || p3;
+      const c1dx = c1.x - p0.x, c1dy = c1.y - p0.y;
+      const c2dx = c2.x - p3.x, c2dy = c2.y - p3.y;
+      let isStr = (c1dx * c1dx + c1dy * c1dy < 1e-10 && c2dx * c2dx + c2dy * c2dy < 1e-10);
+      if (!isStr) {
+        const dx = p3.x - p0.x, dy = p3.y - p0.y;
+        const len2 = dx * dx + dy * dy;
+        if (len2 > 1e-12) {
+          const cr1 = c1dx * dy - c1dy * dx;
+          const v2x = c2.x - p0.x, v2y = c2.y - p0.y;
+          const cr2 = v2x * dy - v2y * dx;
+          if (cr1 * cr1 < 1e-8 * len2 && cr2 * cr2 < 1e-8 * len2) {
+            const d1 = c1dx * dx + c1dy * dy;
+            const d2 = v2x * dx + v2y * dy;
+            if (d1 >= -1e-6 * len2 && d1 <= 1.000001 * len2 &&
+                d2 >= -1e-6 * len2 && d2 <= 1.000001 * len2) {
+              isStr = true;
+            }
+          }
+        }
+      }
+      if (isStr) {
+        straight[i] = 1;
+        totalPts += 1;
+      } else {
+        totalPts += _BZ_N;
+      }
+    }
+    const xy = new Float64Array(totalPts * 2);
+    xy[0] = cps[0].x;
+    xy[1] = cps[0].y;
+    let out = 2;
+    for (let i = 0; i < nsegs; i++) {
+      const j = (i + 1) % n;
+      const p0 = cps[i], p3 = cps[j];
+      if (straight[i]) {
+        xy[out++] = p3.x;
+        xy[out++] = p3.y;
+      } else {
+        const c1 = hs.o[i] || p0, c2 = hs.i[j] || p3;
+        const p0x = p0.x, p0y = p0.y, c1x = c1.x, c1y = c1.y;
+        const c2x = c2.x, c2y = c2.y, p3x = p3.x, p3y = p3.y;
+        for (let s = 0; s < _BZ_N; s++) {
+          const b0 = _BZ_B0[s], b1 = _BZ_B1[s], b2 = _BZ_B2[s], b3 = _BZ_B3[s];
+          xy[out++] = b0 * p0x + b1 * c1x + b2 * c2x + b3 * p3x;
+          xy[out++] = b0 * p0y + b1 * c1y + b2 * c2y + b3 * p3y;
+        }
+      }
+    }
+    splineRenderXYCache.set(eid, { pts: e.pts, hs: e.hs, closed, xy });
+    return xy;
   }
 
 
@@ -9636,7 +10262,7 @@
   // id cache, dropped on invalidateLoops
   const eqbCache = new Map();
   function entityQuickBounds(e) {
-    const eid = e.id;
+    const eid = e.id != null ? +e.id : null;
     if (eid != null && eqbCache.has(eid)) return eqbCache.get(eid);
     const b = entityQuickBoundsBuild(e);
     if (eid != null) eqbCache.set(eid, b);
@@ -10793,19 +11419,53 @@
         }
         loops.push({ circle: true, entity: +id, poly, area: Math.PI * e.r * e.r });
       } else if (e.type === 'spline' && e.closed) {
-        // Sample the fill exactly like the outline (splineSamplesOf). The old
-        // code popped a duplicated closing node and then sampled with the
-        // un-sliced handle arrays: the length mismatch made splineSamples swap
-        // in autoHandles, so the fill followed an approximated curve while the
-        // outline followed the real handles.
-        const poly = splineSamplesOf(e);
-        if (poly.length > 2) {
-          let ar = 0;
-          for (let i = 0; i < poly.length; i++) {
-            const a = poly[i], b = poly[(i + 1) % poly.length];
-            ar += a.x * b.y - b.x * a.y;
+        // Sample the fill exactly like the outline (splineSamplesOf) and cache
+        // the closed-spline polygon, flat render XY, area, bbox, and LoopTree
+        // acceleration helpers per entity so adding/moving/undoing one object
+        // reuses all untouched closed splines without rescanning 100k+ points.
+        const eid = +id;
+        const cslCache = (typeof closedSplineLoopCache !== 'undefined' &&
+          closedSplineLoopCache && typeof closedSplineLoopCache.get === 'function')
+          ? closedSplineLoopCache : null;
+        let entry = cslCache ? cslCache.get(eid) : null;
+        if (!entry || entry.pts !== e.pts || entry.hs !== e.hs) {
+          const poly = splineSamplesOf(e);
+          if (poly.length > 2) {
+            let ar = 0, x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+            for (let i = 0; i < poly.length; i++) {
+              const a = poly[i], b = poly[(i + 1) % poly.length];
+              ar += a.x * b.y - b.x * a.y;
+              if (a.x < x0) x0 = a.x;
+              if (a.y < y0) y0 = a.y;
+              if (a.x > x1) x1 = a.x;
+              if (a.y > y1) y1 = a.y;
+            }
+            entry = {
+              pts: e.pts,
+              hs: e.hs,
+              poly,
+              xy: typeof splineRenderXYOf === 'function' ? splineRenderXYOf(e) : null,
+              area: Math.abs(ar) / 2,
+              box: { x0, y0, x1, y1 },
+              probe: null,
+              yGrid: null
+            };
+            if (cslCache) cslCache.set(eid, entry);
+          } else {
+            entry = null;
           }
-          loops.push({ poly, area: Math.abs(ar) / 2, steps: [], splineEntity: +id });
+        }
+        if (entry) {
+          loops.push({
+            poly: entry.poly,
+            xy: entry.xy,
+            area: entry.area,
+            _box: entry.box,
+            _boxPoly: entry.poly,
+            _cacheEntry: entry,
+            steps: [],
+            splineEntity: eid
+          });
         }
       }
     }
@@ -11175,21 +11835,47 @@
   }
 
   function buildLoopPath(loop) {
+    const z = view.zoom, ox = view.ox, oy = view.oy;
     if (loop.circle) {
       const cd = circleData(state.entities[loop.entity]);
       if (!cd) return null;
-      const cs = w2s(cd.c.x, cd.c.y);
       const p = new Path2D();
-      p.arc(cs.x, cs.y, cd.r * view.zoom, 0, TAU);
+      p.arc(cd.c.x * z + ox, cd.c.y * z + oy, cd.r * z, 0, TAU);
       return p;
     }
-    if (!loop.poly || !loop.poly.length) return null;
-    const p0 = w2s(loop.poly[0].x, loop.poly[0].y);
+    const xy = loop.xy;
+    if (xy && xy.length >= 6) {
+      const p = new Path2D();
+      let lx = xy[0] * z + ox, ly = xy[1] * z + oy;
+      p.moveTo(lx, ly);
+      // Loop fills rasterise at loopFillScale (0.5x), so skipping sub-1px
+      // vertices cuts Path2D size drastically with zero visible difference.
+      const tol2 = 1.0;
+      const n2 = xy.length;
+      for (let i = 2; i < n2; i += 2) {
+        const qx = xy[i] * z + ox, qy = xy[i + 1] * z + oy;
+        const dx = qx - lx, dy = qy - ly;
+        if (dx * dx + dy * dy < tol2) continue;
+        p.lineTo(qx, qy);
+        lx = qx; ly = qy;
+      }
+      p.closePath();
+      return p;
+    }
+    const poly = loop.poly;
+    if (!poly || !poly.length) return null;
     const p = new Path2D();
-    p.moveTo(p0.x, p0.y);
-    for (let k = 1; k < loop.poly.length; k++) {
-      const q = w2s(loop.poly[k].x, loop.poly[k].y);
-      p.lineTo(q.x, q.y);
+    let lx = poly[0].x * z + ox, ly = poly[0].y * z + oy;
+    p.moveTo(lx, ly);
+    const tol2 = poly.length > 48 ? 1.0 : 0;
+    for (let k = 1; k < poly.length; k++) {
+      const qx = poly[k].x * z + ox, qy = poly[k].y * z + oy;
+      if (tol2) {
+        const dx = qx - lx, dy = qy - ly;
+        if (dx * dx + dy * dy < tol2) continue;
+      }
+      p.lineTo(qx, qy);
+      lx = qx; ly = qy;
     }
     p.closePath();
     return p;
@@ -11409,9 +12095,59 @@
         if (ll != null && ll !== ely) continue;
         const lb = boxes.get(L);
         if (lb.x0 > x0 || lb.y0 > y0 || lb.x1 < x1 || lb.y1 < y1) continue;
-        if (!L.poly || L.poly.length < 3) continue;
+        const op = L.poly;
+        if (!op || op.length < 3) continue;
         let all = true;
-        for (const p of pts) { if (!pointInPoly(p, L.poly)) { all = false; break; } }
+        if (op.length >= 64) {
+          // Reuse or build the Y-band segment grid on large polygons so
+          // testing many leaf points against a 1,000+ vertex boundary is O(1)
+          // per point instead of O(|poly|), with bit-identical ray-cast math.
+          const ce = L._cacheEntry;
+          let yg = (ce && ce.yGrid) || (L._yGrid && L._yGridPoly === op ? L._yGrid : null);
+          if (!yg) {
+            const m = op.length;
+            let gy0 = Infinity, gy1 = -Infinity;
+            const segs = new Array(m);
+            for (let j = 0; j < m; j++) {
+              const c = op[j], d = op[(j + 1) % m];
+              const sy0 = Math.min(c.y, d.y), sy1 = Math.max(c.y, d.y);
+              segs[j] = { a: c, b: d, x0: Math.min(c.x, d.x), x1: Math.max(c.x, d.x), y0: sy0, y1: sy1 };
+              if (sy0 < gy0) gy0 = sy0;
+              if (sy1 > gy1) gy1 = sy1;
+            }
+            const bands = Math.max(1, Math.min(256, Math.ceil(m / 4)));
+            const h = (gy1 - gy0) / bands || 1;
+            const grid = new Array(bands);
+            for (let b = 0; b < bands; b++) grid[b] = [];
+            for (let j = 0; j < m; j++) {
+              const s = segs[j];
+              const b0 = Math.max(0, Math.floor((s.y0 - gy0) / h));
+              const b1 = Math.min(bands - 1, Math.floor((s.y1 - gy0) / h));
+              for (let b = b0; b <= b1; b++) grid[b].push(s);
+            }
+            yg = { y0: gy0, y1: gy1, h, bands, grid };
+            L._yGrid = yg;
+            L._yGridPoly = op;
+            if (ce) ce.yGrid = yg;
+          }
+          const gy0 = yg.y0, gh = yg.h, gbands = yg.bands, ggrid = yg.grid;
+          for (let pi = 0; pi < pts.length; pi++) {
+            const p = pts[pi];
+            const py = p.y, px = p.x;
+            const bi = Math.floor((py - gy0) / gh);
+            if (bi < 0 || bi >= gbands) { all = false; break; }
+            const bucket = ggrid[bi];
+            let inside = false;
+            for (let k = 0; k < bucket.length; k++) {
+              const s = bucket[k], a = s.a, b = s.b;
+              if ((a.y > py) !== (b.y > py) &&
+                px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x) inside = !inside;
+            }
+            if (!inside) { all = false; break; }
+          }
+        } else {
+          for (const p of pts) { if (!pointInPoly(p, op)) { all = false; break; } }
+        }
         if (all) {
           owner.set(id, L);
           leaves.get(L).push(id);
@@ -11443,17 +12179,24 @@
     return loop.level || 0;
   }
 
+  // Optional entity-exclusion set used while baking the static scene backdrop
+  // during a subset drag (non-moving entities stay cached in the backdrop while
+  // only the dragged entities redraw live on top).
+  let renderSkipEntities = null;
+  let renderSkipSig = '';
+
+  function loopTouchesEntitySet(loop, set) {
+    if (!loop || !set || !set.size) return false;
+    if (loop.circle) return set.has(+loop.entity);
+    if (loop.splineEntity != null) return set.has(+loop.splineEntity);
+    for (const st of (loop.steps || [])) {
+      if (set.has(+st.edge.entity)) return true;
+    }
+    return false;
+  }
+
   function drawLoopFills() {
     const visFlags = (loopFillCurrentVisible ? 1 : 0) + '' + (loopFillOthersVisible ? 1 : 0) + (ui.dimOthers ? 'd' : '');
-    // All fills — none/gray/yellow — render into ONE offscreen layer, ordered
-    // by nesting depth, shallowest first. Fills are opaque, so a deeper loop
-    // painted after its parent covers it; a parent painted after a child would
-    // hide the child (an outer none-fill covering a nested yellow one, for
-    // example). This is why the none-fill pass was merged in here instead of
-    // being drawn onto the main canvas after this layer.
-    // Selected loops render with a visibly different fill (see loopFillStyle),
-    // so the cached offscreen layer must know which loops are selected — a
-    // selection change would otherwise reuse a stale layer.
     let selSig = '';
     if (ui.selection.length) {
       const loops = getLoops();
@@ -11461,10 +12204,12 @@
         if (loopShapeSelected(loops[i])) selSig += i + ',';
       }
     }
-    const key = geometryEpoch + '|' + themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
-      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H + '|' + selSig;
+    const skip = renderSkipEntities;
+    const skipKey = skip ? renderSkipSig : '';
+    const key = (skip ? staticSceneEpoch : geometryEpoch) + '|' + themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
+      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H + '|' + selSig + '|' + skipKey;
     const baseKey = themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
-      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H + '|' + selSig;
+      DPR + '|' + loopFillScale + '|' + visFlags + '|' + ui.activeLayer + '|' + W + 'x' + H + '|' + selSig + '|' + skipKey;
     if (!loopFillLayer) {
       loopFillLayer = document.createElement('canvas');
       loopFillLayerCtx = loopFillLayer.getContext('2d');
@@ -11476,7 +12221,7 @@
       loopFillLayer.height = ph;
       loopFillLayerKey = null;
     }
-    const rigid = dragRigidDelta();
+    const rigid = !skip ? dragRigidDelta() : null;
     if (rigid && loopFillLayerKey !== null && loopFillLayerBase === baseKey &&
       loopFillLayerLoops === getLoops() && loopFillLayerSel === selectionIndex()) {
       const ox = (rigid.x - loopFillLayerDelta.x) * view.zoom;
@@ -11488,23 +12233,15 @@
       const lc = loopFillLayerCtx;
       lc.setTransform(DPR * loopFillScale, 0, 0, DPR * loopFillScale, 0, 0);
       lc.clearRect(0, 0, W, H);
-      // Batch by (style, depth). Same-depth loops never contain each other, so
-      // merging them into one path is safe (they share edges, not interiors); a
-      // single opaque fill per group colours them all. Deep (brighter) groups
-      // are painted after shallow ones so the inner contour covers its parent.
-      // Per-layer switches hide fills whole; Dim other layers fades the
-      // other-layer groups with alpha in the SAME pass (no extra layer/pass).
       const groups = new Map();
       for (const loop of getLoops()) {
+        if (skip && loopTouchesEntitySet(loop, skip)) continue;
         const d = loopFrameData(loop);
         if (!d.visible || !d.path) continue;
         const onActive = loopLayerId(loop) === ui.activeLayer;
         if (onActive ? !loopFillCurrentVisible : !loopFillOthersVisible) continue;
         const fade = ui.dimOthers && !onActive;
         const depth = loopDepthOf(loop);
-        // none-fills tint as plain/sel; gray/yellow fills keep their kind and
-        // shift toward blue when selected. All share the one depth-ordered
-        // batch so a deep loop always paints over its parent.
         const kind = d.fill === 'none' ? (d.sel ? 'sel' : 'plain') : d.fill;
         const sel = d.fill !== 'none' && !!d.sel;
         const style = kind + '|' + depth + (sel ? '|sel' : '') + (fade ? '|dim' : '');
@@ -11517,7 +12254,7 @@
           };
           groups.set(style, g);
         }
-        g.path.addPath(d.path, loopDragMatrix(loop) || undefined);
+        g.path.addPath(d.path, skip ? undefined : (loopDragMatrix(loop) || undefined));
       }
       const ordered = Array.from(groups.entries()).sort((a, b) =>
         +a[0].split('|')[1] - +b[0].split('|')[1]
@@ -11673,16 +12410,15 @@
   function drawArrays() {
     const z = view.zoom;
     const jobs = [];
-    for (const id in state.entities) {
+    const skip = renderSkipEntities;
+    const only = renderOnlyEntities;
+    const pushArr = (id) => {
       const e = state.entities[id];
-      if (e.type !== 'array' || !layerVisible(e)) continue;
+      if (!e || e.type !== 'array' || !layerVisible(e)) return;
+      if (skip && skip.has(+id)) return;
       const src = arraySourcePaths(e);
-      if (!src.strokes.size) continue;
+      if (!src.strokes.size) return;
       for (const t of arrayInstanceOffsets(e)) {
-        // A clone places its instance with a full affine matrix [a,b,c,d,tx,ty].
-        // Building the DOMMatrix from t.dx / t.ang alone ignored it entirely, so
-        // every clone was stamped straight onto its master — the copy was there,
-        // just invisible underneath.
         const m = t.m
           ? new DOMMatrix([z, 0, 0, z, view.ox, view.oy])
             .multiply(new DOMMatrix([t.m[0], t.m[1], t.m[2], t.m[3], t.m[4], t.m[5]]))
@@ -11695,13 +12431,16 @@
             : new DOMMatrix([z, 0, 0, z, view.ox + z * (t.dx || 0), view.oy + z * (t.dy || 0)]);
         jobs.push({ m, src, eid: +id });
       }
+    };
+    if (only) {
+      for (const id of only) pushArr(id);
+    } else {
+      for (const id in state.entities) pushArr(id);
     }
     if (!jobs.length) return;
     ctx.save();
-    ctx.lineJoin = 'round';
+    ctx.lineJoin = (isMotionSimplified() && !renderBakingBackdrop) ? 'bevel' : 'round';
     for (const job of jobs) {
-      // An array's clones brighten when the array itself is selected, so the
-      // whole swarm reads as one selection — same rule drawOneEntity follows.
       const arrSel = selected('entity', +job.eid);
       const zw = (arrSel ? SEL_WIDTH : LINE_WIDTH) * clamp(view.zoom, LINE_ZOOM_MIN, LINE_ZOOM_MAX);
       ctx.lineWidth = zw;
@@ -11742,88 +12481,98 @@
   }
 
   function traceEntityPath(e, path) {
+    const z = view.zoom, ox = view.ox, oy = view.oy;
     if (e.type === 'line') {
       const a = P(e.a), b = P(e.b);
       if (!a || !b) return;
-      const sa = w2s(a.x, a.y), sb = w2s(b.x, b.y);
-      path.moveTo(sa.x, sa.y);
-      path.lineTo(sb.x, sb.y);
+      path.moveTo(a.x * z + ox, a.y * z + oy);
+      path.lineTo(b.x * z + ox, b.y * z + oy);
     } else if (e.type === 'circle') {
       const c = P(e.c);
       if (!c) return;
-      const cs = w2s(c.x, c.y);
-      path.moveTo(cs.x + Math.max(0.01, e.r) * view.zoom, cs.y);
-      path.arc(cs.x, cs.y, Math.max(0.01, e.r) * view.zoom, 0, TAU);
+      const cx = c.x * z + ox, cy = c.y * z + oy;
+      const r = Math.max(0.01, e.r) * z;
+      path.moveTo(cx + r, cy);
+      path.arc(cx, cy, r, 0, TAU);
     } else if (e.type === 'spline') {
-      const samples = splineSamplesOf(e);
-      if (samples.length < 2) return;
-      // Realtime LOD: at zoom-out consecutive samples land on the same pixel;
-      // emitting them all only bloats the Path2D. Skip a sample that is closer
-      // than ~0.75 px to the last emitted one (no cache, no pre-pass).
-      let lx = 0, ly = 0, has = false;
-      const tol2 = 0.75 * 0.75;
-      for (let i = 0; i < samples.length; i++) {
-        const q = w2s(samples[i].x, samples[i].y);
-        if (has) {
-          const dx = q.x - lx, dy = q.y - ly;
-          if (dx * dx + dy * dy < tol2) continue;
-          path.lineTo(q.x, q.y);
-        } else {
-          path.moveTo(q.x, q.y);
-        }
-        lx = q.x; ly = q.y; has = true;
+      const xy = splineRenderXYOf(e);
+      const n2 = xy.length;
+      if (n2 < 4) return;
+      // Adaptive screen-space LOD: relax while moving, crisp 0.75px when settled.
+      const tol = isMotionSimplified() ? 2.25 : 0.75;
+      const tol2 = tol * tol;
+      let lx = xy[0] * z + ox, ly = xy[1] * z + oy;
+      path.moveTo(lx, ly);
+      const last = n2 - 2;
+      for (let i = 2; i < last; i += 2) {
+        const qx = xy[i] * z + ox, qy = xy[i + 1] * z + oy;
+        const dx = qx - lx, dy = qy - ly;
+        if (dx * dx + dy * dy < tol2) continue;
+        path.lineTo(qx, qy);
+        lx = qx; ly = qy;
+      }
+      const ex = xy[last] * z + ox, ey = xy[last + 1] * z + oy;
+      if (e.closed) {
+        if ((ex - lx) * (ex - lx) + (ey - ly) * (ey - ly) >= 0.01) path.lineTo(ex, ey);
+        path.closePath();
+      } else {
+        path.lineTo(ex, ey);
       }
     } else if (e.type === 'arc') {
       const ad = arcData(e);
       if (!ad || ad.sweep < 1e-6) return;
-      const cs = w2s(ad.c.x, ad.c.y);
-      const r = ad.r * view.zoom;
-      path.moveTo(cs.x + Math.cos(ad.a0) * r, cs.y + Math.sin(ad.a0) * r);
-      path.arc(cs.x, cs.y, r, ad.a0, ad.a0 + ad.sweep, false);
+      const cx = ad.c.x * z + ox, cy = ad.c.y * z + oy;
+      const r = ad.r * z;
+      path.moveTo(cx + Math.cos(ad.a0) * r, cy + Math.sin(ad.a0) * r);
+      path.arc(cx, cy, r, ad.a0, ad.a0 + ad.sweep, false);
     }
   }
 
   function traceEntity(e) {
+    const z = view.zoom, ox = view.ox, oy = view.oy;
     if (e.type === 'line') {
       const a = P(e.a), b = P(e.b);
       if (!a || !b) return;
-      const sa = w2s(a.x, a.y), sb = w2s(b.x, b.y);
       ctx.beginPath();
-      ctx.moveTo(sa.x, sa.y);
-      ctx.lineTo(sb.x, sb.y);
+      ctx.moveTo(a.x * z + ox, a.y * z + oy);
+      ctx.lineTo(b.x * z + ox, b.y * z + oy);
       ctx.stroke();
     } else if (e.type === 'circle') {
       const c = P(e.c);
       if (!c) return;
-      const cs = w2s(c.x, c.y);
       ctx.beginPath();
-      ctx.arc(cs.x, cs.y, Math.max(0.01, e.r) * view.zoom, 0, TAU);
+      ctx.arc(c.x * z + ox, c.y * z + oy, Math.max(0.01, e.r) * z, 0, TAU);
       ctx.stroke();
     } else if (e.type === 'spline') {
-      const s = splineSamplesOf(e);
-      if (s.length < 2) return;
+      const xy = splineRenderXYOf(e);
+      const n2 = xy.length;
+      if (n2 < 4) return;
       ctx.beginPath();
-      let lx = 0, ly = 0, has = false;
-      const tol2 = 0.75 * 0.75;
-      for (let i = 0; i < s.length; i++) {
-        const p = w2s(s[i].x, s[i].y);
-        if (has) {
-          const dx = p.x - lx, dy = p.y - ly;
-          if (dx * dx + dy * dy < tol2) continue;
-          ctx.lineTo(p.x, p.y);
-        } else {
-          ctx.moveTo(p.x, p.y);
-        }
-        lx = p.x; ly = p.y; has = true;
+      const tol = isMotionSimplified() ? 2.25 : 0.75;
+      const tol2 = tol * tol;
+      let lx = xy[0] * z + ox, ly = xy[1] * z + oy;
+      ctx.moveTo(lx, ly);
+      const last = n2 - 2;
+      for (let i = 2; i < last; i += 2) {
+        const qx = xy[i] * z + ox, qy = xy[i + 1] * z + oy;
+        const dx = qx - lx, dy = qy - ly;
+        if (dx * dx + dy * dy < tol2) continue;
+        ctx.lineTo(qx, qy);
+        lx = qx; ly = qy;
+      }
+      const ex = xy[last] * z + ox, ey = xy[last + 1] * z + oy;
+      if (e.closed) {
+        if ((ex - lx) * (ex - lx) + (ey - ly) * (ey - ly) >= 0.01) ctx.lineTo(ex, ey);
+        ctx.closePath();
+      } else {
+        ctx.lineTo(ex, ey);
       }
       ctx.stroke();
     } else if (e.type === 'arc') {
       const ad = arcData(e);
-      if (!ad) return;
-      const cs = w2s(ad.c.x, ad.c.y);
-      if (ad.sweep < 1e-6) return;
+      if (!ad || ad.sweep < 1e-6) return;
       ctx.beginPath();
-      ctx.arc(cs.x, cs.y, ad.r * view.zoom, ad.a0, ad.a0 + ad.sweep, false);
+      ctx.arc(ad.c.x * z + ox, ad.c.y * z + oy, ad.r * z, ad.a0, ad.a0 + ad.sweep, false);
       ctx.stroke();
     }
   }
@@ -20724,89 +21473,123 @@
   let byLayerEpoch = -1;
   let guideIdCache = null;
 
+  let renderOnlyEntities = null;
+  let renderBakingBackdrop = false;
+
   function drawEntities() {
     const bulk = bulkActive();
     // stroke width = Settings > Renderer: base px at 100% zoom, clamped growth
     const lw = LINE_WIDTH * clamp(view.zoom, LINE_ZOOM_MIN, LINE_ZOOM_MAX);
-    // Selected shapes used to be drawn at a hardcoded 1.3x. Where a thick stroke
-    // only helps you spot the selection, it costs fill rate on every selected
-    // shape — dragging hundreds went slow. It is a setting now, so the trade can
-    // be made per document.
     const selLw = SEL_WIDTH * clamp(view.zoom, LINE_ZOOM_MIN, LINE_ZOOM_MAX);
-    // selecting everything after an import is normal; painting each selected entity
-    // on its own would undo the batching
     const manySelected = selectionCount('entity') > 400;
     const batch = new Map();
     const selBatch = new Map();
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+    // Adaptive motion simplification: bevel/butt joins while moving are 3-5x
+    // faster on Intel onboard GPUs; crisp round joins resume when stopped.
+    const motionSimple = isMotionSimplified() && !renderBakingBackdrop;
+    ctx.lineCap = motionSimple ? 'butt' : 'round';
+    ctx.lineJoin = motionSimple ? 'bevel' : 'round';
 
-    // No selection halo: drawing every selected object twice cost more than
-    // the whole frame. A selected object shows by its colour brightened
-    // instead (see brightColor).
-
-    // Draw in LAYER ORDER, so the Layers panel is a real stacking control.
-    // The panel lists `state.layers` top to bottom, so the FIRST row is the
-    // TOP layer — which means painting the array in REVERSE: the last layer is
-    // painted first (furthest back) and row 0 is painted last (on top).
-    // Entities keep their own order inside a layer, and any entity whose layer
-    // is missing falls back to the first one (same rule as layerOf()).
-    // grouping is purely structural (entity set + layer assignment), so it is
-    // cached per geometryEpoch and dropped on layer mutations — one linear
-    // pass over the document instead of one per frame
-    if (byLayerEpoch !== geometryEpoch) {
+    if (byLayerEpoch !== staticSceneEpoch) {
       byLayerCache = null;
-      byLayerEpoch = geometryEpoch;
+      byLayerEpoch = staticSceneEpoch;
     }
     if (!byLayerCache) {
-    const byLayer = new Map();
-    for (const l of (state.layers || [])) byLayer.set(l.id, []);
-    const fallbackLayer0 = state.layers && state.layers[0] ? state.layers[0].id : null;
-    const guideIds = new Set();
-    for (const id in state.entities) {
-      const e = state.entities[id];
-      if (!e) continue;
-      if (Array.isArray(e.guide)) for (const gid of e.guide) guideIds.add(+gid);
-      if (e.type === 'array' && e.guideId != null) guideIds.add(+e.guideId);
-    }
-    for (const id in state.entities) {
-      const e = state.entities[id];
-      if (!e || guideIds.has(+id)) continue;   // guides draw in the faint pass
-      const lid = layerOf(e);
-      let bucket = byLayer.get(lid);
-      if (!bucket) bucket = byLayer.get(fallbackLayer0) || null;
-      if (bucket) bucket.push(e);
-    }
-    byLayerCache = byLayer;
-    guideIdCache = guideIds;
+      const byLayer = new Map();
+      for (const l of (state.layers || [])) byLayer.set(l.id, []);
+      const fallbackLayer0 = state.layers && state.layers[0] ? state.layers[0].id : null;
+      const guideIds = new Set();
+      for (const id in state.entities) {
+        const e = state.entities[id];
+        if (!e) continue;
+        if (Array.isArray(e.guide)) for (const gid of e.guide) guideIds.add(+gid);
+        if (e.type === 'array' && e.guideId != null) guideIds.add(+e.guideId);
+      }
+      for (const id in state.entities) {
+        const e = state.entities[id];
+        if (!e || guideIds.has(+id)) continue;
+        const lid = layerOf(e);
+        let bucket = byLayer.get(lid);
+        if (!bucket) bucket = byLayer.get(fallbackLayer0) || null;
+        if (bucket) bucket.push(e);
+      }
+      byLayerCache = byLayer;
+      guideIdCache = guideIds;
     }
     const byLayer = byLayerCache;
     const guideIds = guideIdCache || new Set();
+    const skip = renderSkipEntities;
+    const only = renderOnlyEntities;
+
+    // Fast O(k) dynamic pass for subset drag or single-entity hover overlay
+    if (only) {
+      const layers = state.layers || [];
+      const layerVis = new Map();
+      for (const l of layers) layerVis.set(l.id, l.visible);
+      const gbatch = new Map();
+      let hasGuide = false;
+      for (const eid of only) {
+        const e = state.entities[eid];
+        if (!e) continue;
+        if (guideIds.has(+eid)) {
+          hasGuide = true;
+          continue;
+        }
+        const lid = layerOf(e);
+        if (layerVis.has(lid) && !layerVis.get(lid)) continue;
+        const dim = ui.dimOthers && lid !== ui.activeLayer;
+        if (dim) {
+          ctx.save();
+          ctx.globalAlpha = 0.5;
+          const db = new Map(), dsb = new Map();
+          drawOneEntity(e, bulk, manySelected, lw, selLw, dsb, db);
+          flushEntityBatch(db, lw, manySelected);
+          flushSelectedBatch(dsb, selLw);
+          ctx.restore();
+        } else {
+          drawOneEntity(e, bulk, manySelected, lw, selLw, selBatch, batch);
+        }
+      }
+      flushEntityBatch(batch, lw, manySelected);
+      flushSelectedBatch(selBatch, selLw);
+      if (hasGuide) {
+        ctx.save();
+        ctx.globalAlpha = 0.25;
+        for (const eid of only) {
+          if (!guideIds.has(+eid)) continue;
+          const e = state.entities[eid];
+          if (e) drawOneEntity(e, bulk, manySelected, lw, selLw, gbatch, gbatch);
+        }
+        flushEntityBatch(gbatch, lw, manySelected);
+        ctx.restore();
+      }
+      return;
+    }
+
     const layers = state.layers || [];
     for (let li = layers.length - 1; li >= 0; li--) {
       const l = layers[li];
       if (!l.visible) continue;
-      // DIM: every layer but the active one is drawn at half strength (darkened
-      // by 50%), so a bright reference picture recedes while the geometry being
-      // drawn on the active layer keeps its full contrast. The batched strokes
-      // are flushed per layer, inside the same alpha, or they would come back
-      // at full strength.
       const dim = ui.dimOthers && l.id !== ui.activeLayer;
       if (dim) { ctx.save(); ctx.globalAlpha = 0.5; }
-      for (const e of (byLayer.get(l.id) || [])) drawOneEntity(e, bulk, manySelected, lw, selLw, selBatch, batch);
+      const list = byLayer.get(l.id) || [];
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        if (skip && skip.has(+e.id)) continue;
+        drawOneEntity(e, bulk, manySelected, lw, selLw, selBatch, batch);
+      }
       flushEntityBatch(batch, lw, manySelected);
       flushSelectedBatch(selBatch, selLw);
       batch.clear();
       selBatch.clear();
       if (dim) ctx.restore();
     }
-    // Owned construction lines (text/frame/array guides): faint (25%), so a
-    // green guide over red text reads as a guide, not as a stroke on top of it.
     if (guideIds.size) {
       ctx.save();
       ctx.globalAlpha = 0.25;
       const gbatch = new Map();
       for (const id in state.entities) {
+        if (skip && skip.has(+id)) continue;
         const e = state.entities[id];
         if (!e || !guideIds.has(+id)) continue;
         drawOneEntity(e, bulk, manySelected, lw, selLw, gbatch, gbatch);
@@ -20851,7 +21634,7 @@
       return;
     }
     const isSel = selected('entity', +e.id);
-    const isHover = ui.hover && ui.hover.kind === 'entity' && ui.hover.id === +e.id;
+    const isHover = !renderBakingBackdrop && ui.hover && ui.hover.kind === 'entity' && ui.hover.id === +e.id;
     // A selected LINE is painted by the amber selection band instead (see
     // lineDrawnAsSegment): drawing the brightened stroke underneath too produced
     // a doubled line with a white rim. Skipped here entirely, so the band is the
@@ -22224,6 +23007,235 @@
     return false;
   }
 
+  function constraintResidualSq(c) {
+    if (!c || c.reference) return 0;
+    const pt = (pid) => state.points[pid];
+    const radOf = (eid) => {
+      const e = state.entities[eid];
+      if (!e) return 1;
+      if (e.type === 'arc') {
+        const cc = pt(e.c), s = pt(e.s);
+        return (cc && s) ? Math.hypot(s.x - cc.x, s.y - cc.y) : 1;
+      }
+      return Math.max(0.01, e.r);
+    };
+    if (c.type === 'coincident') {
+      const a = pt(c.p1), b = pt(c.p2);
+      if (!a || !b) return 0;
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return dx * dx + dy * dy;
+    }
+    if (c.type === 'distance') {
+      const a = pt(c.p1), b = pt(c.p2);
+      if (!a || !b) return 0;
+      const d = Math.hypot(b.x - a.x, b.y - a.y) - c.value;
+      return d * d;
+    }
+    if (c.type === 'radius') {
+      if (!state.entities[c.entity]) return 0;
+      const d = radOf(c.entity) - c.value;
+      return d * d;
+    }
+    if (c.type === 'horizontal' || c.type === 'vertical') {
+      const e = state.entities[c.entity];
+      if (!e || e.type !== 'line') return 0;
+      const a = pt(e.a), b = pt(e.b);
+      if (!a || !b) return 0;
+      const d = c.type === 'horizontal' ? (b.y - a.y) : (b.x - a.x);
+      return d * d;
+    }
+    if (c.type === 'horizontalPoints' || c.type === 'verticalPoints') {
+      const a = pt(c.p1), b = pt(c.p2);
+      if (!a || !b) return 0;
+      const d = c.type === 'horizontalPoints' ? (b.y - a.y) : (b.x - a.x);
+      return d * d;
+    }
+    if (c.type === 'pointDim') {
+      const p = pt(c.p), e = state.entities[c.entity];
+      if (!p || !e) return 0;
+      const eps = c.side == null ? 1 : c.side;
+      if (e.type === 'line') {
+        const a = pt(e.a), b = pt(e.b);
+        if (!a || !b) return 0;
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+        if (len < 1e-9) return 0;
+        const r = ((p.x - a.x) * dy - (p.y - a.y) * dx) / len - eps * c.value;
+        return r * r;
+      }
+      const cc = pt(e.c);
+      if (!cc) return 0;
+      const r = Math.hypot(p.x - cc.x, p.y - cc.y) - radOf(c.entity) - eps * c.value;
+      return r * r;
+    }
+    if (c.type === 'pointOn') {
+      const p = pt(c.p), e = state.entities[c.entity];
+      if (!p || !e) return 0;
+      if (e.type === 'line') {
+        const a = pt(e.a), b = pt(e.b);
+        if (!a || !b) return 0;
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+        if (len < 1e-9) return 0;
+        const r = 20 * (((p.x - a.x) * dy - (p.y - a.y) * dx) / len);
+        return r * r;
+      }
+      if (e.type === 'arc' || e.type === 'circle') {
+        const cc = pt(e.c);
+        if (!cc) return 0;
+        const r = 20 * (Math.hypot(p.x - cc.x, p.y - cc.y) - radOf(c.entity));
+        return r * r;
+      }
+      return 0;
+    }
+    if (c.type === 'tangent') {
+      const e1 = state.entities[c.line], e2 = state.entities[c.entity];
+      if (!e1 || !e2 || e1.type !== 'line' || (e2.type !== 'arc' && e2.type !== 'circle')) return 0;
+      const a = pt(e1.a), b = pt(e1.b), oc = pt(e2.c);
+      if (!a || !b || !oc) return 0;
+      const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+      if (len < 1e-9) return 0;
+      const perp = ((oc.x - a.x) * dy - (oc.y - a.y) * dx) / len;
+      const r = (c.side == null ? 1 : c.side) * perp - radOf(c.entity);
+      return r * r;
+    }
+    if (c.type === 'tangentAt') {
+      const e1 = state.entities[c.line], e2 = state.entities[c.entity], p = pt(c.p);
+      if (!e1 || !e2 || !p || e1.type !== 'line' || (e2.type !== 'arc' && e2.type !== 'circle')) return 0;
+      const a = pt(e1.a), b = pt(e1.b), oc = pt(e2.c);
+      if (!a || !b || !oc) return 0;
+      const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+      if (len < 1e-9) return 0;
+      const r = ((dx / len) * (p.x - oc.x) + (dy / len) * (p.y - oc.y)) * 10;
+      return r * r;
+    }
+    if (c.type === 'midpoint') {
+      const p = pt(c.p), e = state.entities[c.entity];
+      if (!p || !e || e.type !== 'line') return 0;
+      const a = pt(e.a), b = pt(e.b);
+      if (!a || !b) return 0;
+      const rx = (p.x - (a.x + b.x) / 2) * 2, ry = (p.y - (a.y + b.y) / 2) * 2;
+      return rx * rx + ry * ry;
+    }
+    if (c.type === 'aspect') {
+      if (textDimCount(c.entity) >= 2) return 0;
+      const t0 = pt(c.p0), t1 = pt(c.pw), t2 = pt(c.ph);
+      if (!t0 || !t1 || !t2) return 0;
+      const wa = Math.hypot(t1.x - t0.x, t1.y - t0.y);
+      const hb = Math.hypot(t2.x - t0.x, t2.y - t0.y);
+      if (!(wa > 1e-9)) return 0;
+      const r = 20 * (hb * (c.ratio || 1) - wa);
+      return r * r;
+    }
+    if (c.type === 'equal') {
+      const e1 = state.entities[c.line1], e2 = state.entities[c.line2];
+      if (!e1 || !e2) return 0;
+      const r1 = e1.type === 'circle' || e1.type === 'arc';
+      const r2 = e2.type === 'circle' || e2.type === 'arc';
+      if (r1 && r2) {
+        const r = 20 * (radOf(c.line1) - radOf(c.line2));
+        return r * r;
+      }
+      if (r1 || r2 || e1.type !== 'line' || e2.type !== 'line') return 0;
+      const a1 = pt(e1.a), b1 = pt(e1.b), a2 = pt(e2.a), b2 = pt(e2.b);
+      if (!a1 || !b1 || !a2 || !b2) return 0;
+      const l1 = Math.hypot(b1.x - a1.x, b1.y - a1.y);
+      const l2 = Math.hypot(b2.x - a2.x, b2.y - a2.y);
+      if (l1 < 1e-9 || l2 < 1e-9) return 0;
+      return (l1 - l2) * (l1 - l2);
+    }
+    if (c.type === 'parallel' || c.type === 'perpendicular') {
+      const e1 = state.entities[c.line1], e2 = state.entities[c.line2];
+      if (!e1 || !e2 || e1.type !== 'line' || e2.type !== 'line') return 0;
+      const a1 = pt(e1.a), b1 = pt(e1.b), a2 = pt(e2.a), b2 = pt(e2.b);
+      if (!a1 || !b1 || !a2 || !b2) return 0;
+      const d1x = b1.x - a1.x, d1y = b1.y - a1.y, d2x = b2.x - a2.x, d2y = b2.y - a2.y;
+      if (Math.hypot(d1x, d1y) < 1e-9 || Math.hypot(d2x, d2y) < 1e-9) return 0;
+      let a = wrapPi(Math.atan2(d2y, d2x) - Math.atan2(d1y, d1x));
+      if (a > Math.PI / 2) a -= Math.PI;
+      else if (a <= -Math.PI / 2) a += Math.PI;
+      if (c.type === 'parallel') return (a * 100) * (a * 100);
+      const target = a >= 0 ? Math.PI / 2 : -Math.PI / 2;
+      let diff = a - target;
+      if (diff > Math.PI / 2) diff -= Math.PI;
+      else if (diff <= -Math.PI / 2) diff += Math.PI;
+      return (diff * 100) * (diff * 100);
+    }
+    if (c.type === 'angle') {
+      const e1 = state.entities[c.line1], e2 = state.entities[c.line2];
+      if (!e1 || !e2 || e1.type !== 'line' || e2.type !== 'line') return 0;
+      const g = angleRays(pt(e1.a), pt(e1.b), pt(e2.a), pt(e2.b));
+      if (!g) return 0;
+      const r = wrapDeg(g.delta * 180 / Math.PI - c.value) * 2;
+      return r * r;
+    }
+    if (c.type === 'fix') {
+      const p = pt(c.p);
+      if (!p) return 0;
+      const rx = (p.x - c.x) * 800, ry = (p.y - c.y) * 800;
+      return rx * rx + ry * ry;
+    }
+    return 0;
+  }
+
+  function anyConstraintViolated() {
+    for (const cid in state.constraints) {
+      if (constraintResidualSq(state.constraints[cid]) > 1e-6) return true;
+    }
+    for (const eid in state.entities) {
+      const e = state.entities[eid];
+      if (!e || e.type !== 'arc') continue;
+      const cc = state.points[e.c], s = state.points[e.s], en = state.points[e.e];
+      if (!cc || !s || !en) continue;
+      const diff = (dist(cc, s) - dist(cc, en)) * 6;
+      if (diff * diff > 1e-6) return true;
+    }
+    return false;
+  }
+
+  function dragHasConstraintViolation(opts) {
+    const dp = new Set();
+    if (opts && opts.dragPoints) {
+      for (const id of opts.dragPoints) dp.add(+id);
+    }
+    const de = opts && opts.dragEntity != null ? +opts.dragEntity
+      : (opts && opts.dragRadiusTarget && opts.dragRadiusTarget.e != null ? +opts.dragRadiusTarget.e : null);
+    const hasEntPt = (eid) => {
+      const e = state.entities[eid];
+      if (!e) return false;
+      if (e.type === 'line') return dp.has(+e.a) || dp.has(+e.b);
+      if (e.type === 'arc') return dp.has(+e.c) || dp.has(+e.s) || dp.has(+e.e);
+      if (e.type === 'circle') return dp.has(+e.c);
+      if (e.type === 'spline') return (e.pts || []).some(pid => dp.has(+pid));
+      return false;
+    };
+    for (const cid in state.constraints) {
+      const c = state.constraints[cid];
+      if (!c || c.reference) continue;
+      let touches = false;
+      if (c.p != null && dp.has(+c.p)) touches = true;
+      else if (c.p1 != null && (dp.has(+c.p1) || dp.has(+c.p2))) touches = true;
+      else if (c.p0 != null && (dp.has(+c.p0) || dp.has(+c.pw) || dp.has(+c.ph))) touches = true;
+      else if (c.entity != null && (+c.entity === de || (c.type !== 'radius' && hasEntPt(c.entity)))) touches = true;
+      else if (c.line != null && (+c.line === de || hasEntPt(c.line))) touches = true;
+      else if (c.line1 != null && (+c.line1 === de || +c.line2 === de || hasEntPt(c.line1) || hasEntPt(c.line2))) touches = true;
+      if (touches && constraintResidualSq(c) > 1e-6) return true;
+    }
+    if (dp.size) {
+      for (const eid in state.entities) {
+        const e = state.entities[eid];
+        if (!e || e.type !== 'arc') continue;
+        const n = (dp.has(+e.c) ? 1 : 0) + (dp.has(+e.s) ? 1 : 0) + (dp.has(+e.e) ? 1 : 0);
+        if (n > 0 && n < 3) {
+          const cc = state.points[e.c], s = state.points[e.s], en = state.points[e.e];
+          if (cc && s && en) {
+            const diff = (dist(cc, s) - dist(cc, en)) * 6;
+            if (diff * diff > 1e-6) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   // The dimensions-only dim tone. It used to be called `dimColor` as well, and
   // being the later declaration of the two in this scope it silently replaced
   // the memoized colour-mix version — so every art / clone / part dimmed to a
@@ -23234,12 +24246,17 @@
   function drawNotes() {
     const notes = getNoteEntities();
     if (!notes.length) return;
+    const skip = renderSkipEntities;
+    const only = renderOnlyEntities;
     const h = noteFontPx();
     ctx.save();
     ctx.font = h + 'px sans-serif';
     ctx.textBaseline = 'top';
     for (let i = 0; i < notes.length; i++) {
       const e = notes[i];
+      const eid = +e.id;
+      if (skip && skip.has(eid)) continue;
+      if (only && !only.has(eid)) continue;
       if (!layerVisible(e)) continue;
       const p = P(e.p);
       if (!p) continue;
@@ -23247,7 +24264,7 @@
       const sy = p.y * view.zoom + view.oy;
       if (sx > W + 20 || sy > H + 20 || sy + h < -20) continue;
       const txt = e.text || '';
-      if (selected('entity', +e.id)) {
+      if (selected('entity', eid)) {
         const w = ctx.measureText(txt).width;
         ctx.fillStyle = 'rgba(37, 99, 235, 0.16)';
         ctx.fillRect(sx - 2, sy - 2, w + 4, h + 4);
@@ -23256,6 +24273,61 @@
       ctx.fillText(txt, sx, sy);
     }
     ctx.restore();
+  }
+
+  // ---- Static scene backdrop cache (pure Canvas 2D) ----------------------
+  // Caches the static layers (grid + axes + bitmaps + loop fills + static
+  // entities + arrays + parts + notes) in a pooled offscreen canvas so hover,
+  // marquee, drafting new objects, and dragging a subset of objects blit the
+  // untouched scene with one drawImage instead of repainting 1,000+ paths.
+  let sceneBackdropCanvas = null;
+  let sceneBackdropCtx = null;
+  let sceneBackdropKey = null;
+  let sceneBackdropSelIdx = null;
+  let sceneBackdropSelLen = -1;
+  let backdropDragSeq = 0;
+
+  function ensureDragBackdropSkip(d) {
+    if (!d || !d.moved) return null;
+    if (d._backdropSkipInit) return d._backdropSkip;
+    d._backdropSkipInit = true;
+    const total = entityCount();
+    const limit = Math.max(40, Math.floor(total * 0.65));
+    let set = null;
+    if ((d.kind === 'entity' || d.kind === 'point') && (d.ids || d.clones)) {
+      set = new Set();
+      if (d.ids) {
+        for (let i = 0; i < d.ids.length; i++) {
+          const uses = pointUses(d.ids[i]);
+          if (uses) {
+            for (let j = 0; j < uses.length; j++) {
+              set.add(+uses[j].id);
+              if (set.size > limit) { d._backdropSkip = null; return null; }
+            }
+          }
+        }
+      }
+      if (d.clones) {
+        for (let i = 0; i < d.clones.length; i++) set.add(+d.clones[i].id);
+      }
+    } else if (d.kind === 'radius' && d.id != null) {
+      set = new Set([+d.id]);
+    } else if ((d.kind === 'splineHandle' || d.kind === 'xfMoveInstance') && d.eid != null) {
+      set = new Set([+d.eid]);
+    } else if (d.kind === 'partMarker' && d.startPose && d.part != null) {
+      set = new Set([+d.part]);
+    } else if (d.kind === 'partBody' && !d.mated && d.part != null) {
+      set = new Set([+d.part]);
+    } else if (d.kind === 'partsGroup' && d.ids) {
+      set = new Set(d.ids.map(Number));
+    }
+    if (!set || !set.size || set.size > limit) {
+      d._backdropSkip = null;
+      return null;
+    }
+    d._backdropSkip = set;
+    d._backdropSkipSig = 'd' + (++backdropDragSeq);
+    return set;
   }
 
   // ---- Per-pass render profiler (debug) ---------------------------------
@@ -23318,35 +24390,116 @@
       return;
     }
     ctx.save();
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, W, H);
-    // camera lift while dragging a single point on touch: the whole scene
-    // renders a little higher so the grabbed point (and its snap target) stay
-    // above the finger. Interaction math stays on the real pointer.
-    if (ui._dragLift) ctx.translate(0, -TOUCH_LIFT_PX);
-    drawGrid();
-    drawAxes();
-    // A reference picture is a backdrop: its bitmap goes under the fills and the
-    // geometry, so drawing on top of it behaves like drawing on blank paper.
-    // Its dashed frame is still drawn with the other entities.
-    drawImageBitmaps();
-    // FAST MODE (zoom settle inside the fast window): skip everything that
-    // paints large numbers of low-information pixels — loop fills/tints,
-    // notes, dimension/badge annotations — the full scene follows right after
-    // the window closes (see scheduleZoomSettle)
-    // L temporarily hides the loop fills+tints (the settings switches still
-    // apply on top when L brings them back)
-    if (!fastMode && (loopFillCurrentVisible || loopFillOthersVisible) && !loopFillTempOff) {
-      prof('loopfills', () => { drawLoopFills(); });
+    // Decide whether to serve the static layers from the pooled offscreen
+    // backdrop (active for drawings with >= 24 entities whenever we are idle,
+    // hovering, drafting, marqueeing, or dragging a subset of entities).
+    const dragMoving = !!(ui.drag && ui.drag.moved && isMotionSimplified());
+    const dragSkipSet = dragMoving ? ensureDragBackdropSkip(ui.drag) : null;
+    const useBackdrop = !fastMode && !ui._dragLift && entityCount() >= 24 &&
+      (!dragMoving || !!dragSkipSet) && canvas.width > 0 && canvas.height > 0;
+
+    if (useBackdrop) {
+      if (!sceneBackdropCanvas) {
+        sceneBackdropCanvas = document.createElement('canvas');
+        sceneBackdropCtx = sceneBackdropCanvas.getContext('2d', { alpha: false }) ||
+          sceneBackdropCanvas.getContext('2d');
+        themeContext(sceneBackdropCtx);
+      }
+      if (sceneBackdropCanvas.width !== canvas.width || sceneBackdropCanvas.height !== canvas.height) {
+        sceneBackdropCanvas.width = canvas.width;
+        sceneBackdropCanvas.height = canvas.height;
+        sceneBackdropKey = null;
+      }
+      let laySig = '';
+      const ls = state.layers || [];
+      for (let i = 0; i < ls.length; i++) laySig += ls[i].id + (ls[i].visible ? '1' : '0') + ',';
+      const skipSig = dragSkipSet ? (ui.drag._backdropSkipSig || '') : '';
+      const fillFlags = (loopFillCurrentVisible ? 1 : 0) + '' + (loopFillOthersVisible ? 1 : 0) +
+        (loopFillTempOff ? 1 : 0) + '|' + loopFillScale;
+      const bKey = staticSceneEpoch + '|' + themeName + '|' + view.zoom + '|' + view.ox + '|' + view.oy + '|' +
+        W + 'x' + H + '|' + DPR + '|' + (ui.showGrid ? 1 : 0) + '|' + (ui.dimOthers ? 1 : 0) + '|' +
+        ui.activeLayer + '|' + laySig + '|' + fillFlags + '|' + LINE_WIDTH + '|' + SEL_WIDTH + '|' +
+        NOTE_SIZE + '|' + NOTE_MIN_PX + '|' + NOTE_COLOR + '|' + PART_WIDTH + '|' + skipSig;
+      const selIdx = selectionIndex();
+      if (sceneBackdropKey !== bKey || sceneBackdropSelIdx !== selIdx || sceneBackdropSelLen !== ui.selection.length) {
+        renderSkipEntities = dragSkipSet;
+        renderSkipSig = skipSig;
+        renderBakingBackdrop = true;
+        ctx = sceneBackdropCtx;
+        try {
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, W, H);
+          drawGrid();
+          drawAxes();
+          drawImageBitmaps();
+          if ((loopFillCurrentVisible || loopFillOthersVisible) && !loopFillTempOff) {
+            prof('loopfills', () => { drawLoopFills(); });
+          }
+          prof('entities', () => drawEntities());
+          prof('arrays', () => drawArrays());
+          prof('notes', () => drawNotes());
+        } finally {
+          ctx = mainCtx;
+          renderSkipEntities = null;
+          renderSkipSig = '';
+          renderBakingBackdrop = false;
+        }
+        sceneBackdropKey = bKey;
+        sceneBackdropSelIdx = selIdx;
+        sceneBackdropSelLen = ui.selection.length;
+      }
+      ctx.drawImage(sceneBackdropCanvas, 0, 0, W, H);
+      if (dragSkipSet && dragSkipSet.size) {
+        renderOnlyEntities = dragSkipSet;
+        try {
+          prof('entities', () => drawEntities());
+          prof('arrays', () => drawArrays());
+          prof('notes', () => drawNotes());
+        } finally {
+          renderOnlyEntities = null;
+        }
+      } else if (ui.hover && ui.hover.kind === 'entity' && state.entities[ui.hover.id]) {
+        renderOnlyEntities = new Set([+ui.hover.id]);
+        try {
+          drawEntities();
+        } finally {
+          renderOnlyEntities = null;
+        }
+      }
+      prof('partMarkers', () => drawPartMarkers());
+      prof('mates', () => drawMates());
+    } else {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+      // camera lift while dragging a single point on touch: the whole scene
+      // renders a little higher so the grabbed point (and its snap target) stay
+      // above the finger. Interaction math stays on the real pointer.
+      if (ui._dragLift) ctx.translate(0, -TOUCH_LIFT_PX);
+      drawGrid();
+      drawAxes();
+      // A reference picture is a backdrop: its bitmap goes under the fills and the
+      // geometry, so drawing on top of it behaves like drawing on blank paper.
+      // Its dashed frame is still drawn with the other entities.
+      drawImageBitmaps();
+      // FAST MODE (zoom settle inside the fast window): skip everything that
+      // paints large numbers of low-information pixels — loop fills/tints,
+      // notes, dimension/badge annotations — the full scene follows right after
+      // the window closes (see scheduleZoomSettle)
+      // L temporarily hides the loop fills+tints (the settings switches still
+      // apply on top when L brings them back)
+      if (!fastMode && (loopFillCurrentVisible || loopFillOthersVisible) && !loopFillTempOff) {
+        prof('loopfills', () => { drawLoopFills(); });
+      }
+      prof('entities', () => drawEntities());
+      prof('arrays', () => drawArrays());
+      prof('partMarkers', () => drawPartMarkers());
+      prof('mates', () => drawMates());
+      if (!fastMode) prof('notes', () => drawNotes());
     }
-    prof('entities', () => drawEntities());
-    prof('arrays', () => drawArrays());
-    prof('partMarkers', () => drawPartMarkers());
-    prof('mates', () => drawMates());
     prof('partHighlight', () => drawPartHighlight());
     prof('wallBarriers', () => drawWallBarriers());
     prof('wallDrag', () => drawWallDrag());
-    if (!fastMode) prof('notes', () => drawNotes());
     prof('offsetPreview', () => drawOffsetPreview());
     prof('segmentHighlight', () => drawSegmentHighlight());
     prof('preview', () => drawPreview());
@@ -23440,6 +24593,9 @@
       const n = getLoops().length;
       const s = n + (n === 1 ? ' loop' : ' loops');
       if (loopsEl.textContent !== s) loopsEl.textContent = s;
+    }
+    if (ui.solveDirty && !ui.drag && typeof anyConstraintViolated === 'function' && !anyConstraintViolated()) {
+      ui.solveDirty = false;
     }
     const solverEl = document.getElementById('status-solver');
     let text;
@@ -23543,14 +24699,6 @@
     return base + ' Frame: Alt+R jumps to L/T/W/H (+20 = move +20, Tab = next box). Dimension: select 2 points / 1–2 lines / circle, then D (driving) or Shift+D (measure). Constraints: H V P Q O G M . [ F J on a selection.';
   }
 
-  function syncWallInput() {
-    const el = document.getElementById('wall-mm');
-    if (!el) return;
-    if (document.activeElement === el) return;   // never overwrite what is being typed
-    const v = String(Math.round(clamp(+settings.wallDragMm || 0, 0, 50) * 100) / 100);
-    if (el.value !== v) el.value = v;
-  }
-
   // The mode has to be visible even when the Arrange ribbon is on another page
   // or the panels are collapsed: a top-right pill plus an amber stage frame.
   function syncWallIndicator() {
@@ -23598,7 +24746,7 @@
       sig = 'mate:' + mateJob.stage;
     } else if (ui.tool === 'dragwall') {
       sig = 'dragwall:' + fmt(WALL_DRAG_MM);
-    } else if (ui.solveDirty) {
+    } else if (ui.solveDirty && !ui.drag) {
       sig = 'solve-dirty';
     }
 
@@ -23821,7 +24969,6 @@
     document.querySelectorAll('.tool-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.tool === ui.tool);
     });
-    syncWallInput();
     syncWallIndicator();
     // Every line colour used by the selection gets a dot, not just the first:
     // a selection mixing red and black (or a multi-colour group / array) has to
@@ -24305,16 +25452,26 @@
         });
       }
     }
+    const onlyCur = otCurrentLayerOnly();
+    const layerOk = (L) => !onlyCur || loopLayerId(L) === ui.activeLayer;
+    const countEl = document.getElementById('tree-count');
+    // Skip building the full containment LoopTree while the Object Tree panel
+    // is collapsed — counting loops directly from getLoops() avoids O(N^2)
+    // containment work on every edit, undo, and redo.
+    if (!panel.open) {
+      if (countEl) {
+        const loops = getLoops();
+        countEl.textContent = String(onlyCur ? loops.filter(layerOk).length : loops.length);
+      }
+      list.__lastSig = null;
+      return;
+    }
     const t = loopTree();
     // Layers are independent hierarchies (the tree nests per layer), so the
     // panel can show just the active one: roots and loose objects filtered by
     // layer, children inherit their root's layer.
-    const onlyCur = otCurrentLayerOnly();
-    const layerOk = (L) => !onlyCur || loopLayerId(L) === ui.activeLayer;
     const roots = t.roots.filter(layerOk);
-    const countEl = document.getElementById('tree-count');
     if (countEl) countEl.textContent = String(onlyCur ? t.loops.filter(layerOk).length : t.loops.length);
-    if (!panel.open) { list.__lastSig = null; return; }
     // Rebuild only when the tree, the selection or the open/closed state
     // changed — the tree epoch is stable during a drag (frozen loops), so drag
     // frames cost nothing here.
@@ -24712,9 +25869,15 @@
   // the copied region entirely, so it disappeared during the drag.
   function frameSnapshot() {
     try {
-      const snap = document.createElement('canvas');
-      snap.width = canvas.width;
-      snap.height = canvas.height;
+      let snap = frameSnapshot._pool;
+      if (!snap) {
+        snap = document.createElement('canvas');
+        frameSnapshot._pool = snap;
+      }
+      if (snap.width !== canvas.width || snap.height !== canvas.height) {
+        snap.width = canvas.width;
+        snap.height = canvas.height;
+      }
       snap.getContext('2d').drawImage(canvas, 0, 0);
       return snap;
     } catch (err) {
@@ -26544,7 +27707,7 @@
     if (d.chain.length === 1) d.firstId = aId;
     const closing = d.firstId != null && bId === d.firstId && d.chain.length >= 2;
     requestSolve();
-    commit();
+    commit({ dirtyEntities: [id], dirtyPoints: [aId, bId] });
     if (closing) { cancelDraft(); toast('Loop closed — the chain is done'); }
     return true;
   }
@@ -26634,7 +27797,7 @@
           ui.draft = null;
           ui.selection = [{ kind: 'entity', id }];
           requestSolve();
-          commit();
+          commit({ dirtyEntities: [id], dirtyPoints: [cId] });
           render();
           return;
         }
@@ -26647,7 +27810,7 @@
         ui.draft = null;
         ui.selection = [{ kind: 'entity', id }];
         requestSolve();
-        commit();
+        commit({ dirtyEntities: [id], dirtyPoints: [cId, sId, eId] });
         render();
         return;
       }
@@ -26669,7 +27832,7 @@
         ui.draft = null;
         ui.selection = [{ kind: 'entity', id }];
         requestSolve();
-        commit();
+        commit({ dirtyEntities: [id], dirtyPoints: [cId] });
         // Same as pressing D with the new circle selected: one value sets
         // the radius, two values (100,200) turn it into an ellipse curve.
         createDimension();
@@ -26752,7 +27915,8 @@
         }
         ui.draft = null;
         requestSolve();
-        commit();
+        if (r > 1e-4) commit();
+        else commit({ dirtyEntities: [l1, l2, l3, l4], dirtyPoints: [p1, p2, p3, p4] });
       }
       render();
       return;
@@ -26804,7 +27968,7 @@
       ui.draft = null;
       ui.selection = ids.map(id => ({ kind: 'entity', id }));
       requestSolve();
-      commit();
+      commit({ dirtyEntities: ids, dirtyPoints: pids });
       toast(inner > 0 ? sides + '-point star created' : sides + '-gon created');
       return;
     }
@@ -26880,7 +28044,7 @@
     ui.selection = [{ kind: 'entity', id }];
     requestSolve();
     cleanupPoints();
-    commit();
+    commit({ dirtyEntities: [id], dirtyPoints: pts });
     toast(closed ? 'Closed cubic curve created' : 'Cubic curve created');
   }
 
@@ -27824,7 +28988,7 @@ function cmdSplitCurve() {
         node.i = { x: 2 * dr.startX - world.x, y: 2 * dr.startY - world.y };
         dr.moved = true;
       }
-      render();
+      scheduleRender();
       return;
     }
 
@@ -27927,7 +29091,7 @@ function cmdSplitCurve() {
             ty: d.startPose.ty + dy + sy,
             rot: d.startPose.rot
           };
-          invalidateLoops();
+          invalidateLoops({ dirtyEntities: [d.part] });
         } else {
           // MECHANISM drag (mated part): the raw mouse position is the target
           // for the grabbed marker — the solver simulates the joints live, no
@@ -27997,7 +29161,7 @@ function cmdSplitCurve() {
         xfApplyPreview();
         d.moved = true;
         xfUpdatePanel();
-        render();
+        scheduleRender();
         return;
       }
       if (d.kind === 'xfScale') {
@@ -28028,7 +29192,7 @@ function cmdSplitCurve() {
         xfApplyPreview();
         d.moved = true;
         xfUpdatePanel();
-        render();
+        scheduleRender();
         return;
       }
       if (d.kind === 'xfPivot') {
@@ -28068,8 +29232,8 @@ function cmdSplitCurve() {
           });
           delete e.shapes;
           d.moved = true;
-          invalidateLoops();
-          render();
+          invalidateLoops({ dirtyEntities: [d.eid] });
+          scheduleRender();
         }
         return;
       }
@@ -28084,19 +29248,13 @@ function cmdSplitCurve() {
           xfUpdatePanel();
         }
         d.moved = true;
-        render();
+        scheduleRender();
         return;
       }
       if (d.kind === 'splineHandle') {
         const e = state.entities[d.eid];
         const h = e && e.hs && e.hs[d.which] ? e.hs[d.which][d.idx] : null;
         if (h) {
-          // Shift-drag keeps the OPPOSITE handle of the same node mirroring the
-          // move, so the node stays smooth (one tangent, two opposing arms)
-          // instead of developing a kink. Ctrl (or Cmd) forces the far arm to the
-          // same LENGTH too, which gives a symmetric node instead of a one-sided
-          // bulge; add Shift to get both. Alt breaks the pairing entirely and
-          // moves one arm alone — that is how a corner is made by hand.
           const other = d.which === 'o' ? 'i' : 'o';
           const oh = e.hs[other] ? e.hs[other][d.idx] : null;
           const p = e.pts[d.idx] != null ? P(e.pts[d.idx]) : null;
@@ -28107,17 +29265,13 @@ function cmdSplitCurve() {
             const dx = h.x - p.x, dy = h.y - p.y;
             const len = Math.hypot(dx, dy);
             if (len > 1e-9) {
-              // Opposite direction always; the length is copied when Ctrl is held
-              // and preserved from the far arm otherwise.
               const olen = sym ? len : (Math.hypot(oh.x - p.x, oh.y - p.y) || len);
               oh.x = p.x - (dx / len) * olen;
               oh.y = p.y - (dy / len) * olen;
             }
           }
           d.moved = true;
-          // moving a handle changes the curve geometry: without this the loop
-          // fill keeps the pre-drag shape while the outline redraws live
-          invalidateLoops();
+          invalidateLoops({ dirtyEntities: [d.eid] });
           scheduleRender();
         }
         return;
@@ -28291,7 +29445,10 @@ function cmdSplitCurve() {
           }
         }
         d.moved = !d.wall || !!d.wall.movedAny;
-        invalidateLoops();
+        invalidateLoops({
+          dirtyPoints: d.ids,
+          dirtyEntities: (d.clones && d.clones.length) ? d.clones.map(c => c.id) : null
+        });
         // Remember what the gesture is carrying so the timed auto-solve and the
         // release solve can use the SAME target. A solve without the target is
         // a blind projection: it moves the point away from the cursor, the next
@@ -28300,11 +29457,10 @@ function cmdSplitCurve() {
         d.lastResidualScale = 1;
         d.lastDx = dx;
         d.lastDy = dy;
-        // dragPoints lets the solver's gate skip the whole solve when no
-        // constraint reads the points being dragged (live mode would
-        // otherwise rebuild the Jacobian every move for nothing)
-        requestSolve({ dragTargets: targets, residualScale: 1, dragPoints: d.ids }, 90);
-        scheduleDragAutoSolve();
+        if (d.ids && d.ids.length) {
+          requestSolve({ dragTargets: targets, residualScale: 1, dragPoints: d.ids }, 90);
+          scheduleDragAutoSolve();
+        }
         scheduleRender();
         updateStatusCounts();
         return;
@@ -28320,7 +29476,7 @@ function cmdSplitCurve() {
           }
         }
         d.moved = true;
-        invalidateLoops();
+        invalidateLoops({ dirtyEntities: [d.id] });
         d.lastRadiusTarget = { e: d.id, r: e ? e.r : 0, w: DRAG_TARGET_W };
         requestSolve({ dragPoints: [], dragEntity: d.id, dragRadiusTarget: d.lastRadiusTarget });
         scheduleDragAutoSolve();
@@ -28329,11 +29485,6 @@ function cmdSplitCurve() {
         return;
       }
       if (d.kind === 'rubber') {
-        // A press inside a loop waits for the same decision: movement inside
-        // PRESS_DWELL_MS stays the rectangle, a held press (past the dwell)
-        // selects the loop — the selection the click would have made — and
-        // the drag moves it. This event replays into the new drag like the
-        // object press above.
         if (d.deferredLoop && d.mouse && !d.dwellDecided) {
           if (Math.abs(pos.x - d.start.x) > PRESS_SLOP_PX ||
               Math.abs(pos.y - d.start.y) > PRESS_SLOP_PX) {
@@ -28342,22 +29493,19 @@ function cmdSplitCurve() {
               applyLoopClick(d.deferredLoop, !!m.add, !!m.sub, !!m.alt);
               const at = selectionBodyDragFor(world);
               if (at) {
-                // The undo step of the whole gesture: taken before the drag
-                // moves anything, exactly like beginEntityPress does.
                 pushHistory();
                 ui.drag = at;
                 onPointerMove(ev);
                 return;
               }
             }
-            d.dwellDecided = true;   // moved: this press is a rectangle
+            d.dwellDecided = true;
           }
         }
         ui.rubber = {
           x0: Math.min(d.start.x, pos.x), y0: Math.min(d.start.y, pos.y),
           x1: Math.max(d.start.x, pos.x), y1: Math.max(d.start.y, pos.y)
         };
-        // coalesced redraw: many pointer events per frame, one paint per frame
         scheduleRender();
         return;
       }
@@ -28368,7 +29516,7 @@ function cmdSplitCurve() {
           const along = (world.x - d.startWorld.x) * n.nx + (world.y - d.startWorld.y) * n.ny;
           c.offset = d.orig + along;
           d.moved = true;
-          render();
+          scheduleRender();
         }
         return;
       }
@@ -28377,7 +29525,7 @@ function cmdSplitCurve() {
         if (c) {
           c.radius = Math.max(14, Math.hypot(world.x - d.vertex.x, world.y - d.vertex.y));
           d.moved = true;
-          render();
+          scheduleRender();
         }
         return;
       }
@@ -29625,28 +30773,59 @@ function cmdSplitCurve() {
           toast('Coincident constraint added');
         }
       }
+      ui.drag = null;
       if (d.moved && (d.kind === 'point' || d.kind === 'entity' || d.kind === 'radius')) {
+        // Snapshot constrained points before solveRelease so we know every
+        // point the solver moved and can invalidate only affected caches.
+        const beforeC = new Map();
+        for (const cid in state.constraints) {
+          const c = state.constraints[cid];
+          const rec = (pid) => {
+            if (pid == null || beforeC.has(+pid)) return;
+            const pt = state.points[pid];
+            if (pt) beforeC.set(+pid, [pt.x, pt.y]);
+          };
+          rec(c.p1); rec(c.p2); rec(c.p);
+          if (c.entity != null && state.entities[c.entity]) {
+            for (const pid of entityPointIds(state.entities[c.entity])) rec(pid);
+          }
+          if (c.line != null && state.entities[c.line]) {
+            for (const pid of entityPointIds(state.entities[c.line])) rec(pid);
+          }
+          if (c.line1 != null && state.entities[c.line1]) {
+            for (const pid of entityPointIds(state.entities[c.line1])) rec(pid);
+          }
+          if (c.line2 != null && state.entities[c.line2]) {
+            for (const pid of entityPointIds(state.entities[c.line2])) rec(pid);
+          }
+        }
         solveRelease(d);
-        invalidateLoops();
-        updateUI();
+        const dirtyPts = new Set(d.ids || []);
+        for (const [pid, xy] of beforeC) {
+          const pt = state.points[pid];
+          if (pt && (pt.x !== xy[0] || pt.y !== xy[1])) dirtyPts.add(pid);
+        }
+        const dirtyEnts = [];
+        if (d.kind === 'radius' && d.id != null) dirtyEnts.push(+d.id);
+        if (d.clones && d.clones.length) for (const cl of d.clones) dirtyEnts.push(+cl.id);
+        invalidateLoops({ dirtyPoints: dirtyPts, dirtyEntities: dirtyEnts });
+      } else if (d.moved && d.kind === 'splineHandle' && d.eid != null) {
+        invalidateLoops({ dirtyEntities: [+d.eid] });
       }
       // A drop onto the snap-crosshair target WELDS: merge the dragged point
       // into the target so both become one shared point.
       if (weldTarget) {
         weldPoints([[d.primary, weldTarget]], { checkDist: false });
-        invalidateLoops();
+        invalidateLoops({ dirtyPoints: [d.primary, weldTarget], structural: true });
         ui.selection = ui.selection.filter(s => !(s.kind === 'point' && +s.id === +d.primary));
-        updateUI();
       }
-      if (!ui.drag.moved) {
+      if (!d.moved) {
         history.pop();
         updateHistoryButtons();
-        updateUI();
       } else {
         scheduleSave();
-        updateUI();
       }
-      ui.drag = null;
+      updateUI();
       render();
     }
   }
@@ -29736,8 +30915,9 @@ function cmdSplitCurve() {
     // made select-all drags quadratic — and still ran on files without splines.
     const uses = pointUses(pid);
     if (!uses) return;
-    for (const e of uses) {
-      if (e.type !== 'spline' || !e.hs) continue;
+    for (const ref of uses) {
+      const e = (ref && state.entities[ref.id]) || ref;
+      if (!e || e.type !== 'spline' || !e.hs) continue;
       for (let idx = 0; idx < e.pts.length; idx++) {
         if (+e.pts[idx] !== +pid) continue;
         if (e.hs.o[idx]) { e.hs.o[idx].x += dx; e.hs.o[idx].y += dy; }
@@ -31153,6 +32333,7 @@ function cmdSplitCurve() {
   // and loopContainedIn then reject far-apart pairs with four number
   // compares instead of re-scanning both polygons every time.
   function loopBox(loop) {
+    if (loop._box && loop._boxPoly === loop.poly) return loop._box;
     const poly = loop.poly;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const p of poly) {
@@ -31161,16 +32342,20 @@ function cmdSplitCurve() {
       if (p.x > x1) x1 = p.x;
       if (p.y > y1) y1 = p.y;
     }
-    return { x0, y0, x1, y1 };
+    const b = { x0, y0, x1, y1 };
+    loop._box = b;
+    loop._boxPoly = poly;
+    return b;
   }
+
+  // Memoize exact loopContainedIn(inner, outer) by polygon array identity so
+  // untouched cached closed-spline loops skip repeated polysCross scans across
+  // incremental edits, undo, and redo (auto-GC when a loop polygon is rebuilt).
+  const loopContainCache = typeof WeakMap === 'function' ? new WeakMap() : null;
 
   // True when `inner` lies wholly inside `outer`. A closed inner loop is
   // contained iff its bbox fits, one interior point is inside, and its boundary
-  // never crosses the outer boundary (Jordan curve theorem). The old test ray-
-  // cast EVERY inner vertex against the outer polygon — O(n*m) per pair, which
-  // dominated drag-release on dense splines (4426 verts / 14 loops). The boundary
-  // sweep below rejects almost every segment pair by bbox first, so nested loops
-  // with margin cost near O(n+m) instead of O(n*m) pointInPoly calls.
+  // never crosses the outer boundary (Jordan curve theorem).
   function loopContainedIn(inner, outer, ib, ob) {
     if (!inner || !outer || inner === outer) return false;
     const ip = inner.poly, op = outer.poly;
@@ -31180,41 +32365,65 @@ function cmdSplitCurve() {
       ix0 = ib.x0; iy0 = ib.y0; ix1 = ib.x1; iy1 = ib.y1;
       ox0 = ob.x0; oy0 = ob.y0; ox1 = ob.x1; oy1 = ob.y1;
     } else {
-      ix0 = Infinity; iy0 = Infinity; ix1 = -Infinity; iy1 = -Infinity;
-      for (const p of ip) { if (p.x < ix0) ix0 = p.x; if (p.y < iy0) iy0 = p.y; if (p.x > ix1) ix1 = p.x; if (p.y > iy1) iy1 = p.y; }
-      ox0 = Infinity; oy0 = Infinity; ox1 = -Infinity; oy1 = -Infinity;
-      for (const p of op) { if (p.x < ox0) ox0 = p.x; if (p.y < oy0) oy0 = p.y; if (p.x > ox1) ox1 = p.x; if (p.y > oy1) oy1 = p.y; }
+      const b1 = loopBox(inner), b2 = loopBox(outer);
+      ix0 = b1.x0; iy0 = b1.y0; ix1 = b1.x1; iy1 = b1.y1;
+      ox0 = b2.x0; oy0 = b2.y0; ox1 = b2.x1; oy1 = b2.y1;
     }
     if (ix0 < ox0 || iy0 < oy0 || ix1 > ox1 || iy1 > oy1) return false;
-    if (!pointInPoly(interiorProbe(ip), op)) return false;
-    return !polysCross(ip, op);
+    const cc = (typeof loopContainCache !== 'undefined' && loopContainCache) ? loopContainCache : null;
+    let imap = cc ? cc.get(ip) : null;
+    if (imap && imap.has(op)) return imap.get(op);
+    const ce = inner._cacheEntry;
+    let probe = (ce && ce.probe) || (inner._probe && inner._probePoly === ip ? inner._probe : null);
+    if (!probe) {
+      probe = interiorProbe(ip);
+      inner._probe = probe;
+      inner._probePoly = ip;
+      if (ce) ce.probe = probe;
+    }
+    const res = pointInPoly(probe, op) && !polysCross(ip, op, outer);
+    if (cc) {
+      if (!imap) { imap = new WeakMap(); cc.set(ip, imap); }
+      imap.set(op, res);
+    }
+    return res;
   }
 
   // Do two closed polygons' boundaries cross? Outer segments are bucketed into
-  // Y bands once, so each inner segment only tests the bands it spans (then a
-  // bbox reject before the inclusive orientation test). Nested loops with
-  // margin therefore skip nearly every pair instead of scanning all n*m — the
-  // old per-vertex ray-cast was O(n*m) pointInPoly and dominated drag-release.
-  function polysCross(ip, op) {
-    const n = ip.length, m = op.length;
-    let y0 = Infinity, y1 = -Infinity;
-    const segs = new Array(m);
-    for (let j = 0; j < m; j++) {
-      const c = op[j], d = op[(j + 1) % m];
-      const sy0 = Math.min(c.y, d.y), sy1 = Math.max(c.y, d.y);
-      segs[j] = { a: c, b: d, x0: Math.min(c.x, d.x), x1: Math.max(c.x, d.x), y0: sy0, y1: sy1 };
-      if (sy0 < y0) y0 = sy0;
-      if (sy1 > y1) y1 = sy1;
+  // Y bands once and cached on the outer loop, so LoopTree builds each outer
+  // grid once instead of once per inner candidate.
+  function polysCross(ip, op, outerLoop) {
+    const n = ip.length;
+    const ce = outerLoop && outerLoop._cacheEntry;
+    let yg = (ce && ce.yGrid) || (outerLoop && outerLoop._yGrid && outerLoop._yGridPoly === op ? outerLoop._yGrid : null);
+    if (!yg) {
+      const m = op.length;
+      let y0 = Infinity, y1 = -Infinity;
+      const segs = new Array(m);
+      for (let j = 0; j < m; j++) {
+        const c = op[j], d = op[(j + 1) % m];
+        const sy0 = Math.min(c.y, d.y), sy1 = Math.max(c.y, d.y);
+        segs[j] = { a: c, b: d, x0: Math.min(c.x, d.x), x1: Math.max(c.x, d.x), y0: sy0, y1: sy1 };
+        if (sy0 < y0) y0 = sy0;
+        if (sy1 > y1) y1 = sy1;
+      }
+      const bands = Math.max(1, Math.min(256, Math.ceil(m / 4)));
+      const h = (y1 - y0) / bands || 1;
+      const grid = new Array(bands);
+      for (let b = 0; b < bands; b++) grid[b] = [];
+      for (const s of segs) {
+        const b0 = Math.max(0, Math.floor((s.y0 - y0) / h));
+        const b1 = Math.min(bands - 1, Math.floor((s.y1 - y0) / h));
+        for (let b = b0; b <= b1; b++) grid[b].push(s);
+      }
+      yg = { y0, h, bands, grid };
+      if (outerLoop) {
+        outerLoop._yGrid = yg;
+        outerLoop._yGridPoly = op;
+        if (ce) ce.yGrid = yg;
+      }
     }
-    const bands = Math.max(1, Math.min(256, Math.ceil(m / 4)));
-    const h = (y1 - y0) / bands || 1;
-    const grid = new Array(bands);
-    for (let b = 0; b < bands; b++) grid[b] = [];
-    for (const s of segs) {
-      const b0 = Math.max(0, Math.floor((s.y0 - y0) / h));
-      const b1 = Math.min(bands - 1, Math.floor((s.y1 - y0) / h));
-      for (let b = b0; b <= b1; b++) grid[b].push(s);
-    }
+    const { y0, h, bands, grid } = yg;
     for (let i = 0; i < n; i++) {
       const a = ip[i], b = ip[(i + 1) % n];
       const ax0 = Math.min(a.x, b.x), ax1 = Math.max(a.x, b.x);
@@ -31222,7 +32431,9 @@ function cmdSplitCurve() {
       const b0 = Math.max(0, Math.floor((ay0 - y0) / h));
       const b1 = Math.min(bands - 1, Math.floor((ay1 - y0) / h));
       for (let bb = b0; bb <= b1; bb++) {
-        for (const s of grid[bb]) {
+        const bucket = grid[bb];
+        for (let k = 0; k < bucket.length; k++) {
+          const s = bucket[k];
           if (ax0 > s.x1 || ax1 < s.x0 || ay0 > s.y1 || ay1 < s.y0) continue;
           if (segmentsIntersect(a, b, s.a, s.b)) return true;
         }
@@ -32714,25 +33925,6 @@ function cmdSplitCurve() {
     document.querySelectorAll('.tool-btn').forEach(btn => {
       btn.addEventListener('click', () => toolIconTapped(btn.dataset.tool));
     });
-
-    // Drag wall thickness: one field, shared with Settings and the wheel.
-    (function bindWallInput() {
-      const el = document.getElementById('wall-mm');
-      if (!el) return;
-      const commit = () => {
-        const sp = settingSpec('wallDragMm');
-        settings.wallDragMm = clampSetting(sp, el.value === '' ? sp.def : el.value);
-        applySettings();
-        saveSettings();
-        el.value = String(settings.wallDragMm);
-        updateUI();
-        render();
-      };
-      el.addEventListener('change', commit);
-      el.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter') { ev.preventDefault(); el.blur(); }
-      });
-    })();
 
     // Collapse / expand the left edit+layers stack. A phone cannot spare two
     // cards' worth of canvas, so one slim tab hides them; the choice sticks.
