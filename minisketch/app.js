@@ -25406,6 +25406,30 @@
     const dy = p2.y - p1.y;
     const len = Math.hypot(dx, dy);
     if (len < 1e-9) return null;
+    if (c.axis === 'x') {
+      // H: horizontal dimension line with two vertical extension lines
+      const midY = (p1.y + p2.y) / 2;
+      const off = c.offset == null ? (Math.abs(dy) / 2 + 26) : c.offset;
+      const dimY = midY + off;
+      return {
+        p1, p2,
+        q1: { x: p1.x, y: dimY },
+        q2: { x: p2.x, y: dimY },
+        nx: 0, ny: 1, off, len: Math.abs(dx)
+      };
+    }
+    if (c.axis === 'y') {
+      // V: vertical dimension line with two horizontal extension lines
+      const midX = (p1.x + p2.x) / 2;
+      const off = c.offset == null ? (Math.abs(dx) / 2 + 26) : c.offset;
+      const dimX = midX + off;
+      return {
+        p1, p2,
+        q1: { x: dimX, y: p1.y },
+        q2: { x: dimX, y: p2.y },
+        nx: 1, ny: 0, off, len: Math.abs(dy)
+      };
+    }
     const nx = -dy / len;
     const ny = dx / len;
     const off = c.offset == null ? 26 : c.offset;
@@ -25800,10 +25824,14 @@
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.beginPath();
-    const e1x = q1s.x + (q1s.x - p1s.x) * 0.08;
-    const e1y = q1s.y + (q1s.y - p1s.y) * 0.08;
-    const e2x = q2s.x + (q2s.x - p2s.x) * 0.08;
-    const e2y = q2s.y + (q2s.y - p2s.y) * 0.08;
+    const ext1 = Math.hypot(q1s.x - p1s.x, q1s.y - p1s.y);
+    const ext2 = Math.hypot(q2s.x - p2s.x, q2s.y - p2s.y);
+    const ov1 = ext1 > 1e-3 ? Math.min(6, ext1 * 0.15) / ext1 : 0;
+    const ov2 = ext2 > 1e-3 ? Math.min(6, ext2 * 0.15) / ext2 : 0;
+    const e1x = q1s.x + (q1s.x - p1s.x) * ov1;
+    const e1y = q1s.y + (q1s.y - p1s.y) * ov1;
+    const e2x = q2s.x + (q2s.x - p2s.x) * ov2;
+    const e2y = q2s.y + (q2s.y - p2s.y) * ov2;
     ctx.moveTo(p1s.x, p1s.y);
     ctx.lineTo(e1x, e1y);
     ctx.moveTo(p2s.x, p2s.y);
@@ -25814,14 +25842,16 @@
 
     ctx.fillStyle = color;
     const back = arrowAngle + Math.PI;
-    drawArrow(q1s.x, q1s.y, arrowAngle, 6);
-    drawArrow(q2s.x, q2s.y, back, 6);
+    if (Math.hypot(q2s.x - q1s.x, q2s.y - q1s.y) >= 1) {
+      drawArrow(q1s.x, q1s.y, arrowAngle, 6);
+      drawArrow(q2s.x, q2s.y, back, 6);
+    }
 
     const mx = (q1s.x + q2s.x) / 2;
     const my = (q1s.y + q2s.y) / 2;
     const sign = Math.sign(g.off) || 1;
     const nxs = g.nx * sign;
-    const nys = -g.ny * sign;
+    const nys = g.ny * sign;
     const labelTxt = labelText || dimMeasureLabel(c, g);
     // dimMeasureLabel already carries its own parentheses; the plain labelText
     // path (point-to-line) keeps the reference wrapper as before.
@@ -25829,14 +25859,14 @@
       mx + nxs * 13, my + nys * 13, c.id, isSel);
   }
 
-  // Label of a point-to-point measure: the axis letter (D/H/V) plus the value
-  // it measures — X span for H, Y span for V, straight distance for D. D is
-  // the default measure and carries no letter, and the whole label is one pair
-  // of parentheses: (100), (H 100), (V 100) — never nested.
+  // Label of a point-to-point measure: reports the X span when axis === 'x',
+  // Y span when axis === 'y', or straight distance otherwise. The orthogonal
+  // vs aligned extension lines already show the orientation visually, so no
+  // H/V/D prefix letter is needed; wrapped in one pair of parentheses: (100).
   function dimMeasureLabel(c, g) {
     if (c.kind) return 'R ' + (c.reference ? '(' + fmt(c.value) + ')' : fmt(c.value));
-    if (c.axis === 'x') return '(H ' + fmt(Math.abs(g.p2.x - g.p1.x)) + ')';
-    if (c.axis === 'y') return '(V ' + fmt(Math.abs(g.p2.y - g.p1.y)) + ')';
+    if (c.axis === 'x') return '(' + fmt(Math.abs(g.p2.x - g.p1.x)) + ')';
+    if (c.axis === 'y') return '(' + fmt(Math.abs(g.p2.y - g.p1.y)) + ')';
     return '(' + fmt(c.reference ? c.value : Math.hypot(g.p2.x - g.p1.x, g.p2.y - g.p1.y)) + ')';
   }
 
@@ -26295,7 +26325,7 @@
     } else if (d.type === 'circle' && d.c) {
       const c = d.c.id != null ? P(d.c.id) : d.c;
       if (c) {
-        const b = boxDraftBounds(c, end, !!ui.ctrlDown);
+        const b = boxDraftBounds(c, ui.shiftDown ? shiftSquareEnd(c, end, !!ui.ctrlDown) : end, !!ui.ctrlDown);
         const s0 = w2s(b.x0, b.y0);
         const s1 = w2s(b.x1, b.y1);
         const left = Math.min(s0.x, s1.x);
@@ -26327,21 +26357,13 @@
           ctx.stroke();
           ctx.restore();
         }
-        const es = w2s(end.x, end.y);
-        ctx.save();
-        ctx.setLineDash([]);
-        ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillStyle = '#2563eb';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(fmt(b.w) + ' \u00d7 ' + fmt(b.h) + ' mm' + (b.centered ? ' (Center)' : ''), es.x + 10, es.y - 8);
-        ctx.restore();
+        drawDraftDimLabels(ctx, b);
         drawSnapMarker(end, snapped && end.snapped !== false);
       }
     } else if (d.type === 'box' && d.a) {
       const a = d.a.id != null ? P(d.a.id) : d.a;
       if (a) {
-        const b = boxDraftBounds(a, end, !!ui.ctrlDown);
+        const b = boxDraftBounds(a, ui.shiftDown ? shiftSquareEnd(a, end, !!ui.ctrlDown) : end, !!ui.ctrlDown);
         const s0 = w2s(b.x0, b.y0);
         const s1 = w2s(b.x1, b.y1);
         const left = Math.min(s0.x, s1.x);
@@ -26371,15 +26393,7 @@
           ctx.stroke();
           ctx.restore();
         }
-        const es = w2s(end.x, end.y);
-        ctx.save();
-        ctx.setLineDash([]);
-        ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillStyle = '#2563eb';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(fmt(b.w) + ' \u00d7 ' + fmt(b.h) + ' mm' + (b.centered ? ' (Center)' : ''), es.x + 10, es.y - 8);
-        ctx.restore();
+        drawDraftDimLabels(ctx, b);
         drawSnapMarker(end, snapped && end.snapped !== false);
       }
     } else if (d.type === 'arc') {
@@ -29984,8 +29998,9 @@
         const c = state.constraints[dimHit];
         if (c) {
           if (c.type === 'distance' && c.kind !== 'radius') {
+            const g = distanceGeom(c);
             pushHistory();
-            ui.drag = { kind: 'dimOffset', id: dimHit, startWorld: world, orig: c.offset == null ? 26 : c.offset, moved: false };
+            ui.drag = { kind: 'dimOffset', id: dimHit, startWorld: world, orig: g ? g.off : (c.offset == null ? 26 : c.offset), moved: false };
           } else if (c.type === 'pointDim' && dimOffsetNormal(c)) {
             pushHistory();
             ui.drag = { kind: 'dimOffset', id: dimHit, startWorld: world, orig: c.offset == null ? 22 : c.offset, moved: false };
@@ -30323,6 +30338,52 @@
     };
   }
 
+  // Shift-constrain a drag end so the bound box is a square (DX=DY for the
+  // rectangle tool, Rx=Ry for the ellipse tool): the dominant axis wins and the
+  // smaller axis follows, keeping the drag direction (and the center when
+  // Ctrl-centered).
+  function shiftSquareEnd(a, end, centered) {
+    const dx = Math.abs(end.x - a.x);
+    const dy = Math.abs(end.y - a.y);
+    const m = Math.max(dx, dy);
+    if (m < 1e-12) return end;
+    const sx = end.x >= a.x ? 1 : -1;
+    const sy = end.y >= a.y ? 1 : -1;
+    return { x: a.x + sx * m, y: a.y + sy * m };
+  }
+
+  // Live dx/dy readouts on the draft preview: dx sits above the top edge with a
+  // thin guide line, dy sits to the right of the right edge. Values are the
+  // ACTUAL object dimensions (the bounding-box size), not the mouse span — so
+  // they match the finished shape even when Ctrl-centered.
+  function drawDraftDimLabels(ctx, b) {
+    const s0 = w2s(b.x0, b.y0);
+    const s1 = w2s(b.x1, b.y1);
+    const left = Math.min(s0.x, s1.x);
+    const top = Math.min(s0.y, s1.y);
+    const bw = Math.abs(s1.x - s0.x);
+    const bh = Math.abs(s1.y - s0.y);
+    const dx = b.w;
+    const dy = b.h;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillStyle = '#1d4ed8';
+    ctx.strokeStyle = 'rgba(29, 78, 216, 0.45)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, top - 7);
+    ctx.lineTo(left + bw, top - 7);
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(fmt(dx), left + bw / 2, top - 9);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(fmt(dy), left + bw + 8, top + bh / 2);
+    ctx.restore();
+  }
+
   async function handleCreateClick(snap, ev) {
     const shift = ev.shiftKey;
 
@@ -30436,7 +30497,9 @@
         const a = ui.draft.c.id != null ? P(ui.draft.c.id) : ui.draft.c;
         if (!a) { cancelDraft(); render(); return; }
         const centered = !!(ui.ctrlDown || ev.ctrlKey || ev.metaKey || ui.ctrlToggle);
-        const b = boxDraftBounds(a, snap, centered);
+        // Shift = equal radii (Rx=Ry -> perfect circle)
+        const end = (ev.shiftKey || ui.shiftDown) ? shiftSquareEnd(a, snap, centered) : snap;
+        const b = boxDraftBounds(a, end, centered);
         if (b.w < 1e-7 || b.h < 1e-7) return;
         try { if (canvas.hasPointerCapture(ev.pointerId)) canvas.releasePointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
         const res = await uiFormPrompt([
@@ -30444,9 +30507,11 @@
           { name: 'h', label: 'Height (mm)', value: fmt(b.h) }
         ], {
           title: centered ? 'Ellipse (Center)' : 'Ellipse',
-          message: centered
-            ? 'Center-based (Ctrl) \u00b7 Creates an editable spline curve'
-            : 'Corner bounding box \u00b7 Creates an editable spline curve'
+          message: (Math.abs(b.w - b.h) <= 1e-6)
+            ? 'Equal Width/Height (Shift) \u00b7 creates a REAL circle entity \u2014 D adds a radius dimension'
+            : (centered
+              ? 'Center-based (Ctrl) \u00b7 Creates an editable spline curve'
+              : 'Corner bounding box \u00b7 Creates an editable spline curve')
         });
         if (res == null) {
           cancelDraft();
@@ -30462,6 +30527,21 @@
         const cx = centered ? a.x : (a.x + b.sx * w / 2);
         const cy = centered ? a.y : (a.y + b.sy * h / 2);
         pushHistory();
+        // Equal widths -> a REAL circle entity (not a spline), so D can add a
+        // radius dimension to it later.
+        if (Math.abs(w - h) <= 1e-6) {
+          const cId = materializePoint({ x: cx, y: cy });
+          const id = newId();
+          state.entities[id] = { id, type: 'circle', c: cId, r: w / 2, color: ui.color };
+          ui.draft = null;
+          ui.selection = [{ kind: 'entity', id }];
+          invalidateLoops();
+          requestSolve();
+          commit({ dirtyEntities: [id], dirtyPoints: [cId] });
+          toast('Circle created \u2014 D adds a radius dimension');
+          render();
+          return;
+        }
         const nodes = ellipseCurveNodes({ x: cx, y: cy }, Math.max(1e-6, w / 2), Math.max(1e-6, h / 2), 0);
         const pts = [];
         const o = [];
@@ -30478,7 +30558,7 @@
         invalidateLoops();
         requestSolve();
         commit();
-        toast(Math.abs(w - h) <= 1e-6 ? 'Circle curve created' : 'Ellipse curve created');
+        toast('Ellipse curve created');
       }
       render();
       return;
@@ -30493,7 +30573,9 @@
         const a = ui.draft.a.id != null ? P(ui.draft.a.id) : ui.draft.a;
         if (!a) { cancelDraft(); render(); return; }
         const centered = !!(ui.ctrlDown || ev.ctrlKey || ev.metaKey || ui.ctrlToggle);
-        const b = boxDraftBounds(a, snap, centered);
+        // Shift = square (DX=DY)
+        const end = (ev.shiftKey || ui.shiftDown) ? shiftSquareEnd(a, snap, centered) : snap;
+        const b = boxDraftBounds(a, end, centered);
         if (b.w < 1e-7 || b.h < 1e-7) return;
         try { if (canvas.hasPointerCapture(ev.pointerId)) canvas.releasePointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
         const res = await uiFormPrompt([
@@ -34715,7 +34797,11 @@ function cmdSplitCurve() {
         if ((c.axis || null) !== (axis || null)) {
           const p1 = P(c.p1), p2 = P(c.p2);
           if (p1 && p2) {
+            const side = c.offset != null && c.offset < 0 ? -1 : 1;
             c.axis = axis;
+            c.offset = axis === 'x' ? side * (Math.abs(p2.y - p1.y) / 2 + 26)
+              : axis === 'y' ? side * (Math.abs(p2.x - p1.x) / 2 + 26)
+              : side * 26;
             c.value = round2(axis === 'x' ? Math.abs(p2.x - p1.x) :
               axis === 'y' ? Math.abs(p2.y - p1.y) : dist(p1, p2));
             refreshReferenceDimensions();
