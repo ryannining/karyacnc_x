@@ -186,6 +186,28 @@ EOF
 fi
 
 echo ""
+
+# Kafka manifest statis untuk saved extensions (agar Marketplace & auto-load
+# berfungsi bahkan tanpa endpoint API Go — cukup aset web tersync).
+MANIFEST="$DST/extensions/saved/manifest.json"
+{
+  echo '['
+  first=1
+  for f in "$DST"/extensions/saved/*.js; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    [ "$base" = "manifest.json" ] && continue
+    id=$(sed -n 's/^\/\/ .*id:[[:space:]]*\([A-Za-z0-9_-]*\).*/\1/p' "$f" | head -1)
+    [ -z "$id" ] && id=${base%.js}
+    label=$(sed -n 's/^\/\/ .*label:[[:space:]]*//p' "$f" | head -1)
+    if [ "$first" -eq 0 ]; then echo ','; fi
+    printf '{"file":"%s","id":"%s","label":"%s"}' "$base" "$id" "$label"
+    first=0
+  done
+  echo ''
+  echo ']'
+} > "$MANIFEST"
+echo "  di-update   : extensions/saved/manifest.json"
 echo "Selesai. ${#FILES[@]} file disinkronkan."
 echo "  - Wails dev        : reload iframe/host — server baca dari disk dulu (folder dev float di atas embed)."
 echo "  - Build produksi   : jalankan 'wails build' agar embed go:embed ter-update di binary."

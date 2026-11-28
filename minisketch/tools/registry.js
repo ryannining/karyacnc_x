@@ -828,16 +828,29 @@ window.MiniSketchTools = (() => {
     if (!isLoopbackHost()) return [];
     let list = [];
     try {
-      const res = await fetch('api/extensions/saved', { cache: 'no-cache' });
-      const j = await res.json().catch(() => ({}));
-      list = (j && Array.isArray(j.saved)) ? j.saved : [];
+      const mr = await fetch('extensions/saved/manifest.json', { cache: 'no-cache' })
+        .then(r => r.json()).catch(() => null);
+      if (mr && Array.isArray(mr.saved) && mr.saved.length) {
+        list = mr.saved;
+      } else {
+        const res = await fetch('api/extensions/saved', { cache: 'no-cache' });
+        const j = await res.json().catch(() => ({}));
+        list = (j && Array.isArray(j.saved)) ? j.saved : [];
+      }
     } catch (e) { return []; }
     let mounted = 0;
     const seen = new Set(installedRecords.map(r => r.id));
     for (const rec of list) {
-      if (!rec || !rec.id || !rec.code || seen.has(rec.id)) continue;
+      if (!rec || !rec.id || seen.has(rec.id)) continue;
       if (NS.list.some(t => t.id === rec.id)) continue;
-      installedRecords.push({ id: rec.id, code: rec.code, label: rec.label || '', source: 'saved', sourceUrl: '' });
+      let code = rec.code || '';
+      if (!code && rec.file) {
+        try {
+          code = await fetch('extensions/saved/' + encodeURIComponent(rec.file)).then(r => r.text());
+        } catch (e) { code = ''; }
+      }
+      if (!code) continue;
+      installedRecords.push({ id: rec.id, code, label: rec.label || '', source: 'saved', sourceUrl: '' });
       seen.add(rec.id);
       if (mountRecord(installedRecords[installedRecords.length - 1])) mounted++;
     }
