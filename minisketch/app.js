@@ -2957,33 +2957,25 @@
   }
 
   function updateCanvasCursor() {
+    let cur = 'default';
     if (ui.pan) {
-      canvas.style.cursor = 'grabbing';
-      return;
-    }
-    if (ui.tool === 'transform') {
-      canvas.style.cursor = ui.drag && ui.drag.kind && ui.drag.kind.indexOf('xf') === 0 ? 'grabbing' : 'default';
-      return;
-    }
-    if (ui.inlineText) {
+      cur = 'grabbing';
+    } else if (ui.tool === 'transform') {
+      cur = ui.drag && ui.drag.kind && ui.drag.kind.indexOf('xf') === 0 ? 'grabbing' : 'default';
+    } else if (ui.inlineText) {
       const ie = state.entities[ui.inlineText.id];
       const gg = ie && ie.type === 'text' ? textGeom(ie) : null;
-      if (gg && ui.raw && textInBox(ui.raw, gg)) {
-        canvas.style.cursor = 'text';
-        return;
-      }
-    }
-    if (ui.tool === 'text') {
-      canvas.style.cursor = 'text';
-      return;
-    }
-    if (ui.tool === 'select' || ui.tool === 'dragwall') {
-      canvas.style.cursor = ui.hover && ui.hover.kind === 'partMarker' ? 'grab' : 'default';
-    } else if (ui.tool === 'trim') {
-      canvas.style.cursor = 'crosshair';
+      if (gg && ui.raw && textInBox(ui.raw, gg)) cur = 'text';
+    } else if (ui.tool === 'text') {
+      cur = 'text';
+    } else if (ui.tool === 'select' || ui.tool === 'dragwall') {
+      cur = ui.hover && ui.hover.kind === 'partMarker' ? 'grab' : 'default';
     } else {
-      canvas.style.cursor = 'crosshair';
+      cur = 'crosshair';
     }
+    canvas.style.cursor = cur;
+    const vc = document.getElementById('vcursor');
+    if (vc) vc.dataset.cursor = cur === 'crosshair' ? 'crosshair' : 'default';
   }
 
   function cancelDraft() {
@@ -3064,6 +3056,7 @@
       ui.fitted = true;
       fitView();
     }
+    if (typeof vpadClampCursor === 'function') vpadClampCursor();
     render();
   }
 
@@ -3598,25 +3591,60 @@
   }
 
   let lastSavedDocStr;
+  let fullWarned = false;
+  // localStorage is capped (~5MB/origin) and we store TWO copies (main + bak),
+  // so for large documents the backup copy is skipped to keep the main save
+  // under the quota. Main-only saves lose crash protection, but a save that
+  // throws is worse than one without a backup.
+  const LS_DOC_BAK_MAX = 700000;   // ~0.7MB serialized doc keeps a backup
+  function storageFull(err) {
+    return err && (err.name === 'QuotaExceededError' || err.code === 22 ||
+      /quota/i.test(String(err && err.message || err)));
+  }
+  function finishPersist(quiet) {
+    fullWarned = false;
+    docDirty = false;
+    paintFileDirty(false);
+    if (!quiet) setSavedLabel('saved');
+    if (window.MiniSketchCloud && window.MiniSketchCloud.scheduleSync) window.MiniSketchCloud.scheduleSync('doc');
+  }
+  function failPersist(quiet) {
+    // keep dirty so the UI still shows the work is not safely stored
+    docDirty = true;
+    paintFileDirty(true);
+    setSavedLabel('saving failed');
+    if (!quiet && !fullWarned) {
+      fullWarned = true;
+      toast('Local storage is full — this drawing is too large for browser storage. Export it (Ctrl+E SVG / Ctrl+Shift+S .sketch) or sign in to Cloud so it syncs.', { type: 'error', sticky: true });
+    }
+  }
   function persistNow(quiet) {
     if (ui.transform.pending) return;
     try {
       // P0-6: keep the last-good document aside before overwriting it. A crash
       // or a quota error mid-write used to leave localStorage corrupt with no
       // fallback; load tries main → .bak → blank, in that order.
-      const prev = lastSavedDocStr !== undefined ? lastSavedDocStr : localStorage.getItem(STORAGE_KEY);
-      if (prev) {
-        try { localStorage.setItem(BAK_KEY, prev); } catch (err) { /* bak best-effort */ }
-      }
       const next = serializeDoc();
-      localStorage.setItem(STORAGE_KEY, next);
+      const prev = lastSavedDocStr !== undefined ? lastSavedDocStr : localStorage.getItem(STORAGE_KEY);
+      if (prev && prev.length <= LS_DOC_BAK_MAX && next.length <= LS_DOC_BAK_MAX) {
+        try { localStorage.setItem(BAK_KEY, prev); } catch (err) { /* bak best-effort */ }
+      } else {
+        // large document: drop the double copy so the main save fits
+        try { if (localStorage.getItem(BAK_KEY) != null) localStorage.removeItem(BAK_KEY); } catch (err) { /* ignore */ }
+      }
+      try {
+        localStorage.setItem(STORAGE_KEY, next);
+      } catch (err) {
+        if (!storageFull(err)) throw err;
+        // quota hit: free the backup (if any) and retry once
+        try { localStorage.removeItem(BAK_KEY); } catch (e2) {}
+        localStorage.setItem(STORAGE_KEY, next);
+      }
       lastSavedDocStr = next;
-      docDirty = false;
-      paintFileDirty(false);
-      if (!quiet) setSavedLabel('saved');
-      if (window.MiniSketchCloud && window.MiniSketchCloud.scheduleSync) window.MiniSketchCloud.scheduleSync('doc');
+      finishPersist(quiet);
     } catch (err) {
-      if (!quiet) toast('Browser storage is unavailable', { type: 'error' });
+      if (!storageFull(err)) console.warn('[minisketch] persist failed', err);
+      failPersist(quiet);
     }
   }
 
@@ -6238,6 +6266,9 @@
         }
       }
     }
+    // The duplicate-in-place copy has been moved away from its original: it no
+    // longer overlaps, so its points are weld-eligible again.
+    if (noWeldPoints.size) noWeldPoints.clear();
     // Clone arrays move by instance matrix, not by points (they own none), so
     // a nudge shifts every instance's translation like a drag does.
     for (const e of selectedEntities()) {
@@ -6389,6 +6420,32 @@
     loops.sort((a, b2) => b2.b.maxX - b2.b.minX - (a.b.maxX - a.b.minX) ||
                           (b2.b.maxY - b2.b.minY) - (a.b.maxY - a.b.minY));
     loopTree();
+    // A loop that is the reference (key object) — or a fully-selected loop
+    // nested under it — stays its OWN arrange unit instead of being absorbed
+    // into a parent compound. Otherwise selecting a small box inside a bigger
+    // selected box folds both into one compound and the arrange buttons go
+    // disabled; keeping them separate lets you align them (e.g. center the
+    // small box in the big one) no matter which box you clicked last.
+    // Only explicit clicks set a reference: a marquee (bulk) selection has no
+    // key object, so there the classic compound rule keeps its old behaviour.
+    let refLoop = null;
+    if (lastPickEntityId != null &&
+        ui.selection.some(s => s.kind === 'entity' && +s.id === lastPickEntityId)) {
+      const keyEnt = lastPickEntityId;
+      // Smallest (innermost) matching loop first: the last candidate that owns
+      // the key entity is its own loop, not an enclosing container.
+      for (let i = loops.length - 1; i >= 0; i--) {
+        const cand = loops[i];
+        const owns = loopEntities(cand.loop).some(id => +id === keyEnt) ||
+                     entitiesInsideLoop(cand.loop).includes(keyEnt);
+        if (owns) { refLoop = cand; break; }
+      }
+    }
+    const isRef = l => !!refLoop && l === refLoop.loop;
+    const hasRefAncestor = l => {
+      for (let p = l.parent; p; p = p.parent) if (isRef(p)) return true;
+      return false;
+    };
     const outer = [];
     const outerSet = new Set();
     for (const cand of loops) {
@@ -6396,10 +6453,28 @@
       for (let p = cand.loop.parent; p; p = p.parent) {
         if (outerSet.has(p)) { inside = true; break; }
       }
-      if (!inside) { outer.push(cand); outerSet.add(cand.loop); }
+      if (inside && !isRef(cand.loop) && !hasRefAncestor(cand.loop)) continue;
+      outer.push(cand);
+      outerSet.add(cand.loop);
     }
+    // What each compound claims as its own content; nested loops kept separate
+    // are subtracted from their enclosing compound so they are not double-moved.
+    const rawContent = new Map();
+    for (const o of outer) rawContent.set(o.loop, new Set(arrangeLoopContents(o.loop, selEnts)));
+    const strictDescendantOf = (anc, n) => {
+      for (let q = n.parent; q; q = q.parent) if (q === anc) return true;
+      return false;
+    };
     for (const o of outer) {
-      const ids = arrangeLoopContents(o.loop, selEnts);
+      let exclude = null;
+      for (const [T, tIds] of rawContent) {
+        if (T !== o.loop && strictDescendantOf(o.loop, T)) {
+          if (!exclude) exclude = new Set();
+          for (const id of tIds) exclude.add(id);
+        }
+      }
+      let ids = Array.from(rawContent.get(o.loop));
+      if (exclude) ids = ids.filter(id => !exclude.has(id));
       if (!ids.length) continue;
       let b = o.b;
       for (const id of ids) {
@@ -7241,6 +7316,13 @@
 
   // The payload for a copy: points, entities (plus a text object's owned guide
   // lines) and the constraints that live entirely inside that set. Shared by
+  // Points created by a duplicate-in-place (Ctrl+D at the same coordinates)
+  // must never be welded into the loop graph: the copy is byte-identical to
+  // the original, so welding merges the two loops into one tangled graph and
+  // even mutates the ORIGINAL loop. These ids are excluded from welding in
+  // getLoops() until a move (moveSelection) separates them.
+  const noWeldPoints = new Set();
+
   // Ctrl+C and Ctrl+D — duplicating must not touch the user's clipboard, so the
   // payload is built separately from the act of copying.
   function clipboardPayload() {
@@ -7572,6 +7654,10 @@
       const id = newId();
       pMap[p.id] = id;
       state.points[id] = { x: p.x + offsetX, y: p.y + offsetY, pr: !!p.pr };
+    }
+    // duplicate-in-place: mark every new point as weld-excluded
+    if (o.at === 'same') {
+      for (const id of Object.values(pMap)) noWeldPoints.add(+id);
     }
     const eMap = {};
     const newEntityIds = [];
@@ -11621,6 +11707,26 @@
       sameEnds.add(Math.min(a, b) + ':' + Math.max(a, b));
     }
     const ids = Array.from(usedPoints);
+    // Initial degree per point (pre-weld): how many curve ENDS touch it.
+    // Used to keep duplicate overlap (two identical closed loops on top of each
+    // other, e.g. after Ctrl+D duplicate-in-place) from being welded together:
+    // interior points (degree >= 2) that sit at EXACTLY the same coordinates
+    // are left separate, so each copy stays its own loop. Open ends (degree 1)
+    // and junctions still weld as before.
+    const initDeg = new Map();
+    const incDeg = (n) => {
+      if (n == null) return;
+      initDeg.set(+n, (initDeg.get(+n) || 0) + 1);
+    };
+    for (const id in state.entities) {
+      const e = state.entities[id];
+      if (e.type === 'line') { incDeg(e.a); incDeg(e.b); }
+      else if (e.type === 'arc') { incDeg(e.s); incDeg(e.e); }
+      else if (e.type === 'spline' && !e.closed) {
+        const sids = entityPointIds(e).filter(pid => P(pid));
+        if (sids.length >= 2) { incDeg(sids[0]); incDeg(sids[sids.length - 1]); }
+      }
+    }
     // Loop closure gets its own, wider tolerance: CAD exports leave rounding
     // cracks (0.1-0.2 mm) at junctions that the CNC join tolerance refuses to
     // bridge, and the shape then never reads as a loop. Topology only — no
@@ -11650,6 +11756,15 @@
             if (Math.hypot(p.x - pq.x, p.y - pq.y) >= closeTol) continue;
             if (!sameLayer(pid, q)) continue;
             if (sameEnds.has(Math.min(+pid, +q) + ':' + Math.max(+pid, +q))) continue;
+            // points of a duplicate-in-place copy are never welded (the copy is
+            // identical data; welding would merge the two loops and mutate the
+            // original loop too)
+            if (noWeldPoints.has(+pid) || noWeldPoints.has(+q)) continue;
+            // identical coordinates on two interior points = overlapping copies
+            // (duplicate-in-place); keep them as separate loops instead of
+            // welding them into one tangled graph.
+            if (Math.hypot(p.x - pq.x, p.y - pq.y) < 1e-9 &&
+                (initDeg.get(+pid) || 0) >= 2 && (initDeg.get(+q) || 0) >= 2) continue;
             union(pid, q);
           }
         }
@@ -17696,6 +17811,210 @@
       // SVG in too: the same round-trip, so the AI can place a whole drawing
       // (dozens of paths in one op) instead of one add_line call per stroke.
       exportSVG,
+      // Trace a canvas to CONTOUR DATA without touching the document. Returns
+      // { ok, contours:[{pts, closed, curved, hs?}], width, height } in
+      // document millimetres (Y-down). The extension then inserts the contours
+      // itself with addPanelEntity/addPolylineEntity/addSpline inside its own
+      // pushHistory()/commit() — one undo step total.
+      traceToContours: async (canvas, opts) => {
+        try {
+          if (!canvas) return { ok: false, error: 'canvas required' };
+          const blob = await new Promise((res) => {
+            try {
+              if (typeof canvas.toBlob === 'function') canvas.toBlob((b) => res(b), 'image/png');
+              else res(null);
+            } catch (e) { res(null); }
+          });
+          if (!blob) return { ok: false, error: 'canvas.toBlob unsupported' };
+          const Tr = window.MiniSketchTrace;
+          if (!Tr || typeof Tr.traceBlobInWorker !== 'function') {
+            return { ok: false, error: 'trace engine unavailable' };
+          }
+          // subpixel gives cleaner contours; imagetracer stays available via opts.
+          const tOpts = Object.assign({ algorithm: 'subpixel' }, opts || {});
+          const tr = await Tr.traceBlobInWorker(blob, tOpts);
+          if (!tr || !tr.svg) {
+            console.warn('[traceToContours] tracer returned no svg');
+            return { ok: false, error: 'trace returned no svg' };
+          }
+          let parsed = null;
+          try {
+            parsed = svgImportParse(tr.svg);
+          } catch (err) {
+            console.warn('[traceToContours] svgImportParse failed:', err && err.message);
+            return { ok: false, error: 'svg parse failed: ' + String(err && err.message || err) };
+          }
+          const contours = [];
+          for (const item of ((parsed && parsed.items) || [])) {
+            for (const sub of (item.subpaths || [])) {
+              if (!sub.nodes || sub.nodes.length < 2) continue;
+              const curved = !!(sub.curved && sub.nodes.some(n => n.o || n.i));
+              const c = {
+                pts: sub.nodes.map(n => ({ x: n.x, y: n.y })),
+                closed: !!sub.closed,
+                curved
+              };
+              if (curved) {
+                c.hs = {
+                  o: sub.nodes.map(n => n.o ? { x: n.o.x, y: n.o.y } : null),
+                  i: sub.nodes.map(n => n.i ? { x: n.i.x, y: n.i.y } : null)
+                };
+              }
+              contours.push(c);
+            }
+          }
+          if (!contours.length) {
+            console.warn('[traceToContours] no contours found');
+            return { ok: false, error: 'trace produced no contours' };
+          }
+          return { ok: true, contours, width: tr.width || 0, height: tr.height || 0 };
+        } catch (err) {
+          console.warn('[traceToContours] unexpected:', err && err.message);
+          return { ok: false, error: String(err && err.message || err) };
+        }
+      },
+      // Render a pattern/bitmap to vector contours using the built-in image
+      // tracer. canvas = HTMLCanvasElement (or {data,width,height} ImageData).
+      // opts pass through to traceBlobInWorker (threshold, scale, simplify...).
+      // Returns { ok, ids, width, height } — the traced entities are inserted
+      // into the document as one import (own undo step); do NOT wrap this call
+      // in api.pushHistory(). Draw black on white, 2-4 px per mm for accuracy.
+      traceCanvas: async (canvas, opts) => {
+        // Fallback: if svgImportInsert rejects the traced path (returns 0),
+        // build contours directly from parsed subpaths — always yields entities.
+        const insertTraceContoursManually = (parsed) => {
+          const made = [];
+          let target = null;
+          try { target = s2w(W / 2, H / 2); } catch (e) { target = { x: 0, y: 0 }; }
+          const bb = parsed.bounds || null;
+          const off = { x: 0, y: 0 };
+          if (bb) {
+            off.x = target.x - (bb.minX + bb.maxX) / 2;
+            off.y = target.y - (bb.minY + bb.maxY) / 2;
+          }
+          for (const item of (parsed.items || [])) {
+            const col = '#000000';
+            for (const sub of (item.subpaths || [])) {
+              if (!sub.nodes || sub.nodes.length < 2) continue;
+              const nodes = sub.nodes.map(n => ({ x: n.x + off.x, y: n.y + off.y }));
+              if (sub.curved && sub.nodes.some(n => n.o || n.i)) {
+                const id = api.addSpline({
+                  pts: nodes,
+                  hs: {
+                    o: sub.nodes.map(n => n.o ? { x: n.o.x + off.x, y: n.o.y + off.y } : null),
+                    i: sub.nodes.map(n => n.i ? { x: n.i.x + off.x, y: n.i.y + off.y } : null)
+                  },
+                  closed: !!sub.closed,
+                  color: col
+                });
+                if (id) made.push(id);
+              } else {
+                const id = (sub.closed || nodes.length >= 3)
+                  ? api.addPanelEntity(nodes, col)
+                  : api.addPolylineEntity(nodes, col);
+                if (id) made.push(id);
+              }
+            }
+          }
+          return made;
+        };
+
+        try {
+          if (!canvas) return { ok: false, error: 'canvas required' };
+          const blob = await new Promise((res) => {
+            try {
+              if (typeof canvas.toBlob === 'function') canvas.toBlob((b) => res(b), 'image/png');
+              else res(null);
+            } catch (e) { res(null); }
+          });
+          if (!blob) return { ok: false, error: 'canvas.toBlob unsupported' };
+          const Tr = window.MiniSketchTrace;
+          if (!Tr || typeof Tr.traceBlobInWorker !== 'function') {
+            return { ok: false, error: 'trace engine unavailable' };
+          }
+          // subpixel gives cleaner contours; imagetracer stays available via opts.
+          const tOpts = Object.assign({ algorithm: 'subpixel' }, opts || {});
+          const tr = await Tr.traceBlobInWorker(blob, tOpts);
+          if (!tr || !tr.svg) {
+            console.warn('[traceCanvas] tracer returned no svg');
+            return { ok: false, error: 'trace returned no svg' };
+          }
+          let parsed = null;
+          try {
+            parsed = svgImportParse(tr.svg);
+          } catch (err) {
+            console.warn('[traceCanvas] svgImportParse failed:', err && err.message);
+            return { ok: false, error: 'svg parse failed: ' + String(err && err.message || err) };
+          }
+          if (!parsed || !parsed.items || !parsed.items.length) {
+            console.warn('[traceCanvas] svg produced no items');
+            return { ok: false, error: 'svg parse produced no items' };
+          }
+          console.warn('[traceCanvas] parsed items:',
+            parsed.items.map(it => it.kind + (Array.isArray(it.subpaths) ? '(' + it.subpaths.length + ')' : '')).join(', '),
+            '· skipped=', parsed.skipped, '· bounds=', parsed.bounds || null);
+          let ins = null;
+          try {
+            ins = svgImportInsert(parsed, {
+              keepGroups: false,
+              fillMode: 'none',
+              textMode: 'note',
+              avoidExisting: true
+            });
+          } catch (err) {
+            console.warn('[traceCanvas] svgImportInsert failed:', err && err.message);
+            return { ok: false, error: 'svg insert failed: ' + String(err && err.message || err) };
+          }
+          const ids = (ins && Array.isArray(ins.entities)) ? ins.entities : [];
+          if (!ids.length) {
+            console.warn('[traceCanvas] svg import inserted 0 entities — trying manual contour fallback');
+            const manual = insertTraceContoursManually(parsed);
+            if (manual.length) {
+              try { api.commit(); } catch (e) { /* ignore */ }
+              console.warn('[traceCanvas] manual fallback produced', manual.length, 'entities');
+              return { ok: true, ids: manual, width: tr.width || 0, height: tr.height || 0, fallback: true };
+            }
+            let preview = null;
+            try {
+              if (canvas && typeof canvas.toDataURL === 'function') {
+                preview = canvas.toDataURL('image/png');
+              }
+            } catch (e) { /* ignore */ }
+            if (preview) {
+              try {
+                // Render the traced bitmap inline in DevTools console.
+                console.log('%cGirih canvas preview (traced bitmap)', 'font-size:12px;font-weight:bold;');
+                console.log('%c ', 'font-size:240px;line-height:240px;background:url("' + preview + '") center / contain no-repeat;');
+              } catch (e) { /* ignore */ }
+            }
+            const firstItem = parsed.items[0] || {};
+            const firstSub = (firstItem.subpaths && firstItem.subpaths[0]) || {};
+            return {
+              ok: false,
+              error: 'svg import inserted 0 entities (manual fallback also empty)',
+              debug: {
+                kinds: parsed.items.map(it => it.kind),
+                skipped: parsed.skipped || {},
+                svgHead: String(tr.svg || '').slice(0, 1200),
+                bounds: parsed.bounds || null,
+                firstItem: {
+                  kind: firstItem.kind,
+                  subpaths: firstItem.subpaths ? firstItem.subpaths.length : 0,
+                  nodes: firstSub.nodes ? firstSub.nodes.length : 0,
+                  closed: !!firstSub.closed,
+                  curved: !!firstSub.curved,
+                  sample: firstSub.nodes ? firstSub.nodes.slice(0, 3) : null
+                },
+                preview: preview || null
+              }
+            };
+          }
+          return { ok: true, ids, width: tr.width || 0, height: tr.height || 0 };
+        } catch (err) {
+          console.warn('[traceCanvas] unexpected:', err && err.message);
+          return { ok: false, error: String(err && err.message || err) };
+        }
+      },
       svgImportParse,
       svgImportInsert,
       // Font family names available for text (from the font catalogue). Lets a
@@ -19775,6 +20094,37 @@
     const shared = new Map();
     const madeIds = [];
     const avoidSet = avoid && avoid.size ? avoid : null;
+    // PathBool.get() returns regions: [[contour, contour, …], …] — flatten to a
+    // plain contour list so each face (outer AND holes) becomes its own entity.
+    // A "contour" may be either command segments (["L", a, b], …) or a raw
+    // point list ([[x,y], …]); detect regions only when the inner arrays hold
+    // nested content (segments/points), never plain numeric pairs.
+    const flatPaths = [];
+    for (const p of resultPaths || []) {
+      if (Array.isArray(p) && p.length && Array.isArray(p[0]) &&
+          (typeof p[0][0] === 'string' || (Array.isArray(p[0][0]) && p[0][0].length && typeof p[0][0][0] !== 'number'))) {
+        for (const pp of p) flatPaths.push(pp);
+      } else if (Array.isArray(p)) {
+        flatPaths.push(p);
+      }
+    }
+    // Normalize a contour to command segments, accepting both the command-tuple
+    // form and the raw point-list form.
+    const toSegs = (path) => {
+      const out = [];
+      let prev = null;
+      for (const item of path) {
+        if (item && typeof item === 'object' && typeof item[0] === 'string') {
+          out.push(item);
+        } else if (Array.isArray(item) && item.length >= 2 &&
+                   typeof item[0] === 'number' && typeof item[1] === 'number') {
+          const p = [item[0], item[1]];
+          if (prev) out.push(['L', prev, p]);
+          prev = p;
+        }
+      }
+      return out;
+    };
     const pidAt = (x, y) => {
       const key = Math.round(x / BOOL_EPS) + ',' + Math.round(y / BOOL_EPS);
       if (shared.has(key)) return shared.get(key);
@@ -19912,9 +20262,6 @@
           if (!ok) break;
         }
         if (!ok) {
-          // something the exact builders refuse (rx != ry, degenerate arc,
-          // full-circle arc): fall back to a dense polyline entity for this
-          // subpath only — it stays exact to sampling tolerance
           const pts = [];
           for (const seg of sub.segs) {
             const st = seg[1];
@@ -19941,6 +20288,31 @@
   function boolPathsToCurveLoops(resultPaths) {
     const loops = [];
     const endOf = (seg) => seg[0] === 'L' ? seg[2] : seg[0] === 'C' ? seg[4] : seg[0] === 'Q' ? seg[3] : seg[7];
+    // flatten PathBool regions -> contours (same detection as boolPathsToEntities)
+    const flatPaths = [];
+    for (const p of resultPaths || []) {
+      if (Array.isArray(p) && p.length && Array.isArray(p[0]) &&
+          (typeof p[0][0] === 'string' || (Array.isArray(p[0][0]) && p[0][0].length && typeof p[0][0][0] !== 'number'))) {
+        for (const pp of p) flatPaths.push(pp);
+      } else if (Array.isArray(p)) {
+        flatPaths.push(p);
+      }
+    }
+    const toSegs = (path) => {
+      const out = [];
+      let prev = null;
+      for (const item of path) {
+        if (item && typeof item === 'object' && typeof item[0] === 'string') {
+          out.push(item);
+        } else if (Array.isArray(item) && item.length >= 2 &&
+                   typeof item[0] === 'number' && typeof item[1] === 'number') {
+          const p = [item[0], item[1]];
+          if (prev) out.push(['L', prev, p]);
+          prev = p;
+        }
+      }
+      return out;
+    };
     for (const path of resultPaths) {
       const subs = [];
       let cur = null;
@@ -20054,6 +20426,26 @@
   // the toast instead of vanishing silently.
   function cmdBooleanExact(PB, mode, picked, removedLoops, keepTool, keptLoops) {
     const isUnion = mode === 'union';
+    // Hierarchical selections (loop inside another loop → hole) are handled by
+    // the Clipper+PolyTree fallback — the flat PathBool cannot express a hole.
+    // Union must NOT treat contained loops as holes (they are solids to merge).
+    if (!isUnion) {
+      const hasNested = (() => {
+        for (let i = 0; i < picked.length; i++) {
+          const A = picked[i];
+          if (!A || !A.poly || A.poly.length < 3) continue;
+          const probe = (typeof interiorProbe === 'function') ? interiorProbe(A.poly) : null;
+          if (!probe) continue;
+          for (let j = 0; j < picked.length; j++) {
+            if (i === j) continue;
+            const B = picked[j];
+            if (B && B.poly && B.poly.length >= 3 && pointInPoly(probe, B.poly)) return true;
+          }
+        }
+        return false;
+      })();
+      if (hasNested) return false;
+    }
     // PolyBool's operations are N-ary LEFT-FOLDS: Difference(A,B,C) means
     // A−B−C. So cut with several targets must union the targets first
     // (Union IS the multi-target operation we want), then subtract the tool
@@ -20086,9 +20478,19 @@
     const toolLoops = isUnion ? [] : [picked[0]];
     const targetInputs = inputsOf(targets);
     if (!targetInputs) return false;
+    // Stage 1 fuses the targets into ONE region the tool then acts on. For
+    // CUT the targets fuse by Union (subtract one tool from all of them); for
+    // INTERSECT they must ALSO fuse by Union, not Intersection: intersecting
+    // the targets first would need them to overlap each other, which disjoint
+    // targets (two separate circles) never do — that returned nothing even
+    // when both clearly overlapped the tool. Union grows the target region to
+    // everything selected, so the final intersection with the tool keeps
+    // exactly the tool area covered by the targets (2-circle + box case).
+    // A single target fuses to itself either way, so keep Intersection there.
     const stageOp = isUnion ? PB.PathBooleanOperation.Union
       : mode === 'cut' ? PB.PathBooleanOperation.Union       // targets fuse first
-      : PB.PathBooleanOperation.Intersection;                 // targets fuse first
+      : targets.length > 1 ? PB.PathBooleanOperation.Union    // disjoint targets union first
+      : PB.PathBooleanOperation.Intersection;                 // single target as before
     let resultPaths;
     try {
       resultPaths = new PB.PathBoolean(targetInputs).get(stageOp);
@@ -20145,8 +20547,9 @@
     const madeIds = boolPathsToEntities(PB, resultPaths, color, keepPointIds);
     if (!madeIds.length) {
       commit();
-      toast('That operation leaves nothing');
-      return true;
+      // Exact engine produced nothing (face-fragment flattening can yield zero);
+      // hand off to the Clipper+PolyTree fallback instead of declaring "nothing".
+      return false;
     }
     removeEntities([...eatIds]);
     // re-attach what survives meaningfully
@@ -20376,6 +20779,127 @@
     return fromRings(rings);
   }
 
+  // Container-aware boolean: used when the selection contains array/group/art,
+  // text or image entities. It flattens every selected entity to world curve
+  // contours (entityWorldPolylines), treats the LAST picked entity as the tool
+  // and unions ALL of its contours into ONE region (so a multi-contour text or
+  // group cuts as a single unit), then runs Clipper (union / cut / intersect).
+  // Every consumed entity is replaced by the result, exactly like the loop path.
+  function runContainerBoolean(mode, ents, keep, keepTool) {
+    const Lib = clipperLib();
+    if (!Lib) {
+      toast('Boolean operations need tools/clipper.js');
+      return;
+    }
+    if (ents.length < 2) {
+      toast(mode === 'union'
+        ? 'Select two or more objects, then press Ctrl++'
+        : 'Select the target object first, then the tool object last');
+      return;
+    }
+    const toolEnt = ents[ents.length - 1];
+    const targets = ents.slice(0, -1);
+    const toPath = (pts) => pts.map(p => ({
+      X: Math.round(p.x * OFFSET_SCALE), Y: Math.round(p.y * OFFSET_SCALE)
+    }));
+    const fixPts = (pts) => {
+      const c = (pts || []).slice();
+      if (c.length >= 3 && signedAreaPts(c) < 0) c.reverse();
+      return c;
+    };
+    const polysOf = (e) => {
+      const out = [];
+      for (const pl of entityWorldPolylines(e)) {
+        if (pl && Array.isArray(pl.pts) && pl.pts.length >= 3) out.push(pl.pts);
+      }
+      return out;
+    };
+
+    const cl = new Lib.Clipper();
+    // subject = every target contour, each as its own loop (targets are NOT
+    // unioned with each other, matching the loop-based pipeline)
+    for (const t of targets) {
+      for (const pts of polysOf(t)) {
+        cl.AddPaths([toPath(fixPts(pts))], Lib.PolyType.ptSubject, true);
+      }
+    }
+    if (mode !== 'union') {
+      // tool = ONE unit: union all of its contours into a single region first
+      const tpaths = [];
+      for (const pts of polysOf(toolEnt)) tpaths.push(toPath(fixPts(pts)));
+      if (!tpaths.length) {
+        toast('Tool has no usable geometry');
+        return;
+      }
+      let clipPaths;
+      if (tpaths.length === 1) {
+        clipPaths = tpaths;
+      } else {
+        const tc = new Lib.Clipper();
+        tc.AddPaths(tpaths, Lib.PolyType.ptSubject, true);
+        const fused = new Lib.Paths();
+        tc.Execute(Lib.ClipType.ctUnion, fused, Lib.PolyFillType.pftNonZero, Lib.PolyFillType.pftNonZero);
+        clipPaths = [];
+        for (const path of fused) if (path && path.length >= 3) clipPaths.push(path);
+      }
+      cl.AddPaths(clipPaths, Lib.PolyType.ptClip, true);
+    }
+
+    const raw = new Lib.Paths();
+    const op = mode === 'union' ? Lib.ClipType.ctUnion
+      : mode === 'intersect' ? Lib.ClipType.ctIntersection
+      : Lib.ClipType.ctDifference;
+    cl.Execute(op, raw, Lib.PolyFillType.pftNonZero, Lib.PolyFillType.pftNonZero);
+
+    const result = [];
+    for (const path of raw) {
+      if (!path || path.length < 3) continue;
+      const pts = [];
+      for (const pt of path) {
+        const x = pt.X / OFFSET_SCALE, y = pt.Y / OFFSET_SCALE;
+        const last = pts[pts.length - 1];
+        if (last && Math.hypot(x - last.x, y - last.y) < OFFSET_PRECISION * 0.5) continue;
+        pts.push({ x, y });
+      }
+      if (pts.length >= 3 && Math.abs(signedAreaPts(pts)) > 1e-6) result.push(pts);
+    }
+    if (!result.length) {
+      toast('That operation leaves nothing');
+      return;
+    }
+    const refEnt = targets[0];
+    const color = (refEnt && colorOf(refEnt)) || ui.color;
+
+    pushHistory();
+    const removed = new Set();
+    if (!keep) {
+      for (const t of targets) removed.add(+t.id);
+      if (!keepTool) removed.add(+toolEnt.id);
+    } else if (mode === 'cut') {
+      // cut-keep: only the tool stays; targets are consumed
+      for (const t of targets) removed.add(+t.id);
+    }
+    removeEntities([...removed]);
+
+    const fitResult = settings.booleanFit !== 'poly';
+    const fitTol = isFinite(+settings.curveFitTol) && +settings.curveFitTol > 0 ? +settings.curveFitTol : 0.2;
+    const fitSharp = isFinite(+settings.curveSharpAngle) ? +settings.curveSharpAngle : 25;
+    const madeIds = [];
+    for (const pts of result) {
+      let id = null;
+      if (fitResult) {
+        id = addFittedSpline(pts, color, { tol: fitTol, sharpAngle: fitSharp, closed: true });
+      }
+      if (!id) id = addPanelEntity(pts, color);
+      if (id) madeIds.push(id);
+    }
+    ui.selection = madeIds.map(id => ({ kind: 'entity', id }));
+    invalidateLoops();
+    commit();
+    const what = mode === 'union' ? 'Union' : mode === 'cut' ? 'Cut' : 'Intersection';
+    toast(what + ' (container) · ' + madeIds.length + ' result loop' + (madeIds.length === 1 ? '' : 's'));
+  }
+
   function cmdBoolean(mode) {
     // "keep" modes (Shift+click, or Ctrl+Shift+- for cut) run the operation
     // but leave every ORIGINAL loop in the drawing; the result is added on
@@ -20387,6 +20911,27 @@
       : mode === 'intersect-keep' ? 'intersect' : mode;
     const keepTool = keep;
     const isUnion = effMode === 'union';
+
+    // If the selection contains container entities (array/group/art, text,
+    // image) the boolean must flatten them to curves and treat the LAST picked
+    // entity as ONE unit (its contours are unioned internally) — see
+    // runContainerBoolean below. Plain non-container selections keep the
+    // existing loop-based exact/Clipper pipeline.
+    const selEnts = [];
+    {
+      const guides = (typeof ownedGuideIds === 'function') ? ownedGuideIds() : new Set();
+      for (const s of ui.selection) {
+        if (!s || s.kind !== 'entity') continue;
+        const e = state.entities[s.id];
+        if (!e || !entityEditable(e) || guides.has(+e.id) || e.type === 'note') continue;
+        selEnts.push(e);
+      }
+      const hasContainer = selEnts.some(e => e.type === 'art' || e.type === 'array' || e.type === 'text' || e.type === 'image');
+      if (hasContainer) {
+        runContainerBoolean(effMode, selEnts, keep, keepTool);
+        return;
+      }
+    }
     // Cut / intersect take their tool from the LAST selected loop; reorder so
     // that loop becomes the first (tool) unit. Union has no tool.
     const allPicked = orderLoopsBySelection(pickedLoops(), !isUnion);
@@ -20450,20 +20995,52 @@
       X: Math.round(p.x * OFFSET_SCALE), Y: Math.round(p.y * OFFSET_SCALE)
     }));
     const cl = new Lib.Clipper();
-    if (isUnion) {
-      cl.AddPaths(picked.map(l => toPath(fix(l))), Lib.PolyType.ptSubject, true);
-    } else {
-      // subject = all targets fused (multi-target cut/intersect already worked
-      // in the exact engine; this keeps the Clipper fallback equivalent)
-      cl.AddPaths(targets.map(l => toPath(fix(l))), Lib.PolyType.ptSubject, true);
+    // Hierarchy-aware subject assembly: loops contained inside another selected
+    // loop are HOLES (opposite winding), not solids to union. This keeps e.g.
+    // an outer+inner rectangle pair as a real ring when a crossing tool cuts it.
+    const levels = new Array(picked.length).fill(0);
+    for (let i = 0; i < picked.length; i++) {
+      const A = picked[i];
+      if (!A || !A.poly || A.poly.length < 3) continue;
+      const probe = (typeof interiorProbe === 'function') ? interiorProbe(A.poly) : null;
+      if (!probe) continue;
+      for (let j = 0; j < picked.length; j++) {
+        if (i === j) continue;
+        const B = picked[j];
+        if (B && B.poly && B.poly.length >= 3 && pointInPoly(probe, B.poly)) {
+          levels[i] = Math.max(levels[i], levels[j] + 1);
+        }
+      }
+    }
+    const subjectSolids = [];
+    const subjectHoles = [];
+    const subjectLoops = isUnion ? picked : targets;
+    subjectLoops.forEach((L) => {
+      if (!isUnion) {
+        const idx = picked.indexOf(L);
+        if (idx >= 0 && (levels[idx] % 2 === 1)) { subjectHoles.push(L); return; }
+      }
+      subjectSolids.push(L);
+    });
+    const addSubjectLoop = (L) => cl.AddPaths([toPath(fix(L))], Lib.PolyType.ptSubject, true);
+    for (const L of subjectSolids) addSubjectLoop(L);
+    for (const L of subjectHoles) {
+      const pts = fix(L).slice().reverse();   // holes wind opposite to solids
+      cl.AddPaths([toPath(pts)], Lib.PolyType.ptSubject, true);
+    }
+    if (!isUnion) {
       cl.AddPaths([toPath(fix(toolLoop))], Lib.PolyType.ptClip, true);
     }
-    const raw = new Lib.Paths();
     const clipOp = effMode === 'cut' ? Lib.ClipType.ctDifference
       : effMode === 'intersect' ? Lib.ClipType.ctIntersection : Lib.ClipType.ctUnion;
-    cl.Execute(clipOp, raw, Lib.PolyFillType.pftNonZero, Lib.PolyFillType.pftNonZero);
+    // PolyTree keeps nested holes — read every contour node (outer AND holes).
+    const tree = new Lib.PolyTree();
+    cl.Execute(clipOp, tree, Lib.PolyFillType.pftNonZero, Lib.PolyFillType.pftNonZero);
     const result = [];
-    for (const path of raw) {
+    const nodePolys = (Array.isArray(tree.m_AllPolys) ? tree.m_AllPolys : [])
+      .concat((Array.isArray(tree.Childs) ? tree.Childs : []) || []);
+    for (const node of nodePolys) {
+      const path = (node && (node.m_polygon || node.Contour)) || null;
       if (!path || path.length < 3) continue;
       const pts = [];
       for (const pt of path) {
@@ -29705,6 +30282,11 @@
     render();
   }
 
+  function safeSetPointerCapture(el, ev) {
+    if (!el || !ev || ev._virtual || ev.pointerId == null) return;
+    try { el.setPointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
+  }
+
   async function onPointerDown(ev) {
     if (ui.offsetJob) return;                 // drafting: wheel and Enter only
     // The finger that lifts last after a pinch must not also draw a line.
@@ -29717,7 +30299,7 @@
       // below, so the old middle-click role is covered.
       ev.preventDefault();
       startPan(pointerPos(ev));
-      canvas.setPointerCapture(ev.pointerId);
+      safeSetPointerCapture(canvas, ev);
       return;
     }
     if (ev.button === 2) {
@@ -29728,7 +30310,7 @@
         // decision is made on pointerup, which can tell a click from a drag.
         ev.preventDefault();
         startPan(pointerPos(ev));
-        canvas.setPointerCapture(ev.pointerId);
+        safeSetPointerCapture(canvas, ev);
         ui.panCancelXf = true;
         return;
       }
@@ -29747,7 +30329,7 @@
       // Right-click (no drag) in select mode cycles through the stacked
       // objects at the spot — see onPointerUp. Right-DRAG stays pan.
       ui.pan.cycleOnClick = true;
-      canvas.setPointerCapture(ev.pointerId);
+      safeSetPointerCapture(canvas, ev);
       return;
     }
     if (ev.button !== 0) return;
@@ -29783,7 +30365,7 @@
     const addMod = ev.ctrlKey || ev.metaKey || ui.ctrlToggle;
     const subMod = ev.shiftKey || ui.shiftToggle;
     updateCoords(pos.x, pos.y);
-    canvas.setPointerCapture(ev.pointerId);
+    safeSetPointerCapture(canvas, ev);
     // The modifier flags are also the drafting overrides (Shift = polar,
     // Alt = snap off): refresh them from the event so a stale flag from an
     // earlier move can never silently switch snapping off for this click.
@@ -30264,7 +30846,7 @@
         }
         lastTap = { t: now, x: pos.x, y: pos.y };
         startPan(pos);
-        canvas.setPointerCapture(ev.pointerId);
+        safeSetPointerCapture(canvas, ev);
         render();
         return;
       }
@@ -35007,21 +35589,30 @@ function cmdSplitCurve() {
     };
   }
 
+  // Dedicated single-finger workspace camera pan used while Touch Mode is
+  // active (direct touch on canvas is strictly Pan & Pinch-Zoom — never draws
+  // or selects — so drafting or virtual drags stay intact while panning).
+  let touchPan = null;
+
   function beginPinch() {
-    // Abandon whatever the first finger started. A drag that already pushed a
-    // history entry would otherwise leave a phantom undo step behind.
-    if (ui.drag) {
-      const pushed = ui.drag.pushedHistory || ui.drag.kind === 'partMarker';
-      ui.drag = null;
-      dragSolveSuppressed = false;
-      cancelDragAutoSolve();
-      if (pushed) {
-        history.pop();
-        updateHistoryButtons();
+    touchPan = null;
+    // Abandon whatever the first finger started (only outside Touch Mode: in
+    // Touch Mode direct touch never starts a draw/drag, and preserving any
+    // virtual-mouse draft lets users pan/zoom mid-draft seamlessly).
+    if (!ui.touchMode) {
+      if (ui.drag) {
+        const pushed = ui.drag.pushedHistory || ui.drag.kind === 'partMarker';
+        ui.drag = null;
+        dragSolveSuppressed = false;
+        cancelDragAutoSolve();
+        if (pushed) {
+          history.pop();
+          updateHistoryButtons();
+        }
       }
+      if (ui.pan) ui.pan = null;
+      if (ui.draft && ui.draft.drag) ui.draft.drag = null;
     }
-    if (ui.pan) ui.pan = null;
-    if (ui.draft && ui.draft.drag) ui.draft.drag = null;
     lastTap = null;             // a two-finger gesture is never a double tap
     const p = touchPair();
     pinch = { d0: p.d, mx: p.mx, my: p.my, zoom: view.zoom, ox: view.ox, oy: view.oy };
@@ -35063,27 +35654,52 @@ function cmdSplitCurve() {
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('pointercancel', onPointerUp);
 
-    // Two fingers own the camera. These listeners run BEFORE the tool handlers
-    // (capture phase) so a pinch never leaks into a line / drag / selection.
+    // Two fingers own the camera. In Touch Mode, even ONE finger on the canvas
+    // owns the camera (Pan & Zoom only; all drawing/clicking flows through the
+    // Virtual Mouse Touchpad, even when the touchpad is collapsed).
     const trackTouch = (ev) => {
-      if (ev.pointerType === 'mouse') return;
+      if (ev.pointerType === 'mouse' || ev._virtual) return;
       const pos = pointerPos(ev);
       touchPts.set(ev.pointerId, pos);
       if (touchPts.size === 2) beginPinch();
       else if (touchPts.size > 2) updatePinch();
     };
     const dropTouch = (ev) => {
-      if (ev.pointerType === 'mouse') return;
+      if (ev.pointerType === 'mouse' || ev._virtual) return;
       if (!touchPts.has(ev.pointerId)) return;
       touchPts.delete(ev.pointerId);
-      if (touchPts.size < 2) endPinch();
-      else if (pinch) {
+      if (touchPts.size < 2) {
+        endPinch();
+        if (ui.touchMode && touchPts.size === 1) {
+          // One finger remains after a pinch: rebase smooth 1-finger pan
+          const [remId, remPos] = touchPts.entries().next().value;
+          touchPan = { id: remId, startX: remPos.x, startY: remPos.y, ox: view.ox, oy: view.oy };
+        } else {
+          touchPan = null;
+        }
+      } else if (pinch) {
         // A finger left: rebase so the remaining pair does not jump.
         const p = touchPair();
         pinch = { d0: p.d, mx: p.mx, my: p.my, zoom: view.zoom, ox: view.ox, oy: view.oy };
       }
     };
     canvas.addEventListener('pointerdown', (ev) => {
+      if (ev._virtual) return;
+      if (ui.touchMode && ev.pointerType !== 'mouse') {
+        const pos = pointerPos(ev);
+        touchPts.set(ev.pointerId, pos);
+        if (touchPts.size === 1) {
+          touchPan = { id: ev.pointerId, startX: pos.x, startY: pos.y, ox: view.ox, oy: view.oy };
+        } else if (touchPts.size === 2) {
+          beginPinch();
+        } else {
+          updatePinch();
+        }
+        safeSetPointerCapture(canvas, ev);
+        ev.stopPropagation();
+        ev.preventDefault();
+        return;
+      }
       trackTouch(ev);
       if (pinch) {
         ev.stopPropagation();
@@ -35091,6 +35707,23 @@ function cmdSplitCurve() {
       }
     }, true);
     canvas.addEventListener('pointermove', (ev) => {
+      if (ev._virtual) return;
+      if (ui.touchMode && ev.pointerType !== 'mouse') {
+        const pos = pointerPos(ev);
+        if (touchPts.has(ev.pointerId)) touchPts.set(ev.pointerId, pos);
+        if (pinch) {
+          updatePinch();
+        } else if (touchPan && touchPan.id === ev.pointerId) {
+          view.ox = touchPan.ox + (pos.x - touchPan.startX);
+          view.oy = touchPan.oy + (pos.y - touchPan.startY);
+          ui.lastWorld = s2w(pos.x, pos.y);
+          scheduleRender();
+          scheduleViewSave();
+        }
+        ev.stopPropagation();
+        ev.preventDefault();
+        return;
+      }
       if (!touchPts.has(ev.pointerId)) { trackTouch(ev); if (pinch) return; }
       else touchPts.set(ev.pointerId, pointerPos(ev));
       if (pinch) {
@@ -35099,7 +35732,24 @@ function cmdSplitCurve() {
         ev.preventDefault();
       }
     }, true);
+    const finishTouchModePointer = (ev) => {
+      dropTouch(ev);
+      if (touchPts.size === 0) {
+        touchPan = null;
+        pinchSwallowed = false;
+        scheduleZoomSettle();
+        scheduleViewSave();
+        render();
+      }
+      ev.stopPropagation();
+      ev.preventDefault();
+    };
     canvas.addEventListener('pointerup', (ev) => {
+      if (ev._virtual) return;
+      if (ui.touchMode && ev.pointerType !== 'mouse') {
+        finishTouchModePointer(ev);
+        return;
+      }
       if (pinch) {
         dropTouch(ev);
         ev.stopPropagation();
@@ -35109,6 +35759,11 @@ function cmdSplitCurve() {
       dropTouch(ev);
     }, true);
     canvas.addEventListener('pointercancel', (ev) => {
+      if (ev._virtual) return;
+      if (ui.touchMode && ev.pointerType !== 'mouse') {
+        finishTouchModePointer(ev);
+        return;
+      }
       if (pinch) { dropTouch(ev); ev.stopPropagation(); ev.preventDefault(); return; }
       dropTouch(ev);
     }, true);
@@ -35119,7 +35774,7 @@ function cmdSplitCurve() {
       if (ui.drag || ui.pan) return;
       // touch pointers are tracked by id; leaving the element (finger lifted
       // outside) must not leave a stale pair behind and wedge the camera
-      if (!pinch) touchPts.clear();
+      if (!pinch && !touchPan) touchPts.clear();
       ui.hover = null;
       ui.hoverProbe = null;
       ui.raw = null;
@@ -37380,8 +38035,28 @@ function cmdSplitCurve() {
     const syncModToggles = () => {
       document.querySelectorAll('.rb-btn.toggle[data-toggle]').forEach(b => {
         const k = b.dataset.toggle;
-        if (toggleField[k]) b.classList.toggle('active', !!ui[toggleField[k]]);
+        if (toggleField[k]) {
+          const on = !!ui[toggleField[k]];
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
       });
+      document.querySelectorAll('.vpad-mod[data-vmod]').forEach(b => {
+        const k = b.dataset.vmod;
+        if (toggleField[k]) {
+          const on = !!ui[toggleField[k]];
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
+      });
+    };
+    const flipModToggle = (k) => {
+      if (!toggleField[k]) return;
+      ui[toggleField[k]] = !ui[toggleField[k]];
+      ui[toggleFlag[k]] = !!ui[toggleField[k]];
+      syncModToggles();
+      if (ui.touchMode && typeof vpadNotifyMove === 'function') vpadNotifyMove();
+      else if (ui.draft) render();
     };
     document.querySelectorAll('.rb-btn.toggle[data-toggle]').forEach(btn => {
       const k = btn.dataset.toggle;
@@ -37391,6 +38066,15 @@ function cmdSplitCurve() {
         ui[toggleFlag[k]] = !!ui[toggleField[k]];
         syncModToggles();
         if (ui.draft) render();
+      });
+    });
+    document.querySelectorAll('.vpad-mod[data-vmod]').forEach(btn => {
+      const k = btn.dataset.vmod;
+      if (!toggleField[k]) return;
+      btn.addEventListener('pointerdown', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        flipModToggle(k);
       });
     });
     syncModToggles();
@@ -39987,6 +40671,468 @@ function cmdSplitCurve() {
     app.style.height = Math.round(h) + 'px';
   }
 
+  // ---- Touch Mode & Laptop-Style Virtual Mouse Touchpad -------------------
+  // Auto-activates on coarse-pointer (tablet/phone) devices and can be toggled
+  // manually from the header button or Tool menu. In Touch Mode:
+  //   1. Ribbon becomes slim icon-only (no shortcut badges or labels).
+  //   2. Swatch color strip relocates into #stage-left-panels below Layers so
+  //      the left collapse tab hides Edit + Layers + Swatches together.
+  //   3. Direct touch on #canvas is strictly camera Pan & Pinch-Zoom.
+  //   4. Bottom collapsible touchpad drives a high-contrast virtual mouse
+  //      cursor using synthetic pointerType:'mouse' events for 100% CAD parity.
+  const TOUCH_MODE_KEY = 'minisketch.touchMode';
+  const VPAD_COLLAPSED_KEY = 'minisketch.vpadCollapsed';
+  const vpad = {
+    x: 0,
+    y: 0,
+    initialized: false,
+    collapsed: false,
+    leftHeld: false,
+    rightHeld: false,
+    dragLock: false,
+    lastClickAt: 0,
+    lastClickX: 0,
+    lastClickY: 0,
+    lmbPointerId: null,
+    rmbPointerId: null
+  };
+
+  function vpadRenderCursor() {
+    const vc = document.getElementById('vcursor');
+    if (!vc) return;
+    vc.style.transform = 'translate3d(' + vpad.x.toFixed(1) + 'px, ' + vpad.y.toFixed(1) + 'px, 0)';
+    vc.classList.toggle('is-pressed', !!(vpad.leftHeld || vpad.rightHeld));
+    vc.classList.toggle('is-locked', !!vpad.dragLock);
+  }
+
+  function vpadClampCursor() {
+    if (!ui.touchMode) return;
+    if (!vpad.initialized) {
+      vpad.x = Math.max(16, W / 2);
+      vpad.y = Math.max(16, H / 2);
+      vpad.initialized = true;
+    } else {
+      vpad.x = clamp(vpad.x, 0, Math.max(0, W));
+      vpad.y = clamp(vpad.y, 0, Math.max(0, H));
+    }
+    vpadRenderCursor();
+  }
+
+  function makeVirtualEvent(type, opts) {
+    const r = canvas.getBoundingClientRect();
+    const o = opts || {};
+    const buttons = o.buttons != null
+      ? o.buttons
+      : (((vpad.leftHeld || vpad.dragLock) ? 1 : 0) | (vpad.rightHeld ? 2 : 0));
+    return {
+      type,
+      _virtual: true,
+      pointerType: 'mouse',
+      pointerId: 9001,
+      isPrimary: true,
+      button: o.button != null ? o.button : 0,
+      buttons,
+      clientX: r.left + vpad.x,
+      clientY: r.top + vpad.y,
+      shiftKey: o.shiftKey != null ? !!o.shiftKey : !!ui.shiftToggle,
+      ctrlKey: o.ctrlKey != null ? !!o.ctrlKey : !!ui.ctrlToggle,
+      metaKey: false,
+      altKey: o.altKey != null ? !!o.altKey : !!ui.altToggle,
+      deltaX: o.deltaX || 0,
+      deltaY: o.deltaY || 0,
+      preventDefault() {},
+      stopPropagation() {}
+    };
+  }
+
+  function vpadNotifyMove() {
+    if (!ui.touchMode) return;
+    vpadRenderCursor();
+    onPointerMove(makeVirtualEvent('pointermove'));
+  }
+
+  function initTouchMode() {
+    const btnTouch = document.getElementById('btn-touch-mode');
+    const menuTouch = document.getElementById('menu-touch-mode');
+    const tglTouch = document.getElementById('tgl-touch-mode');
+    const dock = document.getElementById('vpad-dock');
+    const reopenBtn = document.getElementById('vpad-reopen');
+    const collapseBtn = document.getElementById('vpad-collapse');
+    const surface = document.getElementById('vpad-surface');
+    const ripple = document.getElementById('vpad-ripple');
+    const lmbBtn = document.getElementById('vpad-lmb');
+    const lockBtn = document.getElementById('vpad-drag-lock');
+    const lockLabel = document.getElementById('vpad-lock-label');
+    const rmbBtn = document.getElementById('vpad-rmb');
+    const vcursor = document.getElementById('vcursor');
+    const stageEl = document.getElementById('stage');
+    const colorsEl = document.getElementById('stage-colors');
+    const leftPanelsEl = document.getElementById('stage-left-panels');
+    const stageFileEl = document.getElementById('stage-file');
+
+    const coarseMQ = window.matchMedia ? window.matchMedia('(pointer: coarse)') : { matches: false };
+    let modePref = 'auto';
+    try {
+      const saved = localStorage.getItem(TOUCH_MODE_KEY);
+      if (saved === 'on' || saved === 'off' || saved === 'auto') modePref = saved;
+      vpad.collapsed = localStorage.getItem(VPAD_COLLAPSED_KEY) === '1';
+    } catch (err) { /* ignore storage errors */ }
+
+    const tLabel = (key, fallback) =>
+      (window.MiniSketchI18n && window.MiniSketchI18n.t) ? window.MiniSketchI18n.t(key) : fallback;
+
+    const syncButtonsUI = () => {
+      if (lmbBtn) {
+        const down = !!(vpad.leftHeld || vpad.dragLock);
+        lmbBtn.classList.toggle('is-pressed', down);
+        lmbBtn.setAttribute('aria-pressed', down ? 'true' : 'false');
+      }
+      if (rmbBtn) {
+        rmbBtn.classList.toggle('is-pressed', !!vpad.rightHeld);
+        rmbBtn.setAttribute('aria-pressed', vpad.rightHeld ? 'true' : 'false');
+      }
+      if (lockBtn) {
+        lockBtn.classList.toggle('is-locked', !!vpad.dragLock);
+        lockBtn.setAttribute('aria-pressed', vpad.dragLock ? 'true' : 'false');
+      }
+      if (lockLabel) {
+        lockLabel.textContent = vpad.dragLock
+          ? tLabel('vpad.locked', 'Locked')
+          : tLabel('vpad.lock', 'Lock');
+      }
+      vpadRenderCursor();
+    };
+
+    const setDragLock = (on, firePointer) => {
+      const next = !!on;
+      if (vpad.dragLock === next) return;
+      vpad.dragLock = next;
+      syncButtonsUI();
+      if (firePointer !== false) {
+        if (next) {
+          onPointerDown(makeVirtualEvent('pointerdown', { button: 0, buttons: 1 }));
+        } else {
+          onPointerUp(makeVirtualEvent('pointerup', { button: 0, buttons: 0 }));
+        }
+      }
+    };
+
+    const releaseAllVirtualButtons = () => {
+      if (vpad.dragLock) setDragLock(false, true);
+      if (vpad.leftHeld) {
+        vpad.leftHeld = false;
+        vpad.lmbPointerId = null;
+        onPointerUp(makeVirtualEvent('pointerup', { button: 0, buttons: 0 }));
+      }
+      if (vpad.rightHeld) {
+        vpad.rightHeld = false;
+        vpad.rmbPointerId = null;
+        onPointerUp(makeVirtualEvent('pointerup', { button: 2, buttons: 0 }));
+      }
+      syncButtonsUI();
+    };
+
+    const relocateSwatches = (toLeftPanel) => {
+      if (!colorsEl) return;
+      if (toLeftPanel && leftPanelsEl) {
+        if (colorsEl.parentElement !== leftPanelsEl) {
+          leftPanelsEl.appendChild(colorsEl);
+        }
+      } else if (stageEl && colorsEl.parentElement !== stageEl) {
+        if (stageFileEl && stageFileEl.parentElement === stageEl) {
+          stageEl.insertBefore(colorsEl, stageFileEl);
+        } else {
+          stageEl.appendChild(colorsEl);
+        }
+      }
+    };
+
+    const syncDockVisibility = () => {
+      const on = !!ui.touchMode;
+      const showDock = on && !vpad.collapsed;
+      const showReopen = on && vpad.collapsed;
+      document.body.classList.toggle('vpad-collapsed', on && vpad.collapsed);
+      if (dock) dock.classList.toggle('hidden', !showDock);
+      if (reopenBtn) {
+        reopenBtn.classList.toggle('hidden', !showReopen);
+        reopenBtn.setAttribute('aria-expanded', showDock ? 'true' : 'false');
+      }
+      if (collapseBtn) collapseBtn.setAttribute('aria-expanded', showDock ? 'true' : 'false');
+      if (vcursor) vcursor.classList.toggle('hidden', !on);
+      if (!showDock && vpad.dragLock) setDragLock(false, true);
+      requestAnimationFrame(() => {
+        resize();
+        if (on) vpadClampCursor();
+      });
+    };
+
+    const applyTouchMode = (active, persist) => {
+      const next = !!active;
+      if (!next && ui.touchMode) releaseAllVirtualButtons();
+      ui.touchMode = next;
+      document.body.classList.toggle('touch-mode', next);
+      if (btnTouch) {
+        btnTouch.classList.toggle('is-on', next);
+        btnTouch.setAttribute('aria-pressed', next ? 'true' : 'false');
+      }
+      if (tglTouch) tglTouch.checked = next;
+      if (menuTouch) {
+        menuTouch.classList.toggle('is-on', next);
+        menuTouch.setAttribute('aria-checked', next ? 'true' : 'false');
+      }
+      relocateSwatches(next);
+      if (persist) {
+        modePref = next ? 'on' : 'off';
+        try { localStorage.setItem(TOUCH_MODE_KEY, modePref); } catch (err) { /* ignore */ }
+      }
+      syncDockVisibility();
+      updateCanvasCursor();
+    };
+
+    const toggleTouchMode = () => applyTouchMode(!ui.touchMode, true);
+    if (btnTouch) btnTouch.addEventListener('click', toggleTouchMode);
+    if (tglTouch) tglTouch.addEventListener('change', () => applyTouchMode(!!tglTouch.checked, true));
+
+    const setCollapsed = (next) => {
+      vpad.collapsed = !!next;
+      try { localStorage.setItem(VPAD_COLLAPSED_KEY, vpad.collapsed ? '1' : '0'); } catch (err) { /* ignore */ }
+      syncDockVisibility();
+    };
+    if (collapseBtn) {
+      collapseBtn.addEventListener('pointerdown', ev => ev.stopPropagation());
+      collapseBtn.addEventListener('click', () => setCollapsed(true));
+    }
+    if (reopenBtn) {
+      reopenBtn.addEventListener('click', () => setCollapsed(false));
+    }
+
+    const triggerTapRipple = (clientX, clientY) => {
+      if (!ripple || !surface) return;
+      const r = surface.getBoundingClientRect();
+      ripple.style.left = (clientX - r.left) + 'px';
+      ripple.style.top = (clientY - r.top) + 'px';
+      ripple.classList.remove('pop');
+      void ripple.offsetWidth;
+      ripple.classList.add('pop');
+    };
+
+    const fireVirtualLeftTap = () => {
+      const now = performance.now();
+      const isDouble = (now - vpad.lastClickAt) < DOUBLE_TAP_MS &&
+        Math.hypot(vpad.x - vpad.lastClickX, vpad.y - vpad.lastClickY) < 10;
+      vpad.lastClickAt = now;
+      vpad.lastClickX = vpad.x;
+      vpad.lastClickY = vpad.y;
+      onPointerDown(makeVirtualEvent('pointerdown', { button: 0, buttons: 1 }));
+      onPointerUp(makeVirtualEvent('pointerup', { button: 0, buttons: 0 }));
+      if (isDouble) {
+        vpad.lastClickAt = 0;
+        onDoubleClick(makeVirtualEvent('dblclick', { button: 0, buttons: 0 }));
+      }
+    };
+
+    // Left Click button (supports tap, hold-while-sliding, double-tap, or releasing Drag Lock)
+    if (lmbBtn) {
+      let lmbConsumedLock = false;
+      lmbBtn.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (vpad.dragLock) {
+          lmbConsumedLock = true;
+          setDragLock(false, true);
+          return;
+        }
+        lmbConsumedLock = false;
+        vpad.lmbPointerId = ev.pointerId;
+        vpad.leftHeld = true;
+        try { lmbBtn.setPointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
+        syncButtonsUI();
+        onPointerDown(makeVirtualEvent('pointerdown', { button: 0, buttons: 1 }));
+      });
+      const releaseLmb = (ev) => {
+        if (lmbConsumedLock) { lmbConsumedLock = false; return; }
+        if (vpad.lmbPointerId != null && ev.pointerId !== vpad.lmbPointerId) return;
+        if (!vpad.leftHeld) return;
+        ev.preventDefault();
+        vpad.leftHeld = false;
+        vpad.lmbPointerId = null;
+        syncButtonsUI();
+        const now = performance.now();
+        const isDouble = !ui.drag && (now - vpad.lastClickAt) < DOUBLE_TAP_MS &&
+          Math.hypot(vpad.x - vpad.lastClickX, vpad.y - vpad.lastClickY) < 10;
+        vpad.lastClickAt = now;
+        vpad.lastClickX = vpad.x;
+        vpad.lastClickY = vpad.y;
+        onPointerUp(makeVirtualEvent('pointerup', { button: 0, buttons: 0 }));
+        if (isDouble) {
+          vpad.lastClickAt = 0;
+          onDoubleClick(makeVirtualEvent('dblclick', { button: 0, buttons: 0 }));
+        }
+      };
+      lmbBtn.addEventListener('pointerup', releaseLmb);
+      lmbBtn.addEventListener('pointercancel', releaseLmb);
+    }
+
+    // Drag Lock toggle button (latches LMB down for effortless one-hand drag / marquee / draw)
+    if (lockBtn) {
+      lockBtn.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setDragLock(!vpad.dragLock, true);
+      });
+    }
+
+    // Right Click button (cancel draft, return to Select, cycle stacked objects, or right-drag pan)
+    if (rmbBtn) {
+      rmbBtn.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (vpad.dragLock) setDragLock(false, true);
+        vpad.rmbPointerId = ev.pointerId;
+        vpad.rightHeld = true;
+        try { rmbBtn.setPointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
+        syncButtonsUI();
+        onPointerDown(makeVirtualEvent('pointerdown', { button: 2, buttons: 2 }));
+      });
+      const releaseRmb = (ev) => {
+        if (vpad.rmbPointerId != null && ev.pointerId !== vpad.rmbPointerId) return;
+        if (!vpad.rightHeld) return;
+        ev.preventDefault();
+        vpad.rightHeld = false;
+        vpad.rmbPointerId = null;
+        syncButtonsUI();
+        onPointerUp(makeVirtualEvent('pointerup', { button: 2, buttons: 0 }));
+      };
+      rmbBtn.addEventListener('pointerup', releaseRmb);
+      rmbBtn.addEventListener('pointercancel', releaseRmb);
+    }
+
+    // Touchpad surface: 1-finger relative cursor + acceleration + tap/double-tap,
+    // 2-finger vertical scroll -> virtual wheel zoom / parameter scroll at cursor
+    if (surface) {
+      const padPts = new Map();
+      let primaryId = null;
+      let startX = 0, startY = 0, startT = 0;
+      let lastX = 0, lastY = 0, lastT = 0;
+      let moved = false;
+      let twoFinger = false;
+      let prevMidY = 0;
+
+      surface.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const now = performance.now();
+        padPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+        try { surface.setPointerCapture(ev.pointerId); } catch (err) { /* ignore */ }
+        surface.classList.add('is-active');
+        if (padPts.size === 1) {
+          primaryId = ev.pointerId;
+          startX = lastX = ev.clientX;
+          startY = lastY = ev.clientY;
+          startT = lastT = now;
+          moved = false;
+          twoFinger = false;
+        } else if (padPts.size >= 2) {
+          twoFinger = true;
+          moved = true;
+          const pts = Array.from(padPts.values());
+          prevMidY = (pts[0].y + pts[1].y) / 2;
+        }
+      });
+
+      surface.addEventListener('pointermove', (ev) => {
+        if (!padPts.has(ev.pointerId)) return;
+        ev.preventDefault();
+        const now = performance.now();
+        padPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+        if (twoFinger && padPts.size >= 2) {
+          const pts = Array.from(padPts.values());
+          const midY = (pts[0].y + pts[1].y) / 2;
+          const dy = midY - prevMidY;
+          prevMidY = midY;
+          if (Math.abs(dy) >= 0.5) {
+            const paramWheel = !!(ui.offsetJob ||
+              (ui.tool === 'box' && ui.draft && ui.draft.type === 'box') ||
+              (ui.tool === 'poly' && ui.draft && ui.draft.type === 'poly'));
+            onWheel(makeVirtualEvent('wheel', {
+              deltaY: -dy * 2.4,
+              ctrlKey: paramWheel ? !!ui.ctrlToggle : true
+            }));
+          }
+          return;
+        }
+        if (ev.pointerId !== primaryId) return;
+        const dx = ev.clientX - lastX;
+        const dy = ev.clientY - lastY;
+        const dt = Math.max(4, now - lastT);
+        lastX = ev.clientX;
+        lastY = ev.clientY;
+        lastT = now;
+        if (!moved && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 6) {
+          moved = true;
+        }
+        if (dx === 0 && dy === 0) return;
+        // Laptop-like pointer ballistics: 0.9x at slow speed for node precision,
+        // smoothly accelerating up to 2.35x for brisk sweeps across the canvas.
+        const speed = Math.hypot(dx, dy) / dt;
+        const gain = clamp(0.9 + speed * 0.85, 0.9, 2.35);
+        vpad.x = clamp(vpad.x + dx * gain, 0, Math.max(0, W));
+        vpad.y = clamp(vpad.y + dy * gain, 0, Math.max(0, H));
+        vpadNotifyMove();
+      });
+
+      const endPadPointer = (ev, cancelled) => {
+        if (!padPts.has(ev.pointerId)) return;
+        ev.preventDefault();
+        const now = performance.now();
+        const wasPrimary = ev.pointerId === primaryId;
+        const wasTap = !cancelled && wasPrimary && !moved && !twoFinger && (now - startT) < 260;
+        padPts.delete(ev.pointerId);
+        if (padPts.size === 0) {
+          surface.classList.remove('is-active');
+          primaryId = null;
+          twoFinger = false;
+        } else if (wasPrimary) {
+          const [nextId, nextPt] = padPts.entries().next().value;
+          primaryId = nextId;
+          lastX = nextPt.x;
+          lastY = nextPt.y;
+          lastT = now;
+          moved = true;
+        }
+        if (wasTap) {
+          triggerTapRipple(ev.clientX, ev.clientY);
+          if (vpad.dragLock) {
+            setDragLock(false, true);
+          } else {
+            fireVirtualLeftTap();
+          }
+        }
+      };
+
+      surface.addEventListener('pointerup', (ev) => endPadPointer(ev, false));
+      surface.addEventListener('pointercancel', (ev) => endPadPointer(ev, true));
+    }
+
+    // Pressing Esc cleanly disarms Drag Lock if active
+    window.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && vpad.dragLock) {
+        setDragLock(false, true);
+      }
+    });
+
+    // Follow pointer:coarse changes when preference is 'auto'
+    if (coarseMQ && typeof coarseMQ.addEventListener === 'function') {
+      coarseMQ.addEventListener('change', (ev) => {
+        if (modePref === 'auto') applyTouchMode(!!ev.matches, false);
+      });
+    }
+
+    // Initial state: explicit saved preference wins, else auto-detect coarse pointer
+    const startOn = modePref === 'on' ? true : (modePref === 'off' ? false : !!coarseMQ.matches);
+    applyTouchMode(startOn, false);
+  }
+
   function init() {
     initTheme();
     loadSettings();
@@ -40114,6 +41260,7 @@ function cmdSplitCurve() {
     initModalBehavior();
     bindCanvas();
     bindUI();
+    initTouchMode();
     initPropertyBar();
     bindSidebarSplitter();
     costBind();

@@ -30,6 +30,16 @@ window.MiniSketchTools = (() => {
   const DISABLED_KEY = 'minisketch.v1.ext.disabled';
   const INSTALLED_KEY = 'minisketch.v1.ext.installed';
 
+  // Best-effort line-number extraction from a JS error stack for readable toasts.
+  function errLineOf(err) {
+    try {
+      const st = String(err && err.stack || '');
+      const m = st.match(/\(.*?:(\d+):\d+\)|:(\d+):\d+/);
+      const line = +(m[1] || m[2]);
+      return isFinite(line) ? line : null;
+    } catch (e) { return null; }
+  }
+
   // When a non-built-in extension throws at runtime (only surfaces with a real
   // selection), add a "Fix with AI" button to its modal. Clicking it switches
   // the AI Chat to Extension Builder mode and sends the error + the extension's
@@ -55,10 +65,12 @@ window.MiniSketchTools = (() => {
       // register({...}) contract
       if (typeof chat.setBuilderMode === 'function') chat.setBuilderMode('ext');
       else chat.builderMode = 'ext';
+      // send the error + extension code so the AI can revise in the chat.
       const code = tool.code || '';
+      const line = errLineOf(err);
       const prompt =
         'Ekstensi "' + (tool.label || tool.id) + '" melempar error saat dijalankan:\n' +
-        String(err && err.message || err) + '\n\n' +
+        String(err && err.message || err) + (line ? ' (line ' + line + ')' : '') + '\n\n' +
         (code ? 'Kode ekstensinya:\n```js\n' + code + '\n```\n\n' : '') +
         'Perbaiki error tersebut dan kirim ulang SATU blok kode ```js ... ``` yang lengkap dan valid untuk window.MiniSketchTools.register({...}).';
       if (chat.setTab) chat.setTab('chat');
@@ -90,14 +102,70 @@ window.MiniSketchTools = (() => {
     } catch (err) { installedRecords = []; }
   }
 
+  // ---- Extension code storage: IndexedDB primary, localStorage as boot cache ----
+  // Extension code (especially AI/marketplace tools) can be large, and it shares
+  // the ~5MB localStorage quota with the document. The canonical copy therefore
+  // lives in IndexedDB; localStorage keeps a cache for a synchronous boot. When
+  // the quota denies the localStorage write (QuotaExceededError), the IDB copy
+  // is still safe and the next boot restores from it via refreshFromIdb().
+  const EXT_IDB_NAME = 'minisketch-ext';
+  const EXT_IDB_VER = 1;
+  const EXT_IDB_STORE = 'installed';
+  let _extIdb = null;
+  function openExtIdb() {
+    if (_extIdb) return Promise.resolve(_extIdb);
+    return new Promise((resolve, reject) => {
+      const rq = indexedDB.open(EXT_IDB_NAME, EXT_IDB_VER);
+      rq.onupgradeneeded = () => {
+        const db = rq.result;
+        if (!db.objectStoreNames.contains(EXT_IDB_STORE)) db.createObjectStore(EXT_IDB_STORE, { keyPath: 'id' });
+      };
+      rq.onsuccess = () => { _extIdb = rq.result; resolve(_extIdb); };
+      rq.onerror = () => reject(rq.error);
+    });
+  }
+  async function extIdbReplaceAll(records) {
+    try {
+      const db = await openExtIdb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(EXT_IDB_STORE, 'readwrite');
+        const st = tx.objectStore(EXT_IDB_STORE);
+        st.clear();
+        for (const r of records) st.put(r);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+  async function extIdbGetAll() {
+    try {
+      const db = await openExtIdb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(EXT_IDB_STORE, 'readonly');
+        const rq = tx.objectStore(EXT_IDB_STORE).getAll();
+        rq.onsuccess = () => resolve(rq.result || []);
+        rq.onerror = () => reject(rq.error);
+      });
+    } catch (err) {
+      return [];
+    }
+  }
+
   function saveDisabled() {
     try { localStorage.setItem(DISABLED_KEY, JSON.stringify([...disabledIds])); }
     catch (err) { /* private mode / quota */ }
   }
 
   function saveInstalled() {
-    try { localStorage.setItem(INSTALLED_KEY, JSON.stringify(installedRecords)); }
-    catch (err) { /* private mode / quota */ }
+    const next = JSON.stringify(installedRecords);
+    try { localStorage.setItem(INSTALLED_KEY, next); } catch (err) {
+      // quota hit: the cache is dropped; the IDB canonical copy still holds it
+      try { localStorage.removeItem(INSTALLED_KEY); } catch (e2) {}
+    }
+    extIdbReplaceAll(installedRecords);
   }
 
   function notifyChange() {
@@ -216,7 +284,9 @@ window.MiniSketchTools = (() => {
           } catch (err) {
             console.warn('[minisketch] Extension apply error (' + tool.id + '):', err);
             if (NS.api && NS.api.toast) {
-              NS.api.toast((tool.label || tool.id) + ' error: ' + String(err && err.message || err));
+              const line = errLineOf(err);
+              NS.api.toast((tool.label || tool.id) + ' error: ' + String(err && err.message || err) +
+                (line ? ' — line ' + line : ''));
             }
             // Runtime errors (only appear with a real selection) get a path
             // back to the AI, same as validation errors have "Minta AI
@@ -690,6 +760,88 @@ window.MiniSketchTools = (() => {
     });
   };
 
+  // Mount one stored extension record into the tool list (skips duplicates and
+  // broken records; keeps the app bootable).
+  function mountRecord(rec) {
+    if (!rec || !rec.id || !rec.code) return false;
+    if (NS.list.some(t => t.id === rec.id)) return false;
+    try {
+      const tool = runExtensionCode(rec.code);
+      if (tool && tool.id && typeof tool.apply === 'function') {
+        tool.builtIn = false;
+        tool.preview = false;
+        tool.source = rec.source || 'local';
+        tool.sourceUrl = rec.sourceUrl || '';
+        tool.catalogUrl = rec.catalogUrl || '';
+        tool.version = rec.version || tool.version || '1.0.0';
+        tool.author = rec.author || tool.author || 'Community';
+        tool.category = rec.category || tool.category || 'CNC Utility';
+        tool.description = rec.description || tool.description || tool.title || '';
+        tool.label = rec.label || tool.label || tool.id;
+        tool.icon = rec.icon || tool.icon || '';
+        tool.code = rec.code;
+        NS.list.push(tool);
+        return true;
+      }
+    } catch (err) {
+      /* keep broken saved record harmless so the app still boots */
+    }
+    return false;
+  }
+
+  // When localStorage holds no extension cache (quota kept it from being
+  // written, or storage was cleared), restore the canonical copies from
+  // IndexedDB as soon as it resolves and re-populate the tool row.
+  function refreshFromIdb() {
+    let haveLs = false;
+    try { haveLs = !!(localStorage.getItem(INSTALLED_KEY)); } catch (err) { haveLs = false; }
+    if (haveLs) return Promise.resolve();
+    return extIdbGetAll().then((records) => {
+      const fresh = records.filter(r => r && r.id && r.code);
+      if (!fresh.length || fresh.length === installedRecords.length) return;
+      installedRecords = fresh;
+      let mounted = 0;
+      for (const rec of fresh) if (mountRecord(rec)) mounted++;
+      for (const tool of NS.list) {
+        if (!tool._mounted) mountToolModalAndWire(tool);
+      }
+      if (mounted) { syncToolsRow(); notifyChange(); }
+    }).catch(() => {});
+  }
+
+  // Load extensions saved on the server disk (extensions/saved/*.js) — loopback
+  // only. This makes the disk copy a real safety net: after browser storage is
+  // cleared, tools come back from disk automatically.
+  function isLoopbackHost() {
+    const h = String(typeof location !== 'undefined' && location.hostname || '');
+    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+  }
+  NS.loadSavedFromDisk = async () => {
+    if (!isLoopbackHost()) return [];
+    let list = [];
+    try {
+      const res = await fetch('api/extensions/saved', { cache: 'no-cache' });
+      const j = await res.json().catch(() => ({}));
+      list = (j && Array.isArray(j.saved)) ? j.saved : [];
+    } catch (e) { return []; }
+    let mounted = 0;
+    const seen = new Set(installedRecords.map(r => r.id));
+    for (const rec of list) {
+      if (!rec || !rec.id || !rec.code || seen.has(rec.id)) continue;
+      if (NS.list.some(t => t.id === rec.id)) continue;
+      installedRecords.push({ id: rec.id, code: rec.code, label: rec.label || '', source: 'saved', sourceUrl: '' });
+      seen.add(rec.id);
+      if (mountRecord(installedRecords[installedRecords.length - 1])) mounted++;
+    }
+    if (mounted) {
+      saveInstalled();
+      for (const tool of NS.list) if (!tool._mounted) mountToolModalAndWire(tool);
+      syncToolsRow();
+      notifyChange();
+    }
+    return list;
+  };
+
   // Called once by app.js init(): loads saved extensions, injects modals, and
   // populates enabled tool buttons into #tools-row.
   NS.mount = (api, host) => {
@@ -698,35 +850,17 @@ window.MiniSketchTools = (() => {
     loadStorageState();
 
     // Load persisted user/AI/marketplace extensions before mounting UI
-    for (const rec of installedRecords) {
-      if (NS.list.some(t => t.id === rec.id)) continue;
-      try {
-        const tool = runExtensionCode(rec.code);
-        if (tool && tool.id && typeof tool.apply === 'function') {
-          tool.builtIn = false;
-          tool.preview = false;
-          tool.source = rec.source || 'local';
-          tool.sourceUrl = rec.sourceUrl || '';
-          tool.catalogUrl = rec.catalogUrl || '';
-          tool.version = rec.version || tool.version || '1.0.0';
-          tool.author = rec.author || tool.author || 'Community';
-          tool.category = rec.category || tool.category || 'CNC Utility';
-          tool.description = rec.description || tool.description || tool.title || '';
-          tool.label = rec.label || tool.label || tool.id;
-          tool.icon = rec.icon || tool.icon || '';
-          tool.code = rec.code;
-          NS.list.push(tool);
-        }
-      } catch (err) {
-        /* keep broken saved record harmless so the app still boots */
-      }
-    }
+    for (const rec of installedRecords) mountRecord(rec);
 
     for (const tool of NS.list) {
       if (!tool._mounted) mountToolModalAndWire(tool);
     }
     syncToolsRow();
     notifyChange();
+    // Async fallback when the localStorage cache is missing (quota was hit)
+    refreshFromIdb();
+    // Also pull tools saved on the server disk (loopback) — safety net.
+    NS.loadSavedFromDisk();
   };
 
   NS.open = (id, params) => {

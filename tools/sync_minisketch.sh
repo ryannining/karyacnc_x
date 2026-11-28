@@ -104,6 +104,13 @@ fi
 
 # Buang duplikat, jaga urutan
 FILES=($(printf '%s\n' "${FILES[@]}" | awk '!seen[$0]++'))
+# Aset extension yang disimpan ke disk oleh server (extensions/saved/*.js) —
+# ikut tersalin agar "Save to disk" & auto-load berfungsi di salinan embed.
+for f in "$SRC"/extensions/saved/*.js; do
+    [ -f "$f" ] || continue
+    FILES+=("extensions/saved/$(basename "$f")")
+done
+
 
 echo "Sumber : $SRC"
 echo "Target : $DST"
