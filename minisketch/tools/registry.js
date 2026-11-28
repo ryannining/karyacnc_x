@@ -813,8 +813,16 @@ window.MiniSketchTools = (() => {
   // only. This makes the disk copy a real safety net: after browser storage is
   // cleared, tools come back from disk automatically.
   function isLoopbackHost() {
-    const h = String(typeof location !== 'undefined' && location.hostname || '');
-    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+    const h = String(typeof location !== 'undefined' && location.hostname || '').toLowerCase();
+    if (h === 'localhost' || h === '[::1]' || h === '::1' || h === '127.0.0.1') return true;
+    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (m) {
+      const a = +m[1], b = +m[2];
+      if (a === 10) return true;
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      if (a === 192 && b === 168) return true;
+    }
+    return false;
   }
   NS.loadSavedFromDisk = async () => {
     if (!isLoopbackHost()) return [];

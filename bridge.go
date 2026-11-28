@@ -268,6 +268,9 @@ func runBrowserMode(app *App, requireBrowser bool) bool {
 	mux.HandleFunc("/api/marketplace/catalog", app.handleMarketplaceAPI)
 	mux.HandleFunc("/api/marketplace/publish", app.handleMarketplaceAPI)
 	mux.HandleFunc("/api/marketplace/extensions/", app.handleMarketplaceAPI)
+	// Disk persistence for AI-built extensions (save/list/delete).
+	mux.HandleFunc("/api/extensions/save", app.handleExtensionSaveDisk)
+	mux.HandleFunc("/api/extensions/saved", app.handleExtensionSavedDisk)
 	// web update: serve from cache if fresh copy exists, else embedded
 	if dir := webAssetDir(); dir != "" {
 		mux.Handle("/", serveWebAsset(dir, embedded))

@@ -881,9 +881,10 @@
           const res = window.MiniSketchTools.uninstallExtension(item.id);
           if (!res.ok && api && api.toast) api.toast(res.error);
           syncUpdateControls();
-          // If a disk copy exists (loopback), offer to remove it too.
-          const h = String(location && location.hostname || '');
-          const loopback = h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+          // If a disk copy exists (private network), offer to remove it too.
+          const h = String(location && location.hostname || '').toLowerCase();
+          const loopback = h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1' ||
+            /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
           if (!loopback) return;
           let diskExists = false;
           try {
@@ -964,8 +965,9 @@
     // locally (disk)" group, so they stay visible even when they are not (yet)
     // installed — and even when the catalog itself is empty.
     {
-      const h = String(location && location.hostname || '');
-      const loopback = h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+      const h = String(location && location.hostname || '').toLowerCase();
+      const loopback = h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1' ||
+        /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
       let savedList = [];
       try {
         const resp = await fetch('api/extensions/saved', { cache: 'no-cache' });
