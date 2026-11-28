@@ -1865,6 +1865,13 @@
   function renderExtDock(items) {
     const dock = getExtDock();
     if (!dock) return;
+    // Testing dock is Extension-mode only — hide entirely in SVG mode.
+    if (NS.builderMode !== 'ext') {
+      dock.innerHTML = '';
+      dock.hidden = true;
+      dock._dockSig = '';
+      return;
+    }
     const versions = extVersions(items || []);
     if (!versions.length) {
       NS._lastExtTotal = 0;
@@ -2697,10 +2704,27 @@
     actions.appendChild(testBtn);
     actions.appendChild(installBtn);
     actions.appendChild(editBtn);
-    actions.appendChild(saveDiskBtn);
-    actions.appendChild(pubBtn);
-    actions.appendChild(dlBtn);
-    actions.appendChild(copyBtn);
+    // Secondary actions live in a "⋯" popover to keep the card clean.
+    {
+      const moreHost = document.createElement('div');
+      moreHost.className = 'ext-more';
+      const moreBtn = document.createElement('button');
+      moreBtn.type = 'button';
+      moreBtn.className = 'btn small';
+      moreBtn.textContent = '⋯';
+      moreBtn.title = 'More actions';
+      moreBtn.addEventListener('click', (ev) => { ev.stopPropagation(); moreHost.classList.toggle('open'); });
+      const pop = document.createElement('div');
+      pop.className = 'ext-more-pop';
+      pop.appendChild(saveDiskBtn);
+      pop.appendChild(pubBtn);
+      pop.appendChild(dlBtn);
+      pop.appendChild(copyBtn);
+      moreHost.appendChild(moreBtn);
+      moreHost.appendChild(pop);
+      document.addEventListener('click', (e) => { if (!moreHost.contains(e.target)) moreHost.classList.remove('open'); });
+      actions.appendChild(moreHost);
+    }
     card.appendChild(actions);
 
     // Live state refresh after local edits
@@ -2856,6 +2880,8 @@
       if (window.MiniSketchCloud && window.MiniSketchCloud.scheduleSync) {
         window.MiniSketchCloud.scheduleSync('prefs');
       }
+      // The extension testing dock visibility depends on the mode — re-render.
+      if (typeof renderLog === 'function') renderLog();
     };
     NS.setBuilderMode = setBuilderMode;
     if (modeSel) modeSel.addEventListener('change', () => setBuilderMode(modeSel.value));
