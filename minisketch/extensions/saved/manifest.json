@@ -1,4 +1,7 @@
 [
+{"file":"acp-bitmap-halftone.js","id":"acp-bitmap-halftone","label":"ACP Halftone"},
+{"file":"acp-leaf-voronoi.js","id":"acp-leaf-voronoi","label":"Daun Voronoi"},
+{"file":"acp-voronoi-perf.js","id":"acp-voronoi-perf","label":"ACP Voronoi"},
 {"file":"bake-nomor.js","id":"bake-nomor","label":"Bake Nomor"},
 {"file":"halftone-panel.js","id":"halftone-panel","label":"Halftone"},
 {"file":"mashrabiya.js","id":"mashrabiya","label":"Mashrabiya"},

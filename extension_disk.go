@@ -69,6 +69,37 @@ func privateNetAllowed(r *http.Request) bool {
 
 var safeIDRe = regexp.MustCompile(`[^a-z0-9_-]`)
 
+// writeSavedManifest regenerates extensions/saved/manifest.json from the live
+// folder, so the static manifest never goes stale after a save/delete.
+func writeSavedManifest() {
+	dir := extensionsSavedDir()
+	entries := []map[string]any{}
+	files, err := os.ReadDir(dir)
+	if err == nil {
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".js") {
+				continue
+			}
+			full := filepath.Join(dir, f.Name())
+			b, err := os.ReadFile(full)
+			if err != nil {
+				continue
+			}
+			code := string(b)
+			rec := map[string]any{"file": f.Name(), "id": strings.TrimSuffix(f.Name(), ".js"), "label": ""}
+			if m := regexp.MustCompile(`id:\s*([A-Za-z0-9_-]+)`).FindStringSubmatch(code); len(m) > 1 {
+				rec["id"] = m[1]
+			}
+			if m := regexp.MustCompile(`label:\s*(.*)`).FindStringSubmatch(code); len(m) > 1 {
+				rec["label"] = strings.TrimSpace(m[1])
+			}
+			entries = append(entries, rec)
+		}
+	}
+	b, _ := json.Marshal(entries)
+	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), append(b, '\n'), 0o644)
+}
+
 func (a *App) handleExtensionSaveDisk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -107,6 +138,7 @@ func (a *App) handleExtensionSaveDisk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	writeSavedManifest()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file": fileName, "dir": dir})
 }
 
@@ -161,6 +193,7 @@ func (a *App) handleExtensionSavedDisk(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		writeSavedManifest()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file": fileName})
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
